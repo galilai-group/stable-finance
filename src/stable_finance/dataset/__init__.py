@@ -30,6 +30,12 @@ from stable_finance.dataset.transforms import (
     normalize,
     prior_vwap,
 )
+from stable_finance.dataset.targets import (
+    AnchorTargetStats,
+    CrossSectionalTargetBundle,
+    TARGET_TRANSFORMS,
+    build_cross_section_metadata,
+)
 from stable_finance.dataset.views import ViewSpec
 
 __all__ = [
@@ -40,6 +46,10 @@ __all__ = [
     "Month",
     "SessionPreprocessor",
     "ViewSpec",
+    "AnchorTargetStats",
+    "CrossSectionalTargetBundle",
+    "TARGET_TRANSFORMS",
+    "build_cross_section_metadata",
     "aggregate",
     "build_norm_groups",
     "ffill_vwap",

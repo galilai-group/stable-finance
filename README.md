@@ -63,18 +63,28 @@ crossed = cross_spread_sharpe(
 )
 ```
 
-In the originating market-jepa setup, the default probe target is an ordinary
-cross-sectional z-score at each date and decision anchor:
+In the originating market-jepa setup, the default for supervised training,
+ridge fitting, and evaluation is the empirical-uniform target within each
+same-date, same-anchor cross-section:
 
 ```text
-z_i(t, h) = (y_i(t, h) - mean_cross_section(y(t, h)))
-             / std_cross_section(y(t, h))
+uniform_i(t, h) = rankdata(y_cell)_i / (n_cell + 1)
 ```
 
-It is not an empirical-percentile score. Market-jepa separately supports an
-opt-in Gaussian-rank target that maps the empirical cross-sectional percentile
-through the inverse normal CDF. Stable-finance fits either representation—or
-raw returns—exactly as supplied.
+Ties receive their average rank. Gaussian rank, ordinary cross-sectional
+z-score `(y - mean) / std`, and raw returns remain explicit alternatives. The
+ridge estimator never changes the supplied target; the stable-finance dataset
+layer computes the representations explicitly and the caller chooses one.
+
+The dataset layer can expose all four representations together, so choosing a
+loss target does not discard information or push preprocessing into model
+code:
+
+```python
+targets = stats.transform(raw, date, anchor, target_types, horizons)
+model_target = targets.select("uniform")       # default
+all_target_metadata = targets.as_dict()        # raw/zscore/uniform/rank
+```
 
 ## Dataset architecture
 
