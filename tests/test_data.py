@@ -1,7 +1,12 @@
 import numpy as np
 import pytest
 
-from stable_finance.data import ForwardReturns, PortfolioWeights, require_aligned
+from stable_finance.data import (
+    Embeddings,
+    ForwardReturns,
+    PortfolioWeights,
+    require_aligned,
+)
 
 
 def contract(values=None, *, assets=("A", "B")):
@@ -21,3 +26,7 @@ def test_alignment_checks_axis_values_not_only_shape():
     with pytest.raises(ValueError, match="assets are not aligned"):
         require_aligned(weights, returns)
 
+
+def test_embeddings_validate_the_observation_axes():
+    with pytest.raises(ValueError, match="values must have shape"):
+        Embeddings(np.zeros((3, 2, 4)), [1, 2], ["A", "B"])
