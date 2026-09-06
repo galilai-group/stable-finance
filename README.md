@@ -109,8 +109,10 @@ boundaries so a future multi-day framer can insert learned open and close
 tokens without changing storage or target APIs.
 
 View geometry is configuration. `ViewSpec()` records the current 2,048-token,
-50–100% of session recipe; sequence length, scale range, resolution range,
-anchor grid, and future slack are hyperparameters rather than dataset schema.
+50–100% of session recipe. `AnchorSpec()` independently records the session,
+decision-grid, and forward-measurement geometry. Sequence length, view scale,
+resolution, anchor spacing, and future slack are therefore configuration rather
+than hidden dataset constants.
 
 A model integration may implement `MonthlyProbeData`, allowing the existing
 probe to be fit with `RidgeProbe().fit_month("2020-01", source)` while keeping
@@ -134,6 +136,6 @@ uv run pytest
 4. Add an order/fill contract and bid/ask execution simulator.
 5. Expose serialized evaluation results through a small visualization app.
 
-Research-specific checkpoint loading, target construction, and training remain
-in `market-jepa`; they should depend on this package's public contracts rather
-than being copied into it.
+Research-specific checkpoint loading, risk-factor-adjusted target assembly, and
+training remain in `market-jepa`; they depend on this package's public dataset
+and outcome contracts rather than duplicating them.

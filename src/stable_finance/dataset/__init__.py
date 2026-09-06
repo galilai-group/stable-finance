@@ -11,8 +11,18 @@ from stable_finance.dataset.calendar import (
     standard_open_est,
     timeline_bounds_est,
 )
+from stable_finance.dataset.anchors import AnchorSpec, DEFAULT_ANCHOR_SPEC
 from stable_finance.dataset.grid import SessionPreprocessor, sparse_to_dense_grid
 from stable_finance.dataset.months import Month, next_month
+from stable_finance.dataset.outcomes import (
+    ANCHOR_TARGET_TYPES,
+    PAIR_TARGET_TYPES,
+    anchor_indices,
+    anchor_targets,
+    forward_vwap,
+    window_realized_volatility,
+    window_spread,
+)
 from stable_finance.dataset.periods import (
     infer_period_frequency,
     period_directories,
@@ -40,6 +50,8 @@ from stable_finance.dataset.views import ViewSpec
 
 __all__ = [
     "FeatureSchema",
+    "AnchorSpec",
+    "DEFAULT_ANCHOR_SPEC",
     "MARKET_SCHEMA",
     "MarketSchedule",
     "MarketSession",
@@ -49,10 +61,15 @@ __all__ = [
     "AnchorTargetStats",
     "CrossSectionalTargetBundle",
     "TARGET_TRANSFORMS",
+    "ANCHOR_TARGET_TYPES",
+    "PAIR_TARGET_TYPES",
+    "anchor_indices",
+    "anchor_targets",
     "build_cross_section_metadata",
     "aggregate",
     "build_norm_groups",
     "ffill_vwap",
+    "forward_vwap",
     "infer_period_frequency",
     "next_month",
     "normalize",
@@ -62,4 +79,6 @@ __all__ = [
     "standard_open_est",
     "timeline_bounds_est",
     "validate_period_alignment",
+    "window_realized_volatility",
+    "window_spread",
 ]
