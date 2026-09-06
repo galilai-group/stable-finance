@@ -24,7 +24,17 @@ except ModuleNotFoundError as error:
 
 def discover_streams(*args, **kwargs):
     """Build MosaicML streams for :func:`period_directories`."""
-    return [Stream(local=str(path)) for path in period_directories(*args, **kwargs)]
+    try:
+        directories = period_directories(*args, **kwargs)
+    except ValueError as error:
+        message = str(error)
+        if message.startswith("No dataset period directories"):
+            message = message.replace(
+                "No dataset period directories", "No MDS period directories", 1
+            )
+            raise ValueError(message) from error
+        raise
+    return [Stream(local=str(path)) for path in directories]
 
 
 def shard_list(month_dir: str | Path) -> list[dict]:
