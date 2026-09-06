@@ -5,6 +5,7 @@ from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
 from stable_finance import Embeddings, ForwardReturns, RidgeProbe
+from stable_finance.dataset import Month
 
 
 def panel(seed=0):
@@ -75,3 +76,20 @@ def test_ridge_probe_must_be_fitted_before_prediction():
     embeddings, _ = panel()
     with pytest.raises(NotFittedError):
         RidgeProbe().predict(embeddings)
+
+
+def test_ridge_probe_can_fit_from_a_month_provider():
+    embeddings, targets = panel()
+
+    class Source:
+        def embeddings(self, month):
+            assert month == Month(2020, 1)
+            return embeddings
+
+        def forward_returns(self, month):
+            assert month == Month(2020, 1)
+            return targets
+
+    probe = RidgeProbe().fit_month("2020-01", Source())
+    assert probe.fit_month_ == Month(2020, 1)
+    assert np.isfinite(probe.predict(embeddings).values).all()

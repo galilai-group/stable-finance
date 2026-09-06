@@ -33,6 +33,36 @@ forecast = probe.predict(test_embeddings)
 information_coefficients = evaluate_forward_returns(forecast, test_returns)
 ```
 
+## Dataset architecture
+
+The supported input is the Polygon-derived one-second US-equity dataset. Its
+column semantics, exchange sessions, sparse-to-dense reconstruction, and
+single-session contract live in `stable_finance.dataset`. MosaicML Streaming is
+the v1 storage backend:
+
+```bash
+uv sync --extra mds
+```
+
+```python
+from stable_finance.dataset.mds import StreamingMarketDataset
+
+train = StreamingMarketDataset.from_month(mosaic_dir, "2020-01")
+```
+
+Storage is kept behind a backend-neutral `MarketSession`. A later LanceDB
+backend can therefore produce the same object. Sessions retain explicit date
+boundaries so a future multi-day framer can insert learned open and close
+tokens without changing storage or target APIs.
+
+View geometry is configuration. `ViewSpec()` records the current 2,048-token,
+50–100% of session recipe; sequence length, scale range, resolution range,
+anchor grid, and future slack are hyperparameters rather than dataset schema.
+
+A model integration may implement `MonthlyProbeData`, allowing the existing
+probe to be fit with `RidgeProbe().fit_month("2020-01", source)` while keeping
+checkpoint and encoder concerns outside this repository.
+
 ## Development
 
 Use `uv` exclusively:

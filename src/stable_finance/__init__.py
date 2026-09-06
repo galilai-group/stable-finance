@@ -8,13 +8,14 @@ from stable_finance.metrics import (
     sharpe_ratio,
 )
 from stable_finance.portfolio import BacktestResult, evaluate_weights
-from stable_finance.probes import RidgeProbe
+from stable_finance.probes import MonthlyProbeData, RidgeProbe
 
 __all__ = [
     "BacktestResult",
     "Embeddings",
     "ForwardReturns",
     "InformationCoefficient",
+    "MonthlyProbeData",
     "PortfolioWeights",
     "RidgeProbe",
     "evaluate_forward_returns",

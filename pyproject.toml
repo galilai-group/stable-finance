@@ -13,6 +13,12 @@ dependencies = [
     "scikit-learn>=1.9.0",
 ]
 
+[project.optional-dependencies]
+mds = [
+    "mosaicml-streaming>=0.10.0",
+    "zstandard>=0.25.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0",

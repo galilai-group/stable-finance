@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Protocol
 
 import numpy as np
 from sklearn.exceptions import NotFittedError
@@ -14,6 +15,15 @@ from stable_finance.data import (
     ForwardReturns,
     require_same_observations,
 )
+from stable_finance.dataset.months import Month
+
+
+class MonthlyProbeData(Protocol):
+    """Model-specific provider used by :meth:`RidgeProbe.fit_month`."""
+
+    def embeddings(self, month: Month) -> Embeddings: ...
+
+    def forward_returns(self, month: Month) -> ForwardReturns: ...
 
 
 class RidgeProbe:
@@ -82,6 +92,21 @@ class RidgeProbe:
         self.models_ = tuple(models)
         self.horizons_ = targets.horizons.copy()
         self.n_features_in_ = n_features
+        return self
+
+    def fit_month(
+        self, month: Month | str, source: MonthlyProbeData
+    ) -> "RidgeProbe":
+        """Load one fit month through a model-specific provider and fit.
+
+        Stable-finance owns what a month and return panel mean; the provider
+        owns how a particular model produces embeddings. This keeps checkpoint
+        loading out of the evaluation library while giving orchestration code a
+        month-level API.
+        """
+        fit_month = Month.parse(month)
+        self.fit(source.embeddings(fit_month), source.forward_returns(fit_month))
+        self.fit_month_ = fit_month
         return self
 
     def predict(self, embeddings: Embeddings) -> ForwardReturns:
