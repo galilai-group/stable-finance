@@ -7,7 +7,11 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike
 
-from stable_finance.data import ForwardReturns, require_aligned
+from stable_finance.data import (
+    ForwardReturns,
+    PortfolioWeights,
+    require_aligned,
+)
 
 
 @dataclass(frozen=True)
@@ -100,3 +104,98 @@ def sharpe_ratio(returns: ArrayLike, *, periods_per_year: float = 252.0) -> floa
     if volatility <= 0:
         return np.nan
     return float(np.sqrt(periods_per_year) * values.mean() / volatility)
+
+
+def _portfolio_returns_at_mid(
+    weights: PortfolioWeights,
+    realized_mid_returns: ForwardReturns,
+) -> tuple[np.ndarray, ...]:
+    """Return portfolio P&L marked at the mid price for every horizon."""
+    require_aligned(weights, realized_mid_returns)
+    results = []
+    for horizon in range(len(weights.horizons)):
+        weight = weights.values[:, :, horizon]
+        outcome = realized_mid_returns.values[:, :, horizon]
+        valid = np.isfinite(weight) & np.isfinite(outcome)
+        returns = np.where(valid, weight * outcome, 0.0).sum(axis=1)
+        returns[~valid.any(axis=1)] = np.nan
+        results.append(returns)
+    return tuple(results)
+
+
+def mid_price_sharpe(
+    weights: PortfolioWeights,
+    realized_mid_returns: ForwardReturns,
+    *,
+    periods_per_year: float = 252.0,
+) -> tuple[float, ...]:
+    """Annualized Sharpe at the mid price, independently per horizon.
+
+    ``realized_mid_returns`` must contain mid-to-mid forward returns. This is
+    the frictionless result: no spread, impact, or commission is charged.
+    """
+    return tuple(
+        sharpe_ratio(returns, periods_per_year=periods_per_year)
+        for returns in _portfolio_returns_at_mid(weights, realized_mid_returns)
+    )
+
+
+def _validated_quotes(
+    best_bid: ArrayLike,
+    best_ask: ArrayLike,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return equally shaped quote arrays after validating finite markets."""
+    bid = np.asarray(best_bid, dtype=np.float64)
+    ask = np.asarray(best_ask, dtype=np.float64)
+    if bid.ndim != 2 or bid.shape != ask.shape:
+        raise ValueError("best_bid and best_ask must be equally shaped 2-D arrays")
+    crossed = np.isfinite(bid) & np.isfinite(ask) & (ask < bid)
+    if crossed.any():
+        raise ValueError("best_ask cannot be below best_bid")
+    return bid, ask
+
+
+def cross_spread_sharpe(
+    weights: PortfolioWeights,
+    realized_mid_returns: ForwardReturns,
+    best_bid: ArrayLike,
+    best_ask: ArrayLike,
+    *,
+    periods_per_year: float = 252.0,
+) -> tuple[float, ...]:
+    """Annualized Sharpe after crossing the quoted spread on every trade.
+
+    Bid and ask must have shape ``(n_decisions, n_assets)`` and represent the
+    observable quote at each rebalance. A positive weight change buys at the
+    best ask; a negative weight change sells at the best bid. The execution
+    price is compared with that quote's midpoint and charged against mid-marked
+    P&L. The first portfolio is entered from cash. Market impact, quote depth,
+    partial fills, and commissions remain outside this metric.
+    """
+    gross_returns = _portfolio_returns_at_mid(weights, realized_mid_returns)
+    expected = weights.values.shape[:2]
+    bid, ask = _validated_quotes(best_bid, best_ask)
+    if bid.shape != expected:
+        raise ValueError(f"best_bid and best_ask must have shape {expected}")
+
+    sharpes = []
+    for horizon, gross in enumerate(gross_returns):
+        weight = weights.values[:, :, horizon]
+        previous = np.vstack([np.zeros((1, expected[1])), weight[:-1]])
+        trade = weight - previous
+        traded = np.isfinite(trade) & (trade != 0)
+        valid_quote = (
+            np.isfinite(bid) & np.isfinite(ask) & (bid > 0) & (ask > 0)
+        )
+        missing_execution_quote = traded & ~valid_quote
+
+        midpoint = (bid + ask) / 2
+        execution_price = np.where(trade > 0, ask, bid)
+        # Signed trade makes both directions a positive cost: buys execute
+        # above mid and sells (negative trade) execute below mid.
+        execution_cost = trade * (execution_price - midpoint) / midpoint
+        costs = np.where(traded & valid_quote, execution_cost, 0.0).sum(axis=1)
+        net = gross - costs
+        net[missing_execution_quote.any(axis=1)] = np.nan
+        sharpes.append(sharpe_ratio(net, periods_per_year=periods_per_year))
+    return tuple(sharpes)

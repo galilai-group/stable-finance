@@ -17,7 +17,9 @@ The first migration slice provides:
 - a standardized ridge probe from embeddings to forward-return forecasts;
 - cross-sectional Spearman information coefficient at each decision time and
   forecast horizon;
-- annualized Sharpe ratio; and
+- annualized portfolio Sharpe marked at mid;
+- annualized portfolio Sharpe after crossing the observable best-bid/best-ask
+  spread; and
 - weight backtesting with quoted half-spread costs and multiple horizons.
 
 The contracts use dense arrays with shape
@@ -31,6 +33,19 @@ from stable_finance import RidgeProbe, evaluate_forward_returns
 probe = RidgeProbe(alpha=1.0).fit(train_embeddings, train_returns)
 forecast = probe.predict(test_embeddings)
 information_coefficients = evaluate_forward_returns(forecast, test_returns)
+```
+
+The portfolio metrics report the frictionless mid-price result and the
+executable quoted-spread result separately. The latter executes positive
+weight changes at the best ask and negative weight changes at the best bid:
+
+```python
+from stable_finance import cross_spread_sharpe, mid_price_sharpe
+
+mid = mid_price_sharpe(weights, realized_mid_returns)
+crossed = cross_spread_sharpe(
+    weights, realized_mid_returns, best_bid, best_ask
+)
 ```
 
 ## Dataset architecture
