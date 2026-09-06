@@ -35,7 +35,8 @@ def _rankdata(values: np.ndarray) -> np.ndarray:
     return ranks
 
 
-def _correlation(left: np.ndarray, right: np.ndarray) -> float:
+def _pearson_correlation(left: np.ndarray, right: np.ndarray) -> float:
+    """Pearson correlation, used on ranks to obtain Spearman correlation."""
     left = left - left.mean()
     right = right - right.mean()
     denominator = np.sqrt(np.dot(left, left) * np.dot(right, right))
@@ -63,7 +64,9 @@ def grouped_rank_ic(predicted: ArrayLike, realized: ArrayLike, *,
         valid = np.isfinite(prediction) & np.isfinite(outcome)
         if valid.sum() < min_assets:
             continue
-        value = _correlation(_rankdata(prediction[valid]), _rankdata(outcome[valid]))
+        value = _pearson_correlation(
+            _rankdata(prediction[valid]), _rankdata(outcome[valid])
+        )
         if np.isfinite(value):
             values.append(value)
 

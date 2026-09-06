@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import Protocol
 
 import numpy as np
+from sklearn.base import BaseEstimator
 from sklearn.exceptions import NotFittedError
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
@@ -26,7 +27,7 @@ class MonthlyProbeData(Protocol):
     def forward_returns(self, month: Month) -> ForwardReturns: ...
 
 
-class RidgeProbe:
+class RidgeProbe(BaseEstimator):
     """One standardized ridge regression per forward-return horizon.
 
     This preserves the originating market-jepa recipe: fit one
@@ -38,8 +39,6 @@ class RidgeProbe:
 
     def __init__(self, alpha: float | Sequence[float] = 1.0, *,
                  min_samples: int = 20) -> None:
-        if min_samples < 2:
-            raise ValueError("min_samples must be at least 2")
         self.alpha = alpha
         self.min_samples = min_samples
 
@@ -58,6 +57,8 @@ class RidgeProbe:
 
     def fit(self, embeddings: Embeddings, targets: ForwardReturns) -> "RidgeProbe":
         """Fit the scaler and horizon-specific regressions."""
+        if self.min_samples < 2:
+            raise ValueError("min_samples must be at least 2")
         require_same_observations(embeddings, targets)
         n_features = embeddings.values.shape[2]
         X = embeddings.values.reshape(-1, n_features)
@@ -133,3 +134,21 @@ class RidgeProbe:
             embeddings.assets,
             self.horizons_,
         )
+
+
+def fit(
+    embeddings: Embeddings,
+    targets: ForwardReturns,
+    *,
+    alpha: float | Sequence[float] = 1.0,
+    min_samples: int = 20,
+) -> RidgeProbe:
+    """Fit the default embeddings-to-forecast adapter.
+
+    This is the concise entry point for users entering the pipeline with
+    embeddings. It intentionally performs no target transformation: raw
+    returns, cross-sectional z-scores, or another target are fit exactly as
+    supplied. Instantiate :class:`RidgeProbe` directly when composing through
+    scikit-learn estimator tooling.
+    """
+    return RidgeProbe(alpha=alpha, min_samples=min_samples).fit(embeddings, targets)

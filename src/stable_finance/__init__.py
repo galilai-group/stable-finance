@@ -10,7 +10,7 @@ from stable_finance.metrics import (
     sharpe_ratio,
 )
 from stable_finance.portfolio import BacktestResult, evaluate_weights
-from stable_finance.probes import MonthlyProbeData, RidgeProbe
+from stable_finance.probes import MonthlyProbeData, RidgeProbe, fit
 
 __all__ = [
     "BacktestResult",
@@ -23,6 +23,7 @@ __all__ = [
     "cross_spread_sharpe",
     "evaluate_forward_returns",
     "evaluate_weights",
+    "fit",
     "grouped_rank_ic",
     "mid_price_sharpe",
     "sharpe_ratio",

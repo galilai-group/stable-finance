@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 from pathlib import Path
 
@@ -67,6 +68,31 @@ def open_shard(month_dir: str | Path, shard_meta: dict, tmpdir: str | Path):
     local["zip_data"] = None
     shutil.copy(month_dir / "index.json", tmpdir / "index.json")
     return reader_from_json(str(tmpdir), None, local)
+
+
+def configure_epoch_size(dataset, total_steps: int, batch_size: int) -> None:
+    """Resize a MosaicML dataset epoch to cover a complete training run.
+
+    MosaicML otherwise recycles samples at its epoch boundary during a
+    step-based run. The ten-batch margin keeps dataloader prefetch from
+    crossing that boundary. This mutates the supplied dataset in place.
+    """
+    if total_steps < 1 or batch_size < 1:
+        raise ValueError("total_steps and batch_size must be positive")
+    epoch_samples = (total_steps + 10) * batch_size
+    for stream in dataset.streams:
+        for attribute in ("proportion", "repeat", "choose"):
+            if hasattr(stream, attribute):
+                delattr(stream, attribute)
+    dataset.epoch_size = Stream.apply_weights(
+        dataset.streams,
+        dataset.samples_per_stream,
+        epoch_samples,
+        dataset.shuffle_seed,
+    )
+    dataset.length = math.ceil(
+        dataset.epoch_size / dataset._parallel_rank_world.num_ranks
+    )
 
 
 class StreamingMarketDataset(StreamingDataset):

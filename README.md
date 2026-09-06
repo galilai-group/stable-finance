@@ -1,8 +1,9 @@
 # stable-finance
 
 Composable evaluation for financial representations, forecasts, portfolios,
-and orders. The library accepts work at any stage of the pipeline and uses
-small, textbook adapters to reach the metrics that apply to it:
+and orders. **Every stage is an injection point.** Bring your own embeddings,
+return forecasts (`y_hat`), portfolio weights, or orders; stable-finance only
+runs the downstream adapters and metrics you ask for.
 
 ```text
 embeddings -> forward returns -> portfolio weights -> orders
@@ -10,7 +11,10 @@ embeddings -> forward returns -> portfolio weights -> orders
      +------ IC -----+                 +---- Sharpe ---+
 ```
 
-The first migration slice provides:
+The package follows scikit-learn's estimator vocabulary: adapters expose
+`fit(X, y)` and `predict(X)`, constructor arguments are inspectable
+hyperparameters, and the fitted object is reusable. The first migration slice
+provides:
 
 - explicit, validated contracts for embeddings, forward returns, and portfolio
   weights;
@@ -28,12 +32,22 @@ alongside every array and alignment is checked before evaluation. NaN denotes
 a missing observation.
 
 ```python
-from stable_finance import RidgeProbe, evaluate_forward_returns
+import stable_finance as sf
 
-probe = RidgeProbe(alpha=1.0).fit(train_embeddings, train_returns)
+# Enter at embeddings: fit the default adapter, then produce y_hat.
+probe = sf.fit(train_embeddings, train_returns, alpha=1.0)
 forecast = probe.predict(test_embeddings)
-information_coefficients = evaluate_forward_returns(forecast, test_returns)
+
+# Enter at y_hat: skip fitting and evaluate forecasts directly.
+information_coefficients = sf.evaluate_forward_returns(forecast, test_returns)
 ```
+
+`RidgeProbe` is also a scikit-learn estimator, so users who want explicit
+composition can instantiate, inspect, clone, fit, and predict with it directly.
+Stable-finance does not transform the supplied target: a fit against raw
+returns learns raw returns; a fit against cross-sectional z-scores learns those
+z-scores. Choosing or estimating the target transform is a separate pipeline
+stage rather than hidden probe behavior.
 
 The portfolio metrics report the frictionless mid-price result and the
 executable quoted-spread result separately. The latter executes positive
@@ -42,11 +56,25 @@ weight changes at the best ask and negative weight changes at the best bid:
 ```python
 from stable_finance import cross_spread_sharpe, mid_price_sharpe
 
+# Enter at weights: no forecast model or allocator is required.
 mid = mid_price_sharpe(weights, realized_mid_returns)
 crossed = cross_spread_sharpe(
     weights, realized_mid_returns, best_bid, best_ask
 )
 ```
+
+In the originating market-jepa setup, the default probe target is an ordinary
+cross-sectional z-score at each date and decision anchor:
+
+```text
+z_i(t, h) = (y_i(t, h) - mean_cross_section(y(t, h)))
+             / std_cross_section(y(t, h))
+```
+
+It is not an empirical-percentile score. Market-jepa separately supports an
+opt-in Gaussian-rank target that maps the empirical cross-sectional percentile
+through the inverse normal CDF. Stable-finance fits either representation—or
+raw returns—exactly as supplied.
 
 ## Dataset architecture
 

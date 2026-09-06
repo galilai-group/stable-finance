@@ -1,9 +1,11 @@
 import numpy as np
 import pytest
+from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
+import stable_finance as sf
 from stable_finance import Embeddings, ForwardReturns, RidgeProbe
 from stable_finance.dataset import Month
 
@@ -93,3 +95,18 @@ def test_ridge_probe_can_fit_from_a_month_provider():
     probe = RidgeProbe().fit_month("2020-01", Source())
     assert probe.fit_month_ == Month(2020, 1)
     assert np.isfinite(probe.predict(embeddings).values).all()
+
+
+def test_ridge_probe_is_an_sklearn_estimator():
+    probe = RidgeProbe(alpha=3.0, min_samples=10)
+    copied = clone(probe)
+    assert copied.get_params() == {"alpha": 3.0, "min_samples": 10}
+
+
+def test_top_level_fit_maps_embeddings_to_forecasts():
+    embeddings, targets = panel()
+    fitted = sf.fit(embeddings, targets, alpha=[1.0, 10.0])
+    assert isinstance(fitted, RidgeProbe)
+    np.testing.assert_array_equal(
+        fitted.predict(embeddings).horizons, targets.horizons
+    )
