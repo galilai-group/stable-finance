@@ -8,6 +8,7 @@ from stable_finance.dataset import (
     MarketSession,
     Month,
     SessionPreprocessor,
+    ViewMetadata,
     ViewSpec,
     aggregate,
     build_norm_groups,
@@ -65,6 +66,19 @@ def test_view_geometry_is_validated_as_a_hyperparameter():
         ViewSpec(scale_range=(0.0, 1.0))
     with pytest.raises(ValueError, match="aggregation_seconds"):
         ViewSpec(aggregation_seconds=(10, 2))
+
+
+def test_view_metadata_keeps_window_facts_out_of_series_columns():
+    metadata = ViewMetadata(
+        start_seconds=60,
+        end_seconds=180,
+        aggregation_seconds=2,
+        normalization_means=np.arange(4.0),
+        normalization_scales=np.ones(4),
+    )
+    assert metadata.aggregation_seconds == 2
+    with pytest.raises(ValueError, match="scales"):
+        ViewMetadata(0, 1, 1, np.zeros(1), np.zeros(1))
 
 
 def test_supported_schema_owns_column_semantics():
@@ -127,10 +141,31 @@ def test_session_preprocessor_returns_backend_neutral_session():
     assert session.features.dtype == np.float64
 
 
+def test_session_preprocessor_owns_bounded_cache_and_telemetry():
+    start, _ = timeline_bounds_est("2023-01-03")
+    raw = {
+        "ticker": "ABC",
+        "date": "2023-01-03",
+        "ts_interval": np.array([start, start + 1], dtype=np.int32),
+        "features": np.ones((2, 9), dtype=np.float32),
+    }
+    processor = SessionPreprocessor(cache_bytes=1 << 20)
+    processor.transform(raw)
+    processor.transform(raw)
+    info = processor.cache_info()
+    assert (info.hits, info.misses, info.entries) == (1, 1, 1)
+    assert 0 < info.bytes <= info.max_bytes
+
+
 def test_market_session_retains_explicit_boundaries_for_future_framing():
     session = MarketSession(
         "ABC", "2023-01-03", np.array([1, 2]), np.ones((2, 9))
     )
     assert session.date == "2023-01-03"
+    assert session.bar_seconds == 1
+    assert MarketSession(
+        "ABC", "2023-01-03", np.array([1, 61]), np.ones((2, 9)),
+        bar_seconds=60,
+    ).bar_seconds == 60
     with pytest.raises(ValueError, match="strictly increasing"):
         MarketSession("ABC", "2023-01-03", [2, 1], np.ones((2, 9)))

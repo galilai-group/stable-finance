@@ -4,6 +4,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+from numpy.typing import NDArray
+
+
+@dataclass(frozen=True)
+class ViewMetadata:
+    """Model-independent facts about a materialized market view.
+
+    Values remain in their natural units. A model package may encode them and
+    project them into one or more information tokens, without transporting
+    constants as repeated time-series columns.
+    """
+
+    start_seconds: float
+    end_seconds: float
+    aggregation_seconds: float
+    normalization_means: NDArray[np.floating]
+    normalization_scales: NDArray[np.floating]
+
+    def __post_init__(self) -> None:
+        means = np.asarray(self.normalization_means)
+        scales = np.asarray(self.normalization_scales)
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("view bounds must satisfy start < end")
+        if self.aggregation_seconds <= 0:
+            raise ValueError("aggregation_seconds must be positive")
+        if means.ndim != 1 or scales.shape != means.shape:
+            raise ValueError("normalization means and scales must be matching vectors")
+        if np.any(scales <= 0) or not np.all(np.isfinite(scales)):
+            raise ValueError("normalization scales must be finite and positive")
+        object.__setattr__(self, "normalization_means", means)
+        object.__setattr__(self, "normalization_scales", scales)
+
 
 @dataclass(frozen=True)
 class ViewSpec:
@@ -36,4 +69,3 @@ class ViewSpec:
             raise ValueError("end_grid_seconds must be positive")
         if self.min_future_seconds < 0:
             raise ValueError("min_future_seconds cannot be negative")
-

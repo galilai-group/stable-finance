@@ -100,6 +100,7 @@ class MarketSession:
     timestamps: NDArray[np.integer]
     features: NDArray[np.floating]
     schema: FeatureSchema = MARKET_SCHEMA
+    bar_seconds: int = 1
 
     def __post_init__(self) -> None:
         timestamps = np.asarray(self.timestamps)
@@ -113,6 +114,7 @@ class MarketSession:
             )
         if len(timestamps) > 1 and np.any(timestamps[1:] <= timestamps[:-1]):
             raise ValueError("timestamps must be strictly increasing")
+        if self.bar_seconds < 1:
+            raise ValueError("bar_seconds must be positive")
         object.__setattr__(self, "timestamps", timestamps)
         object.__setattr__(self, "features", features)
-

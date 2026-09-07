@@ -13,7 +13,7 @@ from stable_finance.dataset.calendar import (
     timeline_bounds_est,
 )
 from stable_finance.dataset.anchors import AnchorSpec, DEFAULT_ANCHOR_SPEC
-from stable_finance.dataset.grid import SessionPreprocessor, sparse_to_dense_grid
+from stable_finance.dataset.grid import CacheInfo, SessionPreprocessor, sparse_to_dense_grid
 from stable_finance.dataset.months import Month, next_month
 from stable_finance.dataset.outcomes import (
     ANCHOR_TARGET_TYPES,
@@ -49,7 +49,7 @@ from stable_finance.dataset.targets import (
     TARGET_TRANSFORMS,
     build_cross_section_metadata,
 )
-from stable_finance.dataset.views import ViewSpec
+from stable_finance.dataset.views import ViewMetadata, ViewSpec
 
 __all__ = [
     "FeatureSchema",
@@ -61,7 +61,9 @@ __all__ = [
     "MarketSession",
     "Month",
     "SessionPreprocessor",
+    "CacheInfo",
     "ViewSpec",
+    "ViewMetadata",
     "AnchorTargetStats",
     "CrossSectionalTargetBundle",
     "TARGET_TRANSFORMS",

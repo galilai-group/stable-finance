@@ -42,7 +42,6 @@ ANCHOR_TARGET_TYPES = ("return", "volatility_change", "spread_change")
 PAIR_TARGET_TYPES = (
     "return",
     "spread_change",
-    "volatility",
     "volatility_change",
 )
 
@@ -213,7 +212,7 @@ def _standard_target_arrays(
             valid_window, forward - base, np.nan
         )
 
-    if "volatility" in types or "volatility_change" in types:
+    if "volatility_change" in types:
         mid = (
             features[:, _BID].astype(np.float64)
             + features[:, _ASK].astype(np.float64)
@@ -222,32 +221,23 @@ def _standard_target_arrays(
             log_returns = np.diff(np.log(mid))
         s1, s2, counts = _nan_cumsums(log_returns)
 
-        if "volatility" in types:
-            # Preserve the legacy pair target: realized volatility over
-            # [t, min(t+h, close)).
-            end = np.minimum(future, n)
-            result["volatility"] = _windowed_std(
-                s1, s2, counts, t, end - 1
-            )
-
-        if "volatility_change" in types:
-            base = _windowed_std(
-                s1,
-                s2,
-                counts,
-                np.broadcast_to(t, future.shape),
-                np.broadcast_to(t + window - 1, future.shape),
-            )
-            forward = _windowed_std(
-                s1,
-                s2,
-                counts,
-                future_safe,
-                future_safe + window - 1,
-            )
-            result["volatility_change"] = np.where(
-                valid_window, forward - base, np.nan
-            )
+        base = _windowed_std(
+            s1,
+            s2,
+            counts,
+            np.broadcast_to(t, future.shape),
+            np.broadcast_to(t + window - 1, future.shape),
+        )
+        forward = _windowed_std(
+            s1,
+            s2,
+            counts,
+            future_safe,
+            future_safe + window - 1,
+        )
+        result["volatility_change"] = np.where(
+            valid_window, forward - base, np.nan
+        )
 
     return result
 

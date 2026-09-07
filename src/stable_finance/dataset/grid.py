@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 
 import numpy as np
 
 from stable_finance.dataset.calendar import MarketSchedule, timeline_bounds_est
 from stable_finance.dataset.schema import MARKET_SCHEMA, FeatureSchema, MarketSession
+
+
+@dataclass(frozen=True)
+class CacheInfo:
+    """Observable state of a :class:`SessionPreprocessor` LRU cache."""
+
+    hits: int
+    misses: int
+    entries: int
+    bytes: int
+    max_bytes: int
 
 
 def sparse_to_dense_grid(
@@ -79,6 +91,7 @@ class SessionPreprocessor:
         extended_hours: bool = False,
         zero_features: tuple[str, ...] = (),
         cache_bytes: int = 0,
+        bounds: Callable[[str], tuple[int, int]] | None = None,
     ) -> None:
         unknown = set(zero_features) - set(schema.columns)
         if unknown:
@@ -88,10 +101,23 @@ class SessionPreprocessor:
         self.extended_hours = extended_hours
         self.zero_indices = [schema.index(name) for name in zero_features]
         self.cache_bytes = max(0, int(cache_bytes))
+        self.bounds = bounds
         self._cache: OrderedDict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = (
             OrderedDict()
         )
         self._cached_bytes = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    def cache_info(self) -> CacheInfo:
+        """Return cache telemetry without exposing the mutable cache itself."""
+        return CacheInfo(
+            hits=self._cache_hits,
+            misses=self._cache_misses,
+            entries=len(self._cache),
+            bytes=self._cached_bytes,
+            max_bytes=self.cache_bytes,
+        )
 
     def transform(self, sample: Mapping) -> MarketSession | None:
         ticker, date = str(sample.get("ticker", "")), str(sample.get("date", ""))
@@ -100,12 +126,20 @@ class SessionPreprocessor:
         key = (ticker, date)
         cached = self._cache.get(key) if ticker and date else None
         if cached is not None:
+            self._cache_hits += 1
             self._cache.move_to_end(key)
             timestamps, stored = cached
             return MarketSession(ticker, date, timestamps, stored.astype(np.float64), self.schema)
 
-        start, end = timeline_bounds_est(
-            date, schedule=self.schedule, extended_hours=self.extended_hours
+        if self.cache_bytes > 0 and ticker and date:
+            self._cache_misses += 1
+
+        start, end = (
+            self.bounds(date)
+            if self.bounds is not None
+            else timeline_bounds_est(
+                date, schedule=self.schedule, extended_hours=self.extended_hours
+            )
         )
         use_cache = self.cache_bytes > 0 and ticker and date
         result = sparse_to_dense_grid(
@@ -130,4 +164,3 @@ class SessionPreprocessor:
                 self._cached_bytes -= old_timestamps.nbytes + old_features.nbytes
             features = features.astype(np.float64)
         return MarketSession(ticker, date, timestamps, features, self.schema)
-
