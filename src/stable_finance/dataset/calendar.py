@@ -7,7 +7,7 @@ import datetime as dt
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-ET = ZoneInfo("America/New_York")
+EASTERN_TIME = ZoneInfo("America/New_York")
 EXTENDED_OPEN_HHMM = "04:00"
 EXTENDED_POST_CLOSE_HOURS = 4
 
@@ -56,7 +56,7 @@ def timeline_bounds_est(
     """Return the inclusive-open, exclusive-close epoch seconds for a session."""
     if schedule is not None and schedule.is_closed(date):
         raise ValueError(f"Market is closed on {date}")
-    localized = dt.datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=ET)
+    localized = dt.datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=EASTERN_TIME)
     open_text, close_text = (
         schedule.market_hours(date) if schedule is not None else ("09:30", "16:00")
     )
@@ -76,5 +76,5 @@ def timeline_bounds_est(
 
 def standard_open_est(date: str) -> int:
     """Return the standard 09:30 ET grid origin, including the dataset offset."""
-    localized = dt.datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=ET)
+    localized = dt.datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=EASTERN_TIME)
     return int((localized + dt.timedelta(hours=9, minutes=30)).timestamp()) + 1

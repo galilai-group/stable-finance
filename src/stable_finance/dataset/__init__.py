@@ -7,6 +7,7 @@ session or view contracts.
 """
 
 from stable_finance.dataset.calendar import (
+    EASTERN_TIME,
     MarketSchedule,
     standard_open_est,
     timeline_bounds_est,
@@ -19,7 +20,9 @@ from stable_finance.dataset.outcomes import (
     PAIR_TARGET_TYPES,
     anchor_indices,
     anchor_targets,
+    compute_pair_targets,
     forward_vwap,
+    get_target_names,
     window_realized_volatility,
     window_spread,
 )
@@ -52,6 +55,7 @@ __all__ = [
     "FeatureSchema",
     "AnchorSpec",
     "DEFAULT_ANCHOR_SPEC",
+    "EASTERN_TIME",
     "MARKET_SCHEMA",
     "MarketSchedule",
     "MarketSession",
@@ -65,11 +69,13 @@ __all__ = [
     "PAIR_TARGET_TYPES",
     "anchor_indices",
     "anchor_targets",
+    "compute_pair_targets",
     "build_cross_section_metadata",
     "aggregate",
     "build_norm_groups",
     "ffill_vwap",
     "forward_vwap",
+    "get_target_names",
     "infer_period_frequency",
     "next_month",
     "normalize",

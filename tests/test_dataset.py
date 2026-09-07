@@ -16,6 +16,7 @@ from stable_finance.dataset import (
     normalize,
     period_directories,
     sparse_to_dense_grid,
+    standard_open_est,
     timeline_bounds_est,
 )
 
@@ -25,6 +26,26 @@ def test_month_is_a_first_class_fit_period():
     assert month.first_day == dt.date(2020, 12, 1)
     assert month.last_day == dt.date(2020, 12, 31)
     assert next_month(month) == "2021-01"
+
+
+@pytest.mark.parametrize(
+    ("date", "open_utc", "close_utc"),
+    [
+        ("2023-03-10", "14:30:01", "21:00:01"),
+        ("2023-03-13", "13:30:01", "20:00:01"),
+        ("2023-11-03", "13:30:01", "20:00:01"),
+        ("2023-11-06", "14:30:01", "21:00:01"),
+    ],
+)
+def test_session_bounds_use_the_correct_dst_offset(date, open_utc, close_utc):
+    """Pin absolute UTC times, not only the always-6.5-hour session length."""
+    start, end = timeline_bounds_est(date)
+    as_utc = lambda value: dt.datetime.fromtimestamp(
+        value, dt.timezone.utc
+    ).strftime("%H:%M:%S")
+    assert as_utc(start) == open_utc
+    assert as_utc(end) == close_utc
+    assert standard_open_est(date) == start
 
 
 def test_partition_discovery_is_storage_backend_independent(tmp_path):

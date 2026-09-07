@@ -8,7 +8,9 @@ from stable_finance.dataset.outcomes import (
     ANCHOR_TARGET_TYPES,
     anchor_targets,
     anchor_indices,
+    compute_pair_targets,
     forward_vwap,
+    get_target_names,
     window_realized_volatility,
     window_spread,
 )
@@ -56,3 +58,28 @@ def test_anchor_targets_have_stable_type_order_and_no_close_clamp():
         expected
     )
     assert np.isnan(targets[1]).all()
+
+
+def test_pair_targets_match_anchor_targets_for_all_tasks_and_horizons():
+    features = _features(2_000)
+    horizons = [60, 300, 900]
+    index = 500
+    anchor = anchor_targets(features, horizons, np.array([index]))[0]
+    pair = compute_pair_targets(
+        features, index, horizons, list(ANCHOR_TARGET_TYPES)
+    ).reshape(len(ANCHOR_TARGET_TYPES), len(horizons))
+    np.testing.assert_allclose(pair, anchor, rtol=1e-6, equal_nan=True)
+
+
+def test_pair_targets_only_emit_requested_work_in_requested_order():
+    features = _features(1_000)
+    selected = compute_pair_targets(
+        features, 100, [60, 300], ["spread_change"]
+    )
+    assert selected.shape == (2,)
+    assert get_target_names([60, 300], ["spread_change"]) == [
+        "spread_change_060",
+        "spread_change_300",
+    ]
+    with pytest.raises(ValueError, match="unknown target"):
+        compute_pair_targets(features, 100, [60], ["not_a_target"])

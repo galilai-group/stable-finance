@@ -61,6 +61,26 @@ PAIR_TARGET_TYPES = (
 )
 
 
+def get_target_names(
+    horizons: list[int],
+    types: list[str],
+    rf_tickers: list[str] | None = None,
+) -> list[str]:
+    """Return names in the same type-major order as :func:`compute_pair_targets`."""
+    names = [
+        f"{target_type}_{horizon:03d}"
+        for target_type in types
+        for horizon in horizons
+    ]
+    if rf_tickers:
+        names.extend(
+            f"return_adj__{ticker}__{horizon:03d}"
+            for ticker in rf_tickers
+            for horizon in horizons
+        )
+    return names
+
+
 def anchor_indices(
     session_len: int | None = None,
     *,
@@ -127,6 +147,196 @@ def _windowed_mean(cs, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
         return np.where(n > 0, (cs[hi] - cs[lo]) / np.where(n > 0, n, 1.0), np.nan)
 
 
+def _windowed_vwap(features: np.ndarray, idx, window: int):
+    """Vectorized VWAP using one pair of prefix sums."""
+    vw = features[:, _VWAP].astype(np.float64)
+    volume = np.nan_to_num(features[:, _VOL].astype(np.float64), nan=0.0)
+    numerator = np.nan_to_num(vw * volume, nan=0.0)
+    cs_num = np.concatenate([[0.0], np.cumsum(numerator)])
+    cs_volume = np.concatenate([[0.0], np.cumsum(volume)])
+    indices = np.asarray(idx, dtype=np.int64)
+    lo, hi = indices, indices + int(window)
+    valid = (lo >= 0) & (hi <= len(features))
+    lo_safe = np.clip(lo, 0, len(features))
+    hi_safe = np.clip(hi, 0, len(features))
+    denominator = cs_volume[hi_safe] - cs_volume[lo_safe]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(
+            valid & (denominator > 0),
+            (cs_num[hi_safe] - cs_num[lo_safe])
+            / np.where(denominator > 0, denominator, 1.0),
+            np.nan,
+        )
+
+
+def _standard_target_arrays(
+    features: np.ndarray,
+    indices: np.ndarray,
+    horizons: np.ndarray,
+    types: tuple[str, ...],
+    window: int,
+) -> dict[str, np.ndarray]:
+    """Compute requested target families over all points and horizons."""
+    unknown = set(types) - set(PAIR_TARGET_TYPES)
+    if unknown:
+        raise ValueError(f"unknown target types: {sorted(unknown)}")
+
+    n = len(features)
+    t = np.asarray(indices, dtype=np.int64)[:, None]
+    hs = np.asarray(horizons, dtype=np.int64)
+    future = t + hs[None, :]
+    valid_window = (t >= 0) & ((future + window) <= n)
+    future_safe = np.where(valid_window, future, 0)
+    result: dict[str, np.ndarray] = {}
+
+    if "return" in types:
+        base = _windowed_vwap(features, t[:, 0], window)[:, None]
+        forward = _windowed_vwap(features, future_safe, window)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            result["return"] = np.where(
+                valid_window & np.isfinite(base) & (base != 0),
+                forward / np.where(base != 0, base, 1.0) - 1.0,
+                np.nan,
+            )
+
+    if "spread_change" in types:
+        spread = (
+            features[:, _ASK].astype(np.float64)
+            - features[:, _BID].astype(np.float64)
+        )
+        cs = np.concatenate([[0.0], np.nancumsum(spread)])
+        base = _windowed_mean(cs, t, t + window)
+        forward = _windowed_mean(cs, future_safe, future_safe + window)
+        result["spread_change"] = np.where(
+            valid_window, forward - base, np.nan
+        )
+
+    if "volatility" in types or "volatility_change" in types:
+        mid = (
+            features[:, _BID].astype(np.float64)
+            + features[:, _ASK].astype(np.float64)
+        ) / 2.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_returns = np.diff(np.log(mid))
+        s1, s2, counts = _nan_cumsums(log_returns)
+
+        if "volatility" in types:
+            # Preserve the legacy pair target: realized volatility over
+            # [t, min(t+h, close)).
+            end = np.minimum(future, n)
+            result["volatility"] = _windowed_std(
+                s1, s2, counts, t, end - 1
+            )
+
+        if "volatility_change" in types:
+            base = _windowed_std(
+                s1,
+                s2,
+                counts,
+                np.broadcast_to(t, future.shape),
+                np.broadcast_to(t + window - 1, future.shape),
+            )
+            forward = _windowed_std(
+                s1,
+                s2,
+                counts,
+                future_safe,
+                future_safe + window - 1,
+            )
+            result["volatility_change"] = np.where(
+                valid_window, forward - base, np.nan
+            )
+
+    return result
+
+
+def _risk_factor_day(risk_factor: dict, date: str, index: int):
+    date_index = risk_factor["date_to_idx"].get(date)
+    if date_index is None:
+        return None, 0
+    values = risk_factor["features"][date_index]
+    if index < 0 or index >= len(values):
+        return None, 0
+    return values, len(values)
+
+
+def compute_pair_targets(
+    focal_features: np.ndarray,
+    t_idx: int,
+    horizons: list[int],
+    types: list[str],
+    rf_data: dict[str, dict] | None = None,
+    rf_price_mode: str | None = None,
+    date_str: str | None = None,
+    rf_t_idx: int | None = None,
+    *,
+    measurement_window: int = RETURN_VWAP_WINDOW,
+) -> np.ndarray:
+    """Compute selected raw targets for one decision instant.
+
+    Work is lazy by target family: VWAP, spread, and log-return prefix sums are
+    built only when their corresponding target is requested. All requested
+    horizons share those prefix sums.
+    """
+    type_order = tuple(types)
+    hs = np.asarray(horizons, dtype=np.int64)
+    arrays = _standard_target_arrays(
+        focal_features,
+        np.asarray([t_idx]),
+        hs,
+        type_order,
+        int(measurement_window),
+    )
+    output = [arrays[target_type][0] for target_type in type_order]
+
+    if rf_data and rf_price_mode and date_str is not None and rf_t_idx is not None:
+        if rf_price_mode not in {"mid", "vwap"}:
+            raise ValueError("rf_price_mode must be 'mid', 'vwap', or None")
+        n_focal = len(focal_features)
+        focal_mid = (
+            focal_features[t_idx, _BID] + focal_features[t_idx, _ASK]
+        ) / 2.0
+        focal_future = np.minimum(t_idx + hs, n_focal - 1)
+        focal_future_mid = (
+            focal_features[focal_future, _BID]
+            + focal_features[focal_future, _ASK]
+        ) / 2.0
+        focal_gross = (
+            focal_future_mid / focal_mid
+            if focal_mid != 0
+            else np.full(len(hs), np.nan)
+        )
+
+        for risk_factor in rf_data.values():
+            values, n_risk_factor = _risk_factor_day(
+                risk_factor, date_str, rf_t_idx
+            )
+            adjusted = np.full(len(hs), np.nan, dtype=np.float64)
+            if values is not None:
+                rf_future = np.minimum(rf_t_idx + hs, n_risk_factor - 1)
+                matching = (focal_future - t_idx) == (rf_future - rf_t_idx)
+                if rf_price_mode == "mid":
+                    rf_base = (
+                        values[rf_t_idx, _BID] + values[rf_t_idx, _ASK]
+                    ) / 2.0
+                    rf_forward = (
+                        values[rf_future, _BID] + values[rf_future, _ASK]
+                    ) / 2.0
+                else:
+                    rf_base = values[rf_t_idx, _VWAP]
+                    rf_forward = values[rf_future, _VWAP]
+                if rf_base != 0:
+                    adjusted[matching] = (
+                        focal_gross[matching]
+                        - rf_forward[matching] / rf_base
+                    )
+            output.append(adjusted)
+
+    if not output:
+        return np.empty(0, dtype=np.float32)
+    return np.concatenate(output).astype(np.float32, copy=False)
+
+
 def _windowed_std(s1, s2, cn, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
     """Population std (ddof=0, matching ``np.nanstd``) over ``r[lo:hi]``."""
     lo = np.clip(lo, 0, len(cn) - 1)
@@ -163,58 +373,15 @@ def anchor_targets(
     Returns:
         (A, T, H) float64, ``T`` ordered as :data:`ANCHOR_TARGET_TYPES`.
     """
-    n = len(features)
     if anchors is None:
-        anchors = anchor_indices(n, spec=spec)
+        anchors = anchor_indices(len(features), spec=spec)
     anchors = np.asarray(anchors, dtype=np.int64)
     hs = np.asarray(list(horizons), dtype=np.int64)
-
-    bid = features[:, _BID].astype(np.float64)
-    ask = features[:, _ASK].astype(np.float64)
-    mid = (bid + ask) / 2.0
-    spread = ask - bid
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        logmid = np.log(mid)
-    r = np.diff(logmid)
-    s1, s2, cn = _nan_cumsums(r)
-
-    t = anchors[:, None]                      # (A, 1)
-    fut = t + hs[None, :]                     # (A, H)
-    # No clamp: a window that would run past the last row has no target.
-    # Every target now needs its forward window to fit, not just the horizon.
-    measurement_window = spec.measurement_window_seconds
-    valid = (fut + measurement_window) <= n
-    fut_safe = np.where(valid, fut, 0)
-
-    # Both ends are forward VWAP windows of the same shape, so the base is
-    # unknowable at t and no statistic computed at t can be correlated with its
-    # measurement error.
-    base = forward_vwap(features, anchors, measurement_window)[:, None]
-    fwd_px = forward_vwap(features, fut_safe, measurement_window)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ret = np.where(valid & np.isfinite(base) & (base != 0),
-                       fwd_px / np.where(base != 0, base, 1.0) - 1.0, np.nan)
-
-    # Change targets also compare two forward windows so their baseline is not
-    # a spread or volatility measurement already visible in the input.
-    w = measurement_window
-    cs_spread = np.concatenate([[0.0], np.nancumsum(spread)])
-    spr_base = _windowed_mean(cs_spread, t, t + w)              # (A,1)
-    spr_fwd = _windowed_mean(cs_spread, fut_safe, fut_safe + w)  # (A,H)
-    spr = np.where(valid, spr_fwd - spr_base, np.nan)
-
-    # Realized vol over each window. mids[a:b] -> log-returns r[a:b-1], hence
-    # the -1 on the upper bound.
-    vol_base = _windowed_std(s1, s2, cn, np.broadcast_to(t, fut.shape),
-                             np.broadcast_to(t + w - 1, fut.shape))
-    vol_fwd = _windowed_std(s1, s2, cn, fut_safe, fut_safe + w - 1)
-    vol = np.where(valid, vol_fwd - vol_base, np.nan)
-
-    out = np.empty(
-        (len(anchors), len(ANCHOR_TARGET_TYPES), len(hs)), dtype=np.float64
+    arrays = _standard_target_arrays(
+        features,
+        anchors,
+        hs,
+        ANCHOR_TARGET_TYPES,
+        spec.measurement_window_seconds,
     )
-    out[:, ANCHOR_TARGET_TYPES.index("return"), :] = ret
-    out[:, ANCHOR_TARGET_TYPES.index("volatility_change"), :] = vol
-    out[:, ANCHOR_TARGET_TYPES.index("spread_change"), :] = spr
-    return out
+    return np.stack([arrays[name] for name in ANCHOR_TARGET_TYPES], axis=1)
