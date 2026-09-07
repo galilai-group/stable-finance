@@ -349,6 +349,7 @@ def anchor_targets(
     horizons,
     anchors: np.ndarray | None = None,
     *,
+    types=ANCHOR_TARGET_TYPES,
     spec: AnchorSpec = DEFAULT_ANCHOR_SPEC,
 ) -> np.ndarray:
     """Raw forward targets for one (ticker, date) at every anchor.
@@ -361,19 +362,26 @@ def anchor_targets(
         features: (N, 9) raw 1 Hz rows, ffilled, NOT normalized.
         horizons: forward horizons in seconds.
         anchors: 1 Hz row indices; defaults to the standard grid.
+        types: requested target families. Unrequested families are not built.
 
     Returns:
-        (A, T, H) float64, ``T`` ordered as :data:`ANCHOR_TARGET_TYPES`.
+        (A, T, H) float64, ``T`` ordered as ``types``.
     """
     if anchors is None:
         anchors = anchor_indices(len(features), spec=spec)
     anchors = np.asarray(anchors, dtype=np.int64)
     hs = np.asarray(list(horizons), dtype=np.int64)
+    requested = tuple(types)
+    unknown = set(requested) - set(ANCHOR_TARGET_TYPES)
+    if unknown:
+        raise ValueError(f"unknown anchor target types: {sorted(unknown)}")
+    if not requested:
+        raise ValueError("types cannot be empty")
     arrays = _standard_target_arrays(
         features,
         anchors,
         hs,
-        ANCHOR_TARGET_TYPES,
+        requested,
         spec.measurement_window_seconds,
     )
-    return np.stack([arrays[name] for name in ANCHOR_TARGET_TYPES], axis=1)
+    return np.stack([arrays[name] for name in requested], axis=1)

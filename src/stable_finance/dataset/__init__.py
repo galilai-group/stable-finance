@@ -55,6 +55,21 @@ from stable_finance.dataset.targets import (
     build_cross_section_metadata,
 )
 from stable_finance.dataset.views import ViewMetadata, ViewSpec
+from stable_finance.dataset.views import prepare_view
+from stable_finance.dataset.panels import (
+    PanelObservation,
+    build_sample_panel,
+    build_session_panel,
+    choose_cell_aggregation,
+    evenly_spaced_anchors,
+    iter_month_panel,
+)
+from stable_finance.dataset.panel_cache import (
+    CacheClaimed,
+    CachedPanel,
+    PanelCache,
+    cache_key as panel_cache_key,
+)
 
 __all__ = [
     "FeatureSchema",
@@ -70,6 +85,10 @@ __all__ = [
     "CacheInfo",
     "ViewSpec",
     "ViewMetadata",
+    "PanelObservation",
+    "PanelCache",
+    "CachedPanel",
+    "CacheClaimed",
     "AnchorTargetStats",
     "CrossSectionalTargetBundle",
     "TARGET_TRANSFORMS",
@@ -79,6 +98,12 @@ __all__ = [
     "anchor_targets",
     "compute_pair_targets",
     "build_cross_section_metadata",
+    "build_sample_panel",
+    "build_session_panel",
+    "choose_cell_aggregation",
+    "evenly_spaced_anchors",
+    "iter_month_panel",
+    "panel_cache_key",
     "aggregate",
     "build_norm_groups",
     "ffill_vwap",
@@ -89,6 +114,7 @@ __all__ = [
     "normalize",
     "period_directories",
     "prior_vwap",
+    "prepare_view",
     "resample_session",
     "sparse_to_dense_grid",
     "standard_open_est",

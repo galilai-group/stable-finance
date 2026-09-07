@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
+from stable_finance.dataset.transforms import normalize
+
 
 @dataclass(frozen=True)
 class ViewMetadata:
@@ -69,3 +71,26 @@ class ViewSpec:
             raise ValueError("end_grid_seconds must be positive")
         if self.min_future_seconds < 0:
             raise ValueError("min_future_seconds cannot be negative")
+
+
+def prepare_view(
+    view: np.ndarray,
+    normalization_groups: list[tuple[list[int], bool]],
+    *,
+    start_seconds: float,
+    aggregation_seconds: float,
+) -> tuple[np.ndarray, ViewMetadata]:
+    """Normalize a materialized view and return its metadata separately."""
+    statistics: list[tuple[float, float]] = []
+    normalize(view, normalization_groups, stats_out=statistics)
+    return view, ViewMetadata(
+        start_seconds=float(start_seconds),
+        end_seconds=float(start_seconds + len(view) * aggregation_seconds),
+        aggregation_seconds=float(aggregation_seconds),
+        normalization_means=np.asarray(
+            [mean for mean, _ in statistics], dtype=np.float64
+        ),
+        normalization_scales=np.asarray(
+            [scale for _, scale in statistics], dtype=np.float64
+        ),
+    )

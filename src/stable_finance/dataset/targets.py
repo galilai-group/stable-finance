@@ -258,6 +258,9 @@ def build_cross_section_metadata(
     counts: np.ndarray,
     samples_by_decision,
     quantile_levels: np.ndarray,
+    *,
+    include_quantiles: bool = True,
+    include_sorted: bool = True,
 ) -> dict[str, np.ndarray]:
     """Build the arrays needed for every standard target representation.
 
@@ -269,18 +272,31 @@ def build_cross_section_metadata(
     levels = np.asarray(quantile_levels, dtype=np.float64)
     if levels.ndim != 1 or len(levels) < 2 or levels[0] != 0 or levels[-1] != 1:
         raise ValueError("quantile_levels must be a 1-D grid from 0 to 1")
-    samples = [
-        np.asarray(values, dtype=np.float32) for values in samples_by_decision
-    ]
+    result = {
+        "mu": mean,
+        "sigma": sigma,
+        "count": counts.astype(np.int32),
+    }
+    if not include_quantiles and not include_sorted:
+        return result
+    if samples_by_decision is None:
+        raise ValueError(
+            "samples_by_decision is required for rank or uniform metadata"
+        )
+    samples = [np.asarray(values, dtype=np.float32)
+               for values in samples_by_decision]
     if len(samples) != len(counts):
         raise ValueError("samples_by_decision must align with the decision axis")
     cell_shape = counts.shape[1:]
     width = max((len(values) for values in samples), default=0)
-    quantiles = np.full(
-        (len(samples), *cell_shape, len(levels)), np.nan, dtype=np.float32
+    quantiles = (
+        np.full((len(samples), *cell_shape, len(levels)), np.nan,
+                dtype=np.float32)
+        if include_quantiles else None
     )
-    sorted_values = np.full(
-        (len(samples), *cell_shape, width), np.nan, dtype=np.float32
+    sorted_values = (
+        np.full((len(samples), *cell_shape, width), np.nan, dtype=np.float32)
+        if include_sorted else None
     )
     for index, values in enumerate(samples):
         expected = (len(values), *cell_shape)
@@ -288,22 +304,22 @@ def build_cross_section_metadata(
             raise ValueError(
                 f"decision samples have shape {values.shape}; expected {expected}"
             )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            quantiles[index] = np.moveaxis(
-                np.nanquantile(values, levels, axis=0), 0, -1
-            ).astype(np.float32)
-        sorted_values[index, ..., :len(values)] = np.moveaxis(
-            np.sort(values, axis=0), 0, -1
-        )
-    return {
-        "mu": mean,
-        "sigma": sigma,
-        "count": counts.astype(np.int32),
-        "quantiles": quantiles,
-        "quantile_levels": levels.astype(np.float32),
-        "sorted_values": sorted_values,
-    }
+        if include_quantiles:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                quantiles[index] = np.moveaxis(
+                    np.nanquantile(values, levels, axis=0), 0, -1
+                ).astype(np.float32)
+        if include_sorted:
+            sorted_values[index, ..., :len(values)] = np.moveaxis(
+                np.sort(values, axis=0), 0, -1
+            )
+    if include_quantiles:
+        result["quantiles"] = quantiles
+        result["quantile_levels"] = levels.astype(np.float32)
+    if include_sorted:
+        result["sorted_values"] = sorted_values
+    return result
 
 
 def _normal_ppf(u: float) -> float:

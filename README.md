@@ -142,6 +142,30 @@ the vectorized anchor-grid path. Each requested family builds its cumulative
 statistics once and reuses them across horizons; unrequested families do no
 work. Risk-factor-adjusted returns are an optional extension of the same call.
 
+The same selectivity applies when building cross-sectional target tables:
+
+```bash
+python -m stable_finance.dataset.build_targets \
+  --mosaic-dir /data/market/mds --holiday-csv market_holidays.csv \
+  --out-dir /data/market/targets --start 2023-01 --end 2023-12 \
+  --target-types return --horizons 300 900 --transforms uniform
+```
+
+Polygon-to-MDS conversion is owned by the storage backend rather than by a
+model repository:
+
+```bash
+python -m stable_finance.dataset.write_mds \
+  --base-path /data/polygon/snapshots/1Hz \
+  --output /data/market/mds --start 2023-01 --end 2023-12
+```
+
+`build_session_panel` is the model-neutral injection point immediately before
+encoding. It returns normalized views, raw/transformed targets, and
+`ViewMetadata` separately. `PanelCache` preserves that separation on disk;
+model integrations may encode the metadata into tokens at batch time without
+embedding a token layout into the stored dataset.
+
 A model integration may implement `MonthlyProbeData`, allowing the existing
 probe to be fit with `RidgeProbe().fit_month("2020-01", source)` while keeping
 checkpoint and encoder concerns outside this repository.

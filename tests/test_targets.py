@@ -81,3 +81,18 @@ def test_table_builder_owns_moments_quantiles_and_exact_order_statistics():
     np.testing.assert_array_equal(table["quantiles"].ravel(), [1.0, 2.0, 3.0])
     # The cell is intentionally thinner than the production minimum.
     assert np.isnan(table["mu"]).all()
+
+
+def test_table_builder_can_skip_order_statistics():
+    values = np.array([[[1.0]], [[3.0]], [[2.0]]], dtype=np.float32)
+    table = build_cross_section_metadata(
+        values.sum(axis=0, keepdims=True),
+        (values * values).sum(axis=0, keepdims=True),
+        np.full((1, 1, 1), 3, dtype=np.int64),
+        None,
+        np.array([0.0, 0.5, 1.0]),
+        include_quantiles=False,
+        include_sorted=False,
+    )
+
+    assert set(table) == {"mu", "sigma", "count"}

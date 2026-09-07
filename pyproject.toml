@@ -15,7 +15,10 @@ dependencies = [
 
 [project.optional-dependencies]
 mds = [
+    "joblib>=1.5.0",
     "mosaicml-streaming>=0.10.0",
+    "pandas>=2.3.0",
+    "tqdm>=4.67.0",
     "zstandard>=0.25.0",
 ]
 
@@ -29,4 +32,3 @@ packages = ["src/stable_finance"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
