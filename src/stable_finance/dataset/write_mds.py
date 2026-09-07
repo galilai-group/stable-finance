@@ -49,6 +49,19 @@ MDS_COLUMNS = {
     "features": "ndarray:float32",
 }
 
+# THE DENSE LAYOUT. ``features`` is the reconstructed 1 Hz session --
+# (session_seconds, n_columns), forward- and zero-filled -- and ``grid_start``
+# is the epoch second of its first row, so the timestamps are an arange and
+# are not stored. SessionPreprocessor.transform adopts such a record instead
+# of rebuilding the grid; see its ``_from_dense`` for why the format exists
+# and what it measures.
+DENSE_MDS_COLUMNS = {
+    "ticker": "str",
+    "date": "str",
+    "grid_start": "int32",
+    "features": "ndarray:float32",
+}
+
 # Buffer flush threshold: number of partitions to accumulate before shuffling and writing
 BUFFER_FLUSH_PARTITIONS = 200
 

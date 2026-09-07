@@ -123,6 +123,8 @@ class SessionPreprocessor:
         ticker, date = str(sample.get("ticker", "")), str(sample.get("date", ""))
         if self.schedule is not None and self.schedule.is_closed(date):
             return None
+        if "grid_start" in sample:
+            return self._from_dense(sample, ticker, date)
         key = (ticker, date)
         cached = self._cache.get(key) if ticker and date else None
         if cached is not None:
@@ -163,4 +165,38 @@ class SessionPreprocessor:
                 _, (old_timestamps, old_features) = self._cache.popitem(last=False)
                 self._cached_bytes -= old_timestamps.nbytes + old_features.nbytes
             features = features.astype(np.float64)
+        return MarketSession(ticker, date, timestamps, features, self.schema)
+
+    def _from_dense(self, sample: Mapping, ticker: str, date: str) -> MarketSession:
+        """Adopt an already-gridded record instead of rebuilding the grid.
+
+        A record written by ``write_mds --dense`` stores the reconstructed 1 Hz
+        session rather than the observed ticks: ``features`` is already
+        ``(session_seconds, n_columns)`` with forward- and zero-fill applied,
+        and ``grid_start`` is the epoch second of its first row. The timestamps
+        are then an arange, which is why they are not stored.
+
+        WHY THE FORMAT EXISTS. Rebuilding the grid is 71% of the CPU a
+        dataloader worker spends on a sample (2.89 ms of 4.08 ms; the MDS read
+        is 0.25 ms and cropping two global views is 0.95 ms), and it is
+        recomputed identically on every visit. Storing the result is also
+        SMALLER on the wire despite being 1.74x more raw bytes: a filled grid
+        is runs of repeated values, which zstd removes, while the sparse form
+        pays for a monotone int32 timestamp column that does not compress.
+        Measured at 0.75-0.80x of the sparse record across 2009-06, 2015-06 and
+        2023-01 at zstd levels 1, 3 and 9.
+
+        The cache is bypassed deliberately: its whole purpose was to amortize
+        the grid rebuild, and there is nothing left to amortize. Holding a
+        second copy of data the page cache already has would only take memory
+        from the reader.
+        """
+        features = np.asarray(sample["features"])
+        if features.ndim == 1:
+            features = features.reshape(-1, len(self.schema.columns))
+        start = int(np.asarray(sample["grid_start"]).reshape(-1)[0])
+        timestamps = np.arange(start, start + len(features), dtype=np.int64)
+        features = features.astype(np.float64)
+        if self.zero_indices:
+            features[:, self.zero_indices] = 0.0
         return MarketSession(ticker, date, timestamps, features, self.schema)
