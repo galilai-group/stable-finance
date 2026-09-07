@@ -12,7 +12,11 @@ from stable_finance.dataset.calendar import (
     standard_open_est,
     timeline_bounds_est,
 )
-from stable_finance.dataset.anchors import AnchorSpec, DEFAULT_ANCHOR_SPEC
+from stable_finance.dataset.anchors import (
+    AnchorSpec,
+    DEFAULT_ANCHOR_SPEC,
+    DEFAULT_TARGET_HORIZONS,
+)
 from stable_finance.dataset.grid import CacheInfo, SessionPreprocessor, sparse_to_dense_grid
 from stable_finance.dataset.months import Month, next_month
 from stable_finance.dataset.outcomes import (
@@ -56,6 +60,7 @@ __all__ = [
     "FeatureSchema",
     "AnchorSpec",
     "DEFAULT_ANCHOR_SPEC",
+    "DEFAULT_TARGET_HORIZONS",
     "EASTERN_TIME",
     "MARKET_SCHEMA",
     "MarketSchedule",

@@ -11,16 +11,20 @@ from stable_finance.metrics import (
     cross_spread_sharpe,
     evaluate_forward_returns,
     grouped_rank_ic,
+    grouped_rank_ic_by_label,
     mid_price_sharpe,
     sharpe_ratio,
+    paired_difference,
+    pooled_estimates,
 )
 from stable_finance.portfolio import BacktestResult, evaluate_weights
-from stable_finance.probes import MonthlyProbeData, RidgeProbe, fit
+from stable_finance.probes import ColumnwiseRidge, MonthlyProbeData, RidgeProbe, fit
 
 __all__ = [
     "BacktestResult",
     "AnchorTargetStats",
     "CrossSectionalTargetBundle",
+    "ColumnwiseRidge",
     "Embeddings",
     "ForwardReturns",
     "InformationCoefficient",
@@ -33,6 +37,9 @@ __all__ = [
     "evaluate_weights",
     "fit",
     "grouped_rank_ic",
+    "grouped_rank_ic_by_label",
     "mid_price_sharpe",
     "sharpe_ratio",
+    "paired_difference",
+    "pooled_estimates",
 ]

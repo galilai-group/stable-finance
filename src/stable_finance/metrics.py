@@ -79,6 +79,74 @@ def grouped_rank_ic(predicted: ArrayLike, realized: ArrayLike, *,
     return InformationCoefficient(float(array.mean()), standard_error, len(array))
 
 
+def grouped_rank_ic_by_label(
+    predicted: ArrayLike,
+    realized: ArrayLike,
+    groups: ArrayLike,
+    *,
+    min_assets: int = 20,
+) -> InformationCoefficient:
+    """Average Spearman correlation over a flat, explicitly grouped panel.
+
+    This is the injectable counterpart to :func:`grouped_rank_ic`: callers
+    that assemble sparse or cached panels need not first densify them into a
+    decision-by-asset rectangle.
+    """
+    predicted = np.asarray(predicted, dtype=np.float64).ravel()
+    realized = np.asarray(realized, dtype=np.float64).ravel()
+    groups = np.asarray(groups).ravel()
+    if predicted.shape != realized.shape or predicted.shape != groups.shape:
+        raise ValueError("predicted, realized, and groups must have equal length")
+    if min_assets < 2:
+        raise ValueError("min_assets must be at least 2")
+    valid = np.isfinite(predicted) & np.isfinite(realized)
+    predicted, realized, groups = predicted[valid], realized[valid], groups[valid]
+    if len(predicted) == 0:
+        return InformationCoefficient(np.nan, np.nan, 0)
+    order = np.argsort(groups, kind="stable")
+    predicted, realized, groups = predicted[order], realized[order], groups[order]
+    bounds = np.flatnonzero(np.r_[True, groups[1:] != groups[:-1], True])
+    values = []
+    for low, high in zip(bounds[:-1], bounds[1:]):
+        if high - low < min_assets:
+            continue
+        value = _pearson_correlation(
+            _rankdata(predicted[low:high]), _rankdata(realized[low:high])
+        )
+        if np.isfinite(value):
+            values.append(value)
+    if not values:
+        return InformationCoefficient(np.nan, np.nan, 0)
+    array = np.asarray(values)
+    standard_error = (
+        float(array.std(ddof=1) / np.sqrt(len(array))) if len(array) > 1 else np.nan
+    )
+    return InformationCoefficient(float(array.mean()), standard_error, len(array))
+
+
+def pooled_estimates(values: ArrayLike) -> InformationCoefficient:
+    """Pool estimates with each supplied value as one independent unit."""
+    array = np.asarray(values, dtype=np.float64).ravel()
+    array = array[np.isfinite(array)]
+    if len(array) == 0:
+        return InformationCoefficient(np.nan, np.nan, 0)
+    standard_error = (
+        float(array.std(ddof=1) / np.sqrt(len(array))) if len(array) > 1 else np.nan
+    )
+    return InformationCoefficient(float(array.mean()), standard_error, len(array))
+
+
+def paired_difference(
+    estimates: ArrayLike, baselines: ArrayLike
+) -> InformationCoefficient:
+    """Pool paired estimate-minus-baseline differences."""
+    estimates = np.asarray(estimates, dtype=np.float64)
+    baselines = np.asarray(baselines, dtype=np.float64)
+    if estimates.shape != baselines.shape:
+        raise ValueError("estimates and baselines must have matching shapes")
+    return pooled_estimates(estimates - baselines)
+
+
 def evaluate_forward_returns(
     predicted: ForwardReturns,
     realized: ForwardReturns,

@@ -5,8 +5,11 @@ from stable_finance.metrics import (
     cross_spread_sharpe,
     evaluate_forward_returns,
     grouped_rank_ic,
+    grouped_rank_ic_by_label,
     mid_price_sharpe,
     sharpe_ratio,
+    paired_difference,
+    pooled_estimates,
 )
 
 
@@ -25,6 +28,21 @@ def test_grouped_rank_ic_drops_incomplete_small_cross_sections():
     )
     assert result.mean == 1.0
     assert result.observations == 1
+
+
+def test_flat_grouped_rank_ic_is_an_injectable_equivalent():
+    predicted = np.array([1, 2, 2, 4, 4, 3, 2, 1])
+    realized = np.array([1, 2, 2, 4, 1, 2, 3, 4])
+    result = grouped_rank_ic_by_label(
+        predicted, realized, np.repeat([10, 20], 4), min_assets=2
+    )
+    assert result.mean == 0.0
+    assert result.standard_error == 1.0
+
+
+def test_month_pooling_and_paired_differences():
+    assert pooled_estimates([1, 2, 3]).mean == 2
+    assert paired_difference([2, 4], [1, 1]).mean == 2
 
 
 def test_sharpe_uses_sample_volatility_and_annualizes():

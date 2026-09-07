@@ -6,7 +6,7 @@ from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
 import stable_finance as sf
-from stable_finance import Embeddings, ForwardReturns, RidgeProbe
+from stable_finance import ColumnwiseRidge, Embeddings, ForwardReturns, RidgeProbe
 from stable_finance.dataset import Month
 
 
@@ -110,3 +110,13 @@ def test_top_level_fit_maps_embeddings_to_forecasts():
     np.testing.assert_array_equal(
         fitted.predict(embeddings).horizons, targets.horizons
     )
+
+
+def test_columnwise_ridge_accepts_irregular_cached_panels():
+    embeddings, targets = panel()
+    X = embeddings.values.reshape(-1, 3)
+    y = targets.values.reshape(-1, 2)
+    y[:5, 1] = np.nan
+    model = ColumnwiseRidge(alpha=[1.0, 10.0]).fit(X, y)
+    assert model.predict(X).shape == y.shape
+    assert clone(model).get_params() == {"alpha": [1.0, 10.0], "min_samples": 20}
