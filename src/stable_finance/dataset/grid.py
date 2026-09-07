@@ -191,6 +191,18 @@ class SessionPreprocessor:
         second copy of data the page cache already has would only take memory
         from the reader.
         """
+        if self.extended_hours or self.bounds is not None:
+            # A DENSE RECORD CARRIES ONE GRID, and it is the regular session.
+            # Silently handing it back to a caller that asked for extended
+            # hours (or for custom bounds) would return a 6.5-hour view where a
+            # 16-hour one was requested, with nothing in the data to say so --
+            # the failure would surface as a quietly different model. Callers
+            # needing either must read a sparse dataset, which a densify
+            # conversion does not destroy.
+            raise ValueError(
+                "dense records are the regular session only; "
+                "extended_hours and custom bounds require a sparse dataset"
+            )
         features = np.asarray(sample["features"])
         if features.ndim == 1:
             features = features.reshape(-1, len(self.schema.columns))
