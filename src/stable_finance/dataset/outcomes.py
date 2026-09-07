@@ -34,22 +34,8 @@ def forward_vwap(features: np.ndarray, idx, window: int = RETURN_VWAP_WINDOW):
     ``targets.compute_pair_targets`` (training) so the thing a model is trained
     on and the thing it is scored on cannot drift apart.
     """
-    vw = features[:, _VWAP].astype(np.float64)
-    vol = np.nan_to_num(features[:, _VOL].astype(np.float64), nan=0.0)
-    num = np.nan_to_num(vw * vol, nan=0.0)
-    c_num = np.concatenate([[0.0], np.cumsum(num)])
-    c_vol = np.concatenate([[0.0], np.cumsum(vol)])
-
-    n = len(features)
-    a = np.asarray(idx, dtype=np.int64)
-    lo, hi = a, a + int(window)
-    ok = (lo >= 0) & (hi <= n)
-    lo_s, hi_s = np.clip(lo, 0, n), np.clip(hi, 0, n)
-    den = c_vol[hi_s] - c_vol[lo_s]
-    with np.errstate(invalid="ignore", divide="ignore"):
-        out = np.where(ok & (den > 0),
-                       (c_num[hi_s] - c_num[lo_s]) / np.where(den > 0, den, 1.0),
-                       np.nan)
+    cs_num, cs_volume = _vwap_cumsums(features)
+    out = _windowed_vwap(cs_num, cs_volume, len(features), idx, window)
     return out if np.ndim(idx) else float(out)
 
 ANCHOR_TARGET_TYPES = ("return", "volatility_change", "spread_change")
@@ -147,18 +133,29 @@ def _windowed_mean(cs, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
         return np.where(n > 0, (cs[hi] - cs[lo]) / np.where(n > 0, n, 1.0), np.nan)
 
 
-def _windowed_vwap(features: np.ndarray, idx, window: int):
-    """Vectorized VWAP using one pair of prefix sums."""
+def _vwap_cumsums(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     vw = features[:, _VWAP].astype(np.float64)
     volume = np.nan_to_num(features[:, _VOL].astype(np.float64), nan=0.0)
     numerator = np.nan_to_num(vw * volume, nan=0.0)
-    cs_num = np.concatenate([[0.0], np.cumsum(numerator)])
-    cs_volume = np.concatenate([[0.0], np.cumsum(volume)])
+    return (
+        np.concatenate([[0.0], np.cumsum(numerator)]),
+        np.concatenate([[0.0], np.cumsum(volume)]),
+    )
+
+
+def _windowed_vwap(
+    cs_num: np.ndarray,
+    cs_volume: np.ndarray,
+    length: int,
+    idx,
+    window: int,
+):
+    """Read one or many VWAP windows from shared prefix sums."""
     indices = np.asarray(idx, dtype=np.int64)
     lo, hi = indices, indices + int(window)
-    valid = (lo >= 0) & (hi <= len(features))
-    lo_safe = np.clip(lo, 0, len(features))
-    hi_safe = np.clip(hi, 0, len(features))
+    valid = (lo >= 0) & (hi <= length)
+    lo_safe = np.clip(lo, 0, length)
+    hi_safe = np.clip(hi, 0, length)
     denominator = cs_volume[hi_safe] - cs_volume[lo_safe]
     with np.errstate(invalid="ignore", divide="ignore"):
         return np.where(
@@ -190,8 +187,13 @@ def _standard_target_arrays(
     result: dict[str, np.ndarray] = {}
 
     if "return" in types:
-        base = _windowed_vwap(features, t[:, 0], window)[:, None]
-        forward = _windowed_vwap(features, future_safe, window)
+        cs_num, cs_volume = _vwap_cumsums(features)
+        base = _windowed_vwap(
+            cs_num, cs_volume, n, t[:, 0], window
+        )[:, None]
+        forward = _windowed_vwap(
+            cs_num, cs_volume, n, future_safe, window
+        )
         with np.errstate(invalid="ignore", divide="ignore"):
             result["return"] = np.where(
                 valid_window & np.isfinite(base) & (base != 0),
