@@ -42,6 +42,7 @@ from stable_finance.dataset.transforms import (
     ffill_vwap,
     normalize,
     prior_vwap,
+    resample_session,
 )
 from stable_finance.dataset.targets import (
     AnchorTargetStats,
@@ -83,6 +84,7 @@ __all__ = [
     "normalize",
     "period_directories",
     "prior_vwap",
+    "resample_session",
     "sparse_to_dense_grid",
     "standard_open_est",
     "timeline_bounds_est",

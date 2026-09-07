@@ -16,6 +16,7 @@ from stable_finance.dataset import (
     next_month,
     normalize,
     period_directories,
+    resample_session,
     sparse_to_dense_grid,
     standard_open_est,
     timeline_bounds_est,
@@ -169,3 +170,16 @@ def test_market_session_retains_explicit_boundaries_for_future_framing():
     ).bar_seconds == 60
     with pytest.raises(ValueError, match="strictly increasing"):
         MarketSession("ABC", "2023-01-03", [2, 1], np.ones((2, 9)))
+
+
+def test_session_can_be_materialized_at_minute_resolution():
+    features = np.tile(np.arange(1, 10, dtype=np.float64), (120, 1))
+    session = MarketSession(
+        "ABC", "2023-01-03", np.arange(120), features,
+    )
+    minute = resample_session(session, 60)
+    assert minute.bar_seconds == 60
+    np.testing.assert_array_equal(minute.timestamps, [0, 60])
+    assert minute.features.shape == (2, 9)
+    with pytest.raises(ValueError, match="integer multiple"):
+        resample_session(minute, 90)

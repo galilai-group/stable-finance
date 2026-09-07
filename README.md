@@ -108,6 +108,15 @@ backend can therefore produce the same object. Sessions retain explicit date
 boundaries so a future multi-day framer can insert learned open and close
 tokens without changing storage or target APIs.
 
+`MarketSession.bar_seconds` makes native resolution explicit, and
+`resample_session(session, 60)` produces schema-correct minute bars (last
+quotes and sizes, OHLC extrema, summed activity, volume-weighted VWAP). Target
+tables should still be built from the 1 Hz source before discarding it:
+spread-change and volatility-change use within-minute information that the
+nine aggregated columns cannot reconstruct. A compact downstream dataset can
+therefore store minute features plus precomputed requested targets without
+changing their definitions.
+
 View geometry is configuration. `ViewSpec()` records the current 2,048-token,
 50–100% of session recipe. `AnchorSpec()` independently records the session,
 decision-grid, and forward-measurement geometry. Sequence length, view scale,

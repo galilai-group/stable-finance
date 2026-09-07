@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from stable_finance.dataset.schema import MARKET_SCHEMA, FeatureSchema
+from stable_finance.dataset.schema import MARKET_SCHEMA, FeatureSchema, MarketSession
 
 EPS = 1e-5
 
@@ -84,6 +84,33 @@ def aggregate(
         partial = source[full_count * scale_factor:]
         reduce(partial, output[full_count])
     return output
+
+
+def resample_session(session: MarketSession, bar_seconds: int) -> MarketSession:
+    """Convert a dense session to a coarser native bar resolution.
+
+    Only integer coarsening is accepted; silently interpolating between grids
+    would change both view geometry and target horizons. The last bucket may
+    be partial and is retained using the same schema-aware reducers.
+    """
+    target = int(bar_seconds)
+    if target < session.bar_seconds or target % session.bar_seconds:
+        raise ValueError(
+            "bar_seconds must be an integer multiple of the source resolution"
+        )
+    factor = target // session.bar_seconds
+    features = aggregate(session.features, factor, schema=session.schema)
+    if features is None:
+        raise ValueError("session is too short to produce two output bars")
+    timestamps = session.timestamps[::factor][:len(features)]
+    return MarketSession(
+        ticker=session.ticker,
+        date=session.date,
+        timestamps=timestamps,
+        features=features,
+        schema=session.schema,
+        bar_seconds=target,
+    )
 
 
 def prior_vwap(
