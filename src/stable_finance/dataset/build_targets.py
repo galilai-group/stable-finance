@@ -163,14 +163,14 @@ def build_month(
     holiday_csv: str,
     workers: int,
     *,
-    target_types: tuple[str, ...] = tuple(ANCHOR_TARGET_TYPES),
+    target_types: tuple[str, ...] = tuple(TARGET_TYPES),
     horizons: tuple[int, ...] = DEFAULT_TARGET_HORIZONS,
     transforms: tuple[str, ...] = TARGET_TRANSFORMS,
 ) -> Path:
     """Build one month, calculating only requested families and horizons."""
     from joblib import Parallel, delayed
 
-    unknown_types = set(target_types) - set(ANCHOR_TARGET_TYPES)
+    unknown_types = set(target_types) - set(TARGET_TYPES)
     unknown_transforms = set(transforms) - set(TARGET_TRANSFORMS)
     if unknown_types:
         raise ValueError(f"unknown target types: {sorted(unknown_types)}")
@@ -255,8 +255,8 @@ def main(argv=None, *, default_mosaic_dir=None, default_holiday_csv=None):
                    required=default_holiday_csv is None)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--overwrite", action="store_true")
-    p.add_argument("--target-types", nargs="+", choices=ANCHOR_TARGET_TYPES,
-                   default=list(ANCHOR_TARGET_TYPES))
+    p.add_argument("--target-types", nargs="+", choices=TARGET_TYPES,
+                   default=list(TARGET_TYPES))
     p.add_argument("--horizons", nargs="+", type=int,
                    default=list(DEFAULT_TARGET_HORIZONS))
     p.add_argument("--transforms", nargs="+", choices=TARGET_TRANSFORMS,
