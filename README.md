@@ -114,6 +114,25 @@ decision-grid, and forward-measurement geometry. Sequence length, view scale,
 resolution, anchor spacing, and future slack are therefore configuration rather
 than hidden dataset constants.
 
+Raw outcome construction is also injectable and selective. Request only the
+task families and horizons needed by a model or evaluation:
+
+```python
+from stable_finance.dataset import compute_pair_targets
+
+y = compute_pair_targets(
+    session.features,
+    decision_index,
+    horizons=[300, 900],
+    types=["return"],
+)
+```
+
+The return, spread-change, and volatility-change definitions are shared with
+the vectorized anchor-grid path. Each requested family builds its cumulative
+statistics once and reuses them across horizons; unrequested families do no
+work. Risk-factor-adjusted returns are an optional extension of the same call.
+
 A model integration may implement `MonthlyProbeData`, allowing the existing
 probe to be fit with `RidgeProbe().fit_month("2020-01", source)` while keeping
 checkpoint and encoder concerns outside this repository.
@@ -136,6 +155,6 @@ uv run pytest
 4. Add an order/fill contract and bid/ask execution simulator.
 5. Expose serialized evaluation results through a small visualization app.
 
-Research-specific checkpoint loading, risk-factor-adjusted target assembly, and
-training remain in `market-jepa`; they depend on this package's public dataset
-and outcome contracts rather than duplicating them.
+Research-specific checkpoint loading, tensor collation, model augmentation,
+and training remain in `market-jepa`; they depend on this package's public
+dataset and outcome contracts rather than duplicating them.
