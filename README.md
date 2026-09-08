@@ -6,9 +6,21 @@ return forecasts (`y_hat`), portfolio weights, or orders; stable-finance only
 runs the downstream adapters and metrics you ask for.
 
 ```text
-embeddings -> forward returns -> portfolio weights -> orders
-     |               |                 |              |
-     +------ IC -----+                 +---- Sharpe ---+
+┌───────────────────────────────────────────────────────────┐
+│                    Dataset / I/O                          │
+│                                                           │
+│                    1 Hz Market Data                       │
+│                          ↓                                 │
+│              views + targets + metadata                   │
+└──────────────────────────┬────────────────────────────────┘
+                           ↓
+                         model
+                           │
+          ┌────────────────┼────────────────┬───────────────┐
+          ↓                ↓                ↓               ↓
+     embeddings -> forward returns -> portfolio weights -> orders
+          |                |                 |               |
+          +------- IC -----+                 +---- Sharpe ---+
 ```
 
 The package follows scikit-learn's estimator vocabulary: adapters expose
