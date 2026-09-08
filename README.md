@@ -10,7 +10,7 @@ runs the downstream adapters and metrics you ask for.
 │                    Dataset / I/O                          │
 │                                                           │
 │                    1 Hz Market Data                       │
-│                          ↓                                 │
+│                          ↓                                │
 │              views + targets + metadata                   │
 └──────────────────────────┬────────────────────────────────┘
                            ↓
