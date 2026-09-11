@@ -42,6 +42,14 @@ class PanelObservation:
     metadata: ViewMetadata
     target: np.ndarray
     raw_target: np.ndarray
+    quote: np.ndarray | None = None
+    """``[best_bid, best_ask]`` in natural units at the decision row.
+
+    The observable market at the instant the decision is made, carried beside
+    the view because the view is normalized and its scale is per-observation.
+    ``None`` when the producer does not supply it; NaN marks an asset that was
+    not quoting, which the execution simulator treats as unfillable.
+    """
 
 
 def choose_cell_aggregation(
@@ -110,6 +118,12 @@ def build_session_panel(
     choices = view_spec.aggregation_seconds or range(6, 12)
     fixed = choices[0] if choices[0] == choices[1] else None
     features = session.features
+    # Read off THIS session's schema rather than a module constant: the
+    # execution stage charges the spread that was actually quoted, and a
+    # backend that reorders its columns must move these indices with it.
+    quote_columns = [
+        session.schema.index("bid_price"), session.schema.index("ask_price"),
+    ]
     offset = int(session.timestamps[0]) - standard_open_est(session.date)
     output = []
     for anchor_value in anchors:
@@ -158,6 +172,7 @@ def build_session_panel(
             metadata=metadata,
             target=target.ravel().astype(np.float32),
             raw_target=raw.ravel().astype(np.float32),
+            quote=features[row, quote_columns].astype(np.float64),
         ))
     return output
 
