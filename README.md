@@ -7,20 +7,20 @@ runs the downstream adapters and metrics you ask for.
 
 ```text
 ┌───────────────────────────────────────────────────────────┐
-│                    Dataset / I/O                          │
+│                       Dataset / I/O                       │
 │                                                           │
-│                    1 Hz Market Data                       │
-│                          ↓                                │
-│              views + targets + metadata                   │
-└──────────────────────────┬────────────────────────────────┘
-                           ↓
-                         model
-                           │
-          ┌────────────────┼────────────────┬───────────────┐
-          ↓                ↓                ↓               ↓
-     embeddings -> forward returns -> portfolio weights -> orders
-          |                |                 |               |
-          +------- IC -----+                 +---- Sharpe ---+
+│                     1 Hz Market Data                      │
+│                              ↓                            │
+│                views + targets + metadata                 │
+└─────────────────────────────┬─────────────────────────────┘
+                              ↓
+                            model ← What you bring
+                              │
+      ┌───────────────┬───────┴──────────┬─────────────┐
+      ↓               ↓                  ↓             ↓
+  embeddings → forward returns → portfolio weights → orders
+      │               │                  │             │
+      └────── IC ─────┘                  └─── Sharpe ──┘
 ```
 
 The package follows scikit-learn's estimator vocabulary: adapters expose
@@ -35,8 +35,13 @@ provides:
   forecast horizon;
 - annualized portfolio Sharpe marked at mid;
 - annualized portfolio Sharpe after crossing the observable best-bid/best-ask
-  spread; and
-- weight backtesting with quoted half-spread costs and multiple horizons.
+  spread;
+- weight backtesting with quoted half-spread costs and multiple horizons;
+- per-horizon covariance estimation and a mean-variance allocator from
+  forecasts to weights that charges a proportional transaction cost for moving
+  away from the current portfolio; and
+- order and fill contracts with a bid/ask execution simulator that marks the
+  realized position path rather than the target weights.
 
 The contracts use dense arrays with shape
 `(decision time, asset, horizon)`. Decisions, assets, and horizons are carried
@@ -74,6 +79,61 @@ crossed = cross_spread_sharpe(
     weights, realized_mid_returns, best_bid, best_ask
 )
 ```
+
+## Forecasts to weights to orders
+
+`MeanVarianceAllocator` closes the gap between `y_hat` and weights. At each
+decision it solves
+
+```text
+max_w  mu'w - (risk_aversion / 2) w'Sigma w - sum_i cost_i |w_i - w_prev_i|
+```
+
+where `mu` is the forecast, `Sigma` the fitted covariance, and `cost_i` a
+proportional transaction cost per unit of weight traded, for instance the
+quoted half-spread over mid. The cost term is what makes the optimal portfolio
+depend on the portfolio currently held: small forecast changes do not justify
+paying the spread, so decisions are solved in order and each starts from the
+previous solution. With zero cost the allocator reduces to the closed-form
+`Sigma^-1 mu / risk_aversion`. The problem is convex and solved by
+accelerated proximal gradient descent, so nothing beyond numpy is required.
+
+```python
+from stable_finance import MeanVarianceAllocator, allocate
+
+allocator = MeanVarianceAllocator(risk_aversion=5.0, shrinkage=0.1)
+allocator.fit(train_returns)                        # Sigma per horizon
+weights = allocator.predict(forecast, cost=half_spread, initial=current)
+
+# Enter at forecasts with your own covariance: skip fitting.
+weights = allocate(forecast, covariance, risk_aversion=5.0, cost=half_spread)
+```
+
+`estimate_covariance` is the fitted estimator's public core: a pairwise sample
+covariance over finite observations, shrunk toward its diagonal and clipped to
+the positive semidefinite cone. A NaN cost marks an asset that cannot be
+traded at that decision, so it holds its previous weight; a NaN forecast is a
+zero expected return that still pays risk and cost.
+
+Orders are the weight changes along a target path; fills are what executed:
+
+```python
+from stable_finance import (
+    evaluate_fills, orders_from_weights, positions_from_fills, simulate_fills,
+)
+
+orders = orders_from_weights(weights, initial=current)
+fills = simulate_fills(orders, best_bid, best_ask)   # buys at ask, sells at bid
+held = positions_from_fills(fills, initial=current)  # PortfolioWeights actually held
+results = evaluate_fills(fills, realized_mid_returns, initial=current)
+```
+
+The simulator fills each order in full at the touch or not at all; an order
+without a positive quote is left unfilled and the realized position lags the
+target. When every order fills, `evaluate_fills` reproduces
+`cross_spread_sharpe` exactly. Depth, partial fills, impact, and commissions
+remain outside the simulator; bring your own `Fills` to evaluate a richer
+execution model.
 
 In the originating market-jepa setup, the default for supervised training,
 ridge fitting, and evaluation is the empirical-uniform target within each
@@ -196,7 +256,7 @@ uv run pytest
 1. Establish stage contracts and metric semantics.
 2. Add the ridge adapter from embeddings to forward-return forecasts.
 3. Add covariance estimation and a mean-variance adapter from forecasts to
-   weights.
+   weights, with a proportional transaction cost against the held portfolio.
 4. Add an order/fill contract and bid/ask execution simulator.
 5. Expose serialized evaluation results through a small visualization app.
 
