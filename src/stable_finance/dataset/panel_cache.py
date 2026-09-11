@@ -15,7 +15,12 @@ from stable_finance.dataset.panels import PanelObservation
 from stable_finance.dataset.views import ViewMetadata
 
 
-FORMAT_VERSION = 1
+# 2 (2026-09-10): panels carry the QUOTE column. The bump is the point: a
+# panel built under 1 has no quotes, and a reader that filled the gap with
+# NaN would hand the execution stage an unquoted market -- nothing fills,
+# every spread charges zero, and a frictionless Sharpe reports as a
+# spread-charged one. A miss costs a rebuild; a silent NaN costs a result.
+FORMAT_VERSION = 2
 
 
 class CacheClaimed(RuntimeError):
@@ -35,6 +40,7 @@ class CachedPanel:
     aggregations: np.ndarray
     normalization_means: np.ndarray
     normalization_scales: np.ndarray
+    quotes: np.ndarray
     metadata: dict
 
 
@@ -97,6 +103,7 @@ class PanelCache:
             "ends": "ends.npy", "aggregations": "aggregations.npy",
             "normalization_means": "normalization_means.npy",
             "normalization_scales": "normalization_scales.npy",
+            "quotes": "quotes.npy",
         }
         arrays = {
             name: np.load(directory / filename, allow_pickle=False)
@@ -129,6 +136,7 @@ class PanelCache:
                     ),
                     target=panel.targets[index],
                     raw_target=panel.raw_targets[index],
+                    quote=panel.quotes[index],
                 ))
             yield np.asarray(panel.views[sl], dtype=np.float32), observations
 
@@ -152,7 +160,7 @@ class PanelCache:
             columns = {name: [] for name in (
                 "targets", "raw_targets", "dates", "anchors", "tickers",
                 "starts", "ends", "aggregations", "normalization_means",
-                "normalization_scales",
+                "normalization_scales", "quotes",
             )}
             n_rows, view_shape = 0, None
             with open(partial / "views.raw", "wb", buffering=1 << 22) as output:
@@ -178,6 +186,14 @@ class PanelCache:
                         columns["aggregations"].append(row.metadata.aggregation_seconds)
                         columns["normalization_means"].append(row.metadata.normalization_means)
                         columns["normalization_scales"].append(row.metadata.normalization_scales)
+                        # An observation whose backend carried no bid/ask is
+                        # stored as NaN, which is what an absent quote MEANS
+                        # downstream -- distinct from the column being missing
+                        # entirely, which is what version 1 could not express.
+                        columns["quotes"].append(
+                            np.full(2, np.nan, dtype=np.float64)
+                            if row.quote is None
+                            else np.asarray(row.quote, dtype=np.float64))
                     n_rows += len(views)
             if not n_rows:
                 raise RuntimeError("cannot cache an empty panel")
