@@ -514,8 +514,8 @@ def main(argv=None, *, default_base_path=None, default_metadata_path=None,
     )
     parser.add_argument(
         "--holiday-csv",
-        default=None,
-        help="Path to market_holidays.csv. Closed days will be excluded from MDS conversion.",
+        default=os.environ.get("HOLIDAY_CSV"),
+        help="Path to market_holidays.csv ($HOLIDAY_CSV). Closed days will be excluded from MDS conversion.",
     )
     args = parser.parse_args(argv)
 

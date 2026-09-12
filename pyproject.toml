@@ -22,6 +22,18 @@ mds = [
     "zstandard>=0.25.0",
 ]
 
+[project.scripts]
+# The data-preparation CLIs, in pipeline order. Each reads its default paths
+# from the environment (RAW_DATA_DIR, METADATA_PATH, MOSAIC_DIR, HOLIDAY_CSV,
+# DAYSTORE_DIR, ...) so a consumer repo sets them once.
+sf-shard-months = "stable_finance.dataset.shard_months:main"   # raw parquet -> sparse MDS, all months
+sf-write-mds = "stable_finance.dataset.write_mds:main"          # one range, or --risk-factors
+sf-densify = "stable_finance.dataset.densify:main"              # sparse MDS -> dense sessions
+sf-build-targets = "stable_finance.dataset.build_targets:main"  # per-month anchor tables
+sf-daystore = "stable_finance.dataset.daystore:main"            # dense MDS -> day-major store
+sf-industry-map = "stable_finance.dataset.industry:main"        # (month, ticker) -> FF49
+sf-reshard = "stable_finance.dataset.reshard:main"              # date-ordered copy of a month
+
 [dependency-groups]
 dev = [
     "pytest>=9.0",

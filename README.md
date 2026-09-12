@@ -232,6 +232,30 @@ python -m stable_finance.dataset.write_mds \
   --output /data/market/mds --start 2023-01 --end 2023-12
 ```
 
+Training on cross-sectional cells reads a second layout, the day-major store
+(`stable_finance.dataset.daystore`): one record per trading day holding the
+whole cross-section as a channel-major `(tickers, channels, rows)` float32
+memmap, dense exactly as the mosaic stores it, with the forward targets and
+every cross-sectional transform precomputed at every anchor. A cell -- K stocks
+at one (date, anchor, resolution) -- is then K contiguous slices of one file
+and a `(K, T, H)` block of labels, and `stable_finance.dataset.cells` turns it
+into normalized views in one vectorized pass. The store is written from the
+dense mosaic and verified against it day by day:
+
+```bash
+sf-daystore --mosaic-dir /data/market/mds_dense --out-dir /data/market/days \
+  --start 2023-01 --end 2023-12 --holiday-csv market_holidays.csv --workers 8
+```
+
+The data-preparation pipeline is a set of console scripts, in order:
+`sf-shard-months` (raw parquet to sparse MDS, every month, resumable),
+`sf-write-mds` (one range, or `--risk-factors`), `sf-densify` (sparse to dense
+sessions), `sf-build-targets` (per-month anchor tables), `sf-daystore` (dense
+MDS to the day-major store), `sf-industry-map` ((month, ticker) to FF49) and
+`sf-reshard` (a date-ordered copy of a month). Each takes its default paths
+from the environment (`RAW_DATA_DIR`, `METADATA_PATH`, `MOSAIC_DIR`,
+`HOLIDAY_CSV`, `DAYSTORE_DIR`, ...) so a consumer repository sets them once.
+
 `build_session_panel` is the model-neutral injection point immediately before
 encoding. It returns normalized views, raw/transformed targets, and
 `ViewMetadata` separately. `PanelCache` preserves that separation on disk;

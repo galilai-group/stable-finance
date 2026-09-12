@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -245,14 +246,17 @@ def build_month(
 
 
 def main(argv=None, *, default_mosaic_dir=None, default_holiday_csv=None):
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    default_mosaic_dir = default_mosaic_dir or os.environ.get("MOSAIC_DIR")
+    default_holiday_csv = default_holiday_csv or os.environ.get("HOLIDAY_CSV")
     p.add_argument("--mosaic-dir", default=default_mosaic_dir,
-                   required=default_mosaic_dir is None)
+                   required=default_mosaic_dir is None, help="sparse mosaic root ($MOSAIC_DIR)")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--start", required=True, help="first month, YYYY-MM")
     p.add_argument("--end", required=True, help="last month, YYYY-MM (inclusive)")
     p.add_argument("--holiday-csv", default=default_holiday_csv,
-                   required=default_holiday_csv is None)
+                   required=default_holiday_csv is None, help="($HOLIDAY_CSV)")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--target-types", nargs="+", choices=TARGET_TYPES,
