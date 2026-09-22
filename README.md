@@ -16,8 +16,9 @@ runs the downstream adapters and metrics you ask for.
                               ↓
                             model ← What you bring
                               │
-      ┌───────────────┬───────┴──────────┬─────────────┐
-      ↓               ↓                  ↓             ↓
+                              │                    Cost and Execution Model
+      ┌───────────────┬───────┴──────────┬─────────┬────┐
+      ↓               ↓                  ↓         ↓    ↓
   embeddings → forward returns → portfolio weights → orders
       │               │                  │             │
       └────── IC ─────┘                  └─── Sharpe ──┘
