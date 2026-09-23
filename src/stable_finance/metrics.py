@@ -270,3 +270,53 @@ def cross_spread_sharpe(
         net[missing_execution_quote.any(axis=1)] = np.nan
         sharpes.append(sharpe_ratio(net, periods_per_year=periods_per_year))
     return tuple(sharpes)
+
+
+def edge_to_cost(
+    forecast: ArrayLike,
+    half_spread: ArrayLike,
+    *,
+    eligible: ArrayLike | None = None,
+) -> np.ndarray:
+    """How far each name's forecast clears the cost of acting on it.
+
+    The ratio of ``|forecast - cross-sectional median|`` to that name's own
+    one-way cost, on the ``(decision, asset)`` grid. Above 1 the expected move
+    exceeds a single crossing; a round trip needs 2.
+
+    THIS IS THE STATISTIC TO LEAD WITH when reporting whether a forecast is
+    tradable, in preference to a Sharpe ratio, and the reason is sample size.
+    A Sharpe is a time-series statistic over a few hundred periods, with a
+    standard error near ``sqrt((1 + S**2 / 2) / years)``; at two or three
+    years a true Sharpe below 0.5 cannot be distinguished from zero however
+    carefully it is computed, so reporting one as the headline claims
+    precision the data does not carry. This ratio is cross-sectional over
+    every (decision, name) pair -- hundreds of thousands of them -- and is
+    pinned orders of magnitude more tightly. It also answers a question a
+    Sharpe cannot: WHY a forecast is or is not tradable, in units a reader
+    can check against a quoted market.
+
+    ``forecast`` MUST be in the units of the realized return, as
+    ``half_spread`` is; a rank-unit forecast makes this ratio meaningless
+    rather than merely mis-scaled. A name with no two-sided market has no
+    finite cost to clear and is returned as NaN rather than as an infinite
+    edge, so a summary over the grid is not dominated by untradable names.
+    """
+    values = np.asarray(forecast, dtype=np.float64)
+    spread = np.asarray(half_spread, dtype=np.float64)
+    if values.ndim != 2 or spread.shape != values.shape:
+        raise ValueError("forecast and half_spread must be equally shaped 2-D arrays")
+    if np.any(np.isfinite(spread) & (spread < 0)):
+        raise ValueError("half_spread cannot be negative")
+    usable = np.isfinite(values) & np.isfinite(spread) & (spread > 0)
+    if eligible is not None:
+        usable &= np.asarray(eligible, dtype=bool)
+
+    out = np.full(values.shape, np.nan)
+    for decision in range(values.shape[0]):
+        row = np.flatnonzero(usable[decision])
+        if len(row) < 2:
+            continue
+        edge = values[decision, row] - np.median(values[decision, row])
+        out[decision, row] = np.abs(edge) / spread[decision, row]
+    return out

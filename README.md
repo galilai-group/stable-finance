@@ -159,6 +159,157 @@ model_target = targets.select("uniform")       # default
 all_target_metadata = targets.as_dict()        # raw/zscore/uniform/rank
 ```
 
+## The harness is a configuration, not a constant
+
+A Sharpe ratio is not a property of a forecast. It is a property of a forecast
+plus every trading decision made downstream of it -- which names are tradable,
+how much of the cross-section to hold, how risk is forecast, how weights follow
+from it, how often to rebalance, what a trade costs, how a periodic return is
+annualized. None of those are dictated by the model being evaluated, and
+several move the answer by more than the gap between two models.
+
+So the harness is an explicit object. `BacktestConfig` names every decision,
+`DEFAULT_BACKTEST` is the library's opinion when the caller has none, and
+`enumerate_configs` produces the space so the sensitivity of a result to the
+harness can be measured rather than assumed.
+
+```python
+from stable_finance import DEFAULT_BACKTEST, enumerate_configs, run_backtest
+
+report = run_backtest(forecast, realized, half_spread=spread, history=prior)
+report.sharpe_mid, report.sharpe_net, report.information_coefficient
+
+# The same forecast under every harness in the space.
+space = enumerate_configs()                       # 4,080 distinct portfolios
+space = enumerate_configs(cost_model="mid")       # or a named slice
+rows = [run_backtest(forecast, realized, half_spread=spread, history=prior,
+                     config=config).as_dict() for config in space]
+```
+
+`run_backtest` computes the IC and the Sharpe from **the same forecast array**,
+which is the whole reason it is one function rather than two: a study of how
+tightly the two move together is worthless if they came from separately fitted
+predictors.
+
+| Axis | Options |
+|---|---|
+| `universe` | `all`, `tight_50pct`, `tight_25pct` — a cross-sectional screen on each name's own quoted half-spread |
+| `selection` | `all`, `quintile`, `decile`, `decile_long_only` — how much of the ranking to trade |
+| `weighting` | `mean_variance` (cost-aware, path-dependent), `equal`, `inverse_vol`, `min_var`, `erc`, `rank` |
+| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `embedding` — the last forecasts correlations from the encoder's own representation |
+| `cost_model` | `mid`, `cross`, `cross+0.5bps`, `cross+1bps`, `cross+2bps` |
+| `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it |
+| `annualization` | `decisions`, `daily` — whether every decision is an independent period |
+
+`trading_cost` also takes a `multiple`, which is the continuous version of
+the cost axis and is preferred over the flat add-ons for reasoning about size
+or execution quality. A flat `+1bp` charges a 2 bp-spread mega-cap and a
+40 bp-spread small-cap the same penalty, whereas impact scales *with*
+illiquidity and the quoted spread is the only observable proxy for it. One
+scalar then spans the whole range: `0` is frictionless, below 1 is the
+fraction of notional that had to cross rather than rest, `1` is crossing
+everything, above 1 is the size regime. Because net return at any multiple is
+`gross - multiple * cost`, a sensitivity curve costs one backtest rather than
+one per point.
+
+Every axis is also a standalone public function (`apply_screen`,
+`select_book`, `weight_book`, `estimate_risk`, `trading_cost`), so a caller who
+wants one of them and none of the rest is not obliged to adopt the config
+object. `enumerate_configs` removes configurations that duplicate another
+point rather than reporting one portfolio several times: a book that ignores
+the covariance appears under one risk model, and equal-risk-contribution on a
+diagonal model is inverse-volatility, so it is not also counted as its own
+option.
+
+## Is the forecast worth its spread?
+
+A Sharpe ratio is the wrong headline statistic for a short-horizon forecast,
+and the reason is sample size rather than taste. It is a time-series quantity
+over a few hundred periods with a standard error near
+`sqrt((1 + S**2 / 2) / years)`, so at two or three years of data a true Sharpe
+below 0.5 cannot be told apart from zero however carefully it is computed.
+`edge_to_cost` is the cross-sectional alternative: the ratio of each name's
+cross-sectionally centred forecast to its own one-way cost, over every
+(decision, name) pair rather than every period, and therefore pinned orders of
+magnitude more tightly. Above 1 the expected move clears one crossing; a round
+trip needs 2.
+
+```python
+from stable_finance import edge_to_cost
+
+ratio = edge_to_cost(mu, half_spread)       # (decision, asset)
+np.nanmedian(ratio)                         # the number to report
+```
+
+The forecast must be in the units of the realized return. A probe fit against
+a rank target predicts ranks, so rescale it by the slope of realized returns
+on its own output before comparing it to a spread; a rank-unit forecast makes
+this ratio meaningless rather than merely mis-scaled.
+
+Two selection rules follow from the same comparison. `threshold_selection`
+holds a name when `|edge| > multiple * cost`, so a wide-spread name must carry
+a larger forecast to earn its place -- a screen a quantile cut cannot express,
+because the tail of a forecast distribution is not the tail of an
+edge-to-cost distribution whenever the two are correlated, and in equities
+they are. `persistent_selection` then separates opening from closing, because
+re-deciding the whole book every decision is only sensible when trading is
+free: a name whose edge sits near the entry bar otherwise flips in and out and
+pays a round trip each time for a forecast that barely moved.
+
+```python
+from stable_finance import persistent_selection, threshold_selection
+
+signs = threshold_selection(mu, eligible, multiple=1.0, cost=half_spread)
+held = persistent_selection(mu, eligible, enter=1.5, exit_=0.0,
+                            cost=half_spread)
+```
+
+`exit_` is signed and spans the useful behaviours with one number: `0` closes
+when the forecast changes sign, positive tolerates a mild adverse forecast and
+closes only on a reversal worth the round trip, negative closes when
+conviction merely decays. Holding costs nothing, so the exit test does not
+re-check `enter` -- a position already paid for is worth keeping on weaker
+evidence than it took to open, which is the whole asymmetry a cost creates.
+
+Horizon is the lever underneath all of this. The spread is paid once whatever
+the holding period, while the expected move grows with the horizon, so
+edge-to-cost improves with horizon unless the IC decays faster than
+`1 / sqrt(H)`. Measuring that needs one probe per horizon, which
+`StreamingRidge` fits in a single pass over the pool: `X'X` dominates the cost
+and each extra horizon adds only an `X'y`.
+
+```python
+probe = StreamingRidge(alpha=[a_300, a_900, a_3600])
+for shard in shards:
+    probe.partial_fit(shard["X"], shard["y"])   # (n_rows, n_horizons)
+probe.finalize()
+forecasts = probe.predict(eval_X)               # (n_rows, n_horizons)
+```
+
+Targets do not share a gram: a long horizon runs off the end of a session and
+is missing on rows a short one keeps, so each accumulates over its own
+labelled subset and the block fit is identical to fitting each alone.
+
+## Attaching a market to embeddings you already have
+
+Quotes and realized returns are properties of a `(date, anchor, ticker)` row.
+They do not depend on which encoder produced an embedding for that row, so a
+sweep that stored only embeddings and targets can still be turned into a
+portfolio without a second forward pass. `MarketPanel` reads a month of cached
+quotes without touching the cached views, and `align` reorders it onto whatever
+rows the caller has:
+
+```python
+from stable_finance import MarketPanel, decision_labels, to_grid
+
+market = MarketPanel.from_cache(cache_root, "2008-08", anchors_per_day=8)
+attached = market.take(market.align(dates, anchors, tickers))
+attached["half_spread"], attached["raw_targets"], attached["matched"]
+```
+
+Check `matched`. An unmatched row carries no quote, and a missing quote that is
+read as zero prices a free trade in a market that never existed.
+
 ## Dataset architecture
 
 The supported input is the Polygon-derived one-second US-equity dataset. Its
