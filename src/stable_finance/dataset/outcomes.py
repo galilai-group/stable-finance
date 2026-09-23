@@ -7,6 +7,7 @@ import numpy as np
 from stable_finance.dataset.anchors import (
     DEFAULT_ANCHOR_SPEC,
     RETURN_VWAP_WINDOW,
+    TO_CLOSE,
     AnchorSpec,
 )
 from stable_finance.dataset.schema import MARKET_SCHEMA
@@ -165,12 +166,39 @@ def _windowed_vwap(
         )
 
 
+def resolve_future(
+    indices: np.ndarray, horizons: np.ndarray, close_index: int | None
+) -> np.ndarray:
+    """Where each (anchor, horizon) measures its forward window.
+
+    A fixed horizon measures at ``anchor + horizon``. The :data:`TO_CLOSE`
+    sentinel measures at the closing auction instead, which is the same row
+    for every anchor -- so the holding period shortens through the day exactly
+    as a position held into the auction does, rather than the target becoming
+    unmeasurable and quietly dropping the late anchors.
+    """
+    t = np.asarray(indices, dtype=np.int64).reshape(-1, 1)
+    hs = np.asarray(horizons, dtype=np.int64)
+    future = t + hs[None, :]
+    to_close = hs == TO_CLOSE
+    if to_close.any():
+        if close_index is None:
+            raise ValueError(
+                "a TO_CLOSE horizon needs close_index; pass the AnchorSpec "
+                "whose session this is, and keep post_close_seconds >= the "
+                "measurement window so the auction window is retained"
+            )
+        future = np.where(to_close[None, :], int(close_index), future)
+    return future
+
+
 def _standard_target_arrays(
     features: np.ndarray,
     indices: np.ndarray,
     horizons: np.ndarray,
     types: tuple[str, ...],
     window: int,
+    close_index: int | None = None,
 ) -> dict[str, np.ndarray]:
     """Compute requested target families over all points and horizons."""
     unknown = set(types) - set(PAIR_TARGET_TYPES)
@@ -180,8 +208,11 @@ def _standard_target_arrays(
     n = len(features)
     t = np.asarray(indices, dtype=np.int64)[:, None]
     hs = np.asarray(horizons, dtype=np.int64)
-    future = t + hs[None, :]
-    valid_window = (t >= 0) & ((future + window) <= n)
+    future = resolve_future(indices, hs, close_index)
+    # An anchor at or past the measurement point has no forward window to
+    # measure: at the close this is the last seconds of the session, where a
+    # position could still be entered but not held for any length of time.
+    valid_window = (t >= 0) & ((future + window) <= n) & (future > t)
     future_safe = np.where(valid_window, future, 0)
     result: dict[str, np.ndarray] = {}
 
@@ -263,12 +294,17 @@ def compute_pair_targets(
     rf_t_idx: int | None = None,
     *,
     measurement_window: int = RETURN_VWAP_WINDOW,
+    close_index: int | None = None,
 ) -> np.ndarray:
     """Compute selected raw targets for one decision instant.
 
     Work is lazy by target family: VWAP, spread, and log-return prefix sums are
     built only when their corresponding target is requested. All requested
     horizons share those prefix sums.
+
+    ``horizons`` may include :data:`TO_CLOSE`, which measures to the closing
+    auction rather than to a fixed offset; ``close_index`` says which row that
+    is, and the session must retain a measurement window past it.
     """
     type_order = tuple(types)
     hs = np.asarray(horizons, dtype=np.int64)
@@ -278,6 +314,7 @@ def compute_pair_targets(
         hs,
         type_order,
         int(measurement_window),
+        close_index,
     )
     output = [arrays[target_type][0] for target_type in type_order]
 
@@ -377,11 +414,22 @@ def anchor_targets(
         raise ValueError(f"unknown anchor target types: {sorted(unknown)}")
     if not requested:
         raise ValueError("types cannot be empty")
+    # anchor_targets owns a whole session, so it knows where the close is and
+    # whether the tail to measure it was retained. A TO_CLOSE horizon against
+    # a spec that did not keep that tail is a silent column of NaN otherwise.
+    if (hs == TO_CLOSE).any() and not spec.measures_close:
+        raise ValueError(
+            "a TO_CLOSE horizon needs a session that retains the auction "
+            f"window: spec keeps {spec.post_close_seconds}s past the close "
+            f"but the measurement window is {spec.measurement_window_seconds}s"
+            " (use CLOSING_AUCTION_SPEC)"
+        )
     arrays = _standard_target_arrays(
         features,
         anchors,
         hs,
         requested,
         spec.measurement_window_seconds,
+        spec.close_index,
     )
     return np.stack([arrays[name] for name in requested], axis=1)
