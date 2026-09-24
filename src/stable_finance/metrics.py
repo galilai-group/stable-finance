@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike
 
-from stable_finance.costs import breakeven_eq
+from stable_finance.costs import breakeven_efq
 from stable_finance.data import (
     ForwardReturns,
     PortfolioWeights,
@@ -325,46 +325,50 @@ def edge_to_cost(
 
 @dataclass(frozen=True)
 class ExecutionQualityCurve:
-    """Net Sharpe as a function of the effective-to-quoted spread ratio."""
+    """Net Sharpe as a function of EFQ, the effective-to-quoted spread ratio.
 
-    eq: np.ndarray
+    ``efq`` is a fraction, as it is used as a multiplier; the literature
+    quotes EFQ as a percent and figures should display it that way.
+    """
+
+    efq: np.ndarray
     sharpe: np.ndarray
     standard_error: np.ndarray
     gross_sharpe: float
     breakeven: float
     periods: int
 
-    def at(self, eq: float) -> float:
-        """Net Sharpe at one ratio, interpolated within the swept grid.
+    def at(self, efq: float) -> float:
+        """Net Sharpe at one EFQ, interpolated within the swept grid.
 
         NaN outside it rather than the nearest endpoint: ``np.interp`` clamps,
         which would report a comfortably positive Sharpe at an execution
         quality the sweep never visited.
         """
-        if eq < self.eq[0] or eq > self.eq[-1]:
+        if efq < self.efq[0] or efq > self.efq[-1]:
             return float("nan")
-        return float(np.interp(eq, self.eq, self.sharpe))
+        return float(np.interp(efq, self.efq, self.sharpe))
 
 
 def sharpe_vs_execution_quality(
     gross: ArrayLike,
-    cost_at_unit_eq: ArrayLike,
+    cost_at_unit_efq: ArrayLike,
     *,
-    eq_grid: ArrayLike | None = None,
+    efq_grid: ArrayLike | None = None,
     periods_per_year: float = 252.0,
 ) -> ExecutionQualityCurve:
     """Sweep net Sharpe across execution quality, from one backtest.
 
-    ``gross`` and ``cost_at_unit_eq`` are per-period portfolio returns and the
-    per-period cost that would be charged at ``E/Q = 1``. Because cost is
-    linear in E/Q, the whole curve is ``gross - eq * cost`` and needs no
+    ``gross`` and ``cost_at_unit_efq`` are per-period portfolio returns and the
+    per-period cost that would be charged at ``EFQ = 1``. Because cost is
+    linear in EFQ, the whole curve is ``gross - efq * cost`` and needs no
     re-running: one backtest produces the entire sensitivity.
 
     This is the honest way to present a Sharpe ratio that a cost assumption
     can dominate. Rather than defending one number, it reports where the
     result lives as a function of the single assumption that matters, and
     ``breakeven`` says where it dies. A curve whose break-even sits inside
-    ``EQ_EMPIRICAL_RANGE`` is the quantitative form of "there is real
+    ``EFQ_INFORMED_RANGE`` is the quantitative form of "there is real
     predictive structure here and the market charges very nearly all of it".
 
     The standard error is Lo (2002) for an annualized Sharpe over the sample's
@@ -373,9 +377,9 @@ def sharpe_vs_execution_quality(
     the horizon available, not a flaw in the estimate.
     """
     gross = np.asarray(gross, dtype=np.float64).ravel()
-    cost = np.asarray(cost_at_unit_eq, dtype=np.float64).ravel()
+    cost = np.asarray(cost_at_unit_efq, dtype=np.float64).ravel()
     if gross.shape != cost.shape:
-        raise ValueError("gross and cost_at_unit_eq must have the same shape")
+        raise ValueError("gross and cost_at_unit_efq must have the same shape")
     keep = np.isfinite(gross) & np.isfinite(cost)
     gross, cost = gross[keep], cost[keep]
     if len(gross) < 2:
@@ -383,8 +387,8 @@ def sharpe_vs_execution_quality(
     if np.any(cost < 0):
         raise ValueError("cost cannot be negative")
 
-    grid = (np.linspace(0.0, 1.5, 61) if eq_grid is None
-            else np.asarray(eq_grid, dtype=np.float64).ravel())
+    grid = (np.linspace(0.0, 1.5, 61) if efq_grid is None
+            else np.asarray(efq_grid, dtype=np.float64).ravel())
     years = len(gross) / periods_per_year
     sharpe = np.array([sharpe_ratio(gross - ratio * cost,
                                     periods_per_year=periods_per_year)
@@ -393,10 +397,10 @@ def sharpe_vs_execution_quality(
     # so the band widens exactly where the curve is most flattering.
     standard_error = np.sqrt((1.0 + sharpe ** 2 / 2.0) / years)
     return ExecutionQualityCurve(
-        eq=grid,
+        efq=grid,
         sharpe=sharpe,
         standard_error=standard_error,
         gross_sharpe=sharpe_ratio(gross, periods_per_year=periods_per_year),
-        breakeven=breakeven_eq(gross, cost),
+        breakeven=breakeven_efq(gross, cost),
         periods=int(len(gross)),
     )
