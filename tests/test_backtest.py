@@ -72,10 +72,10 @@ def test_enumerate_drops_configs_that_duplicate_another_portfolio():
 
 
 def test_enumerate_accepts_a_scalar_or_a_list_for_an_axis():
-    assert {c.cost_model for c in enumerate_configs(cost_model="mid")} == {"mid"}
-    sliced = enumerate_configs(cost_model=("mid", "cross"), universe="all")
+    assert {c.efq for c in enumerate_configs(efq=0.70)} == {0.70}
+    sliced = enumerate_configs(efq=(0.0, 1.0), universe="all")
     assert {c.universe for c in sliced} == {"all"}
-    assert {c.cost_model for c in sliced} == {"mid", "cross"}
+    assert {c.efq for c in sliced} == {0.0, 1.0}
 
 
 def test_enumerate_rejects_an_unknown_keyword():
@@ -355,7 +355,7 @@ def test_sweeping_agrees_exactly_with_running_one_config_at_a_time():
 
     setup = world()
     space = enumerate_configs(risk_model=("diagonal", "shrunk_sample"),
-                              cost_model=("mid", "cross"))
+                              efq=(0.0, 1.0))
     swept = sweep_configs(setup["forecast"], setup["realized"], space,
                           half_spread=setup["half_spread"],
                           history=setup["history"], days=setup["days"])
@@ -460,3 +460,71 @@ def test_a_negative_cost_multiple_is_refused():
 
     with pytest.raises(ValueError):
         trading_cost("cross", np.array([[1e-4]]), multiple=-1.0)
+
+
+# ── execution quality as a swept axis ───────────────────────────────────────
+
+def test_worse_execution_never_improves_the_net_result():
+    setup = world()
+    previous = None
+    for efq in (0.0, 0.25, 0.70, 1.0, 1.5):
+        report = run_backtest(**setup, config=BacktestConfig(efq=efq))
+        if previous is not None:
+            assert report.mean_cost_bps >= previous - 1e-12
+        previous = report.mean_cost_bps
+
+
+def test_a_midpoint_fill_is_charged_nothing():
+    report = run_backtest(**world(), config=BacktestConfig(efq=0.0))
+    assert report.mean_cost_bps == pytest.approx(0.0)
+    assert report.sharpe_net == pytest.approx(report.sharpe_mid)
+
+
+def test_the_information_coefficient_does_not_depend_on_execution_quality():
+    setup = world()
+    a = run_backtest(**setup, config=BacktestConfig(efq=0.0))
+    b = run_backtest(**setup, config=BacktestConfig(efq=1.0))
+    assert a.information_coefficient == pytest.approx(b.information_coefficient)
+
+
+def test_the_allocator_is_billed_the_execution_quality_it_optimised_against():
+    """The reason EFQ is swept and not applied afterwards.
+
+    The mean-variance allocator is cost-aware, so the BOOK depends on the EFQ
+    it was told about, not only the bill. A cheap-execution book scored at an
+    expensive EFQ is a portfolio nobody would have held, which is exactly what
+    rescaling a stored net return post hoc would produce -- so a higher EFQ
+    must change turnover, not just multiply the charge.
+    """
+    setup = world()
+    cheap = run_backtest(**setup, config=BacktestConfig(efq=0.1))
+    dear = run_backtest(**setup, config=BacktestConfig(efq=2.0))
+    assert dear.mean_turnover < cheap.mean_turnover
+
+    # A path-independent rule ignores cost when sizing, so ITS book is
+    # unchanged and only the bill moves. The contrast is the point.
+    flat = dict(weighting="equal", risk_model="diagonal")
+    a = run_backtest(**setup, config=BacktestConfig(efq=0.1, **flat))
+    b = run_backtest(**setup, config=BacktestConfig(efq=2.0, **flat))
+    assert a.mean_turnover == pytest.approx(b.mean_turnover)
+    assert b.mean_cost_bps == pytest.approx(20.0 * a.mean_cost_bps, rel=1e-6)
+
+
+def test_execution_quality_is_an_axis_of_the_swept_space():
+    from stable_finance.config import EFQ_GRID
+    configs = enumerate_configs()
+    assert {c.efq for c in configs} == set(EFQ_GRID)
+    # Every EFQ carries the same harness, so a per-EFQ summary compares like
+    # with like rather than a different mix of portfolios at each point.
+    counts = {efq: sum(c.efq == efq for c in configs) for efq in EFQ_GRID}
+    assert len(set(counts.values())) == 1
+
+
+def test_annualization_is_pinned_to_daily_and_out_of_the_sweep():
+    # It is pure accounting -- the same trades folded into different periods
+    # -- so leaving it in the space inflates the reported spread with a
+    # difference no model has an opinion about.
+    from stable_finance.config import CONFIG_SPACE
+    assert "annualization" not in CONFIG_SPACE
+    assert {c.annualization for c in enumerate_configs()} == {"daily"}
+    assert run_backtest(**world()).periods_per_year == pytest.approx(252.0)

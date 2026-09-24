@@ -41,7 +41,7 @@ __all__ = ["BacktestReport", "run_backtest", "sweep_configs"]
 #: hold the identical book, so the expensive part is computed once and the
 #: remaining axes -- which act only on an existing book -- are evaluated on top.
 _BOOK_AXES = ("universe", "selection", "weighting", "risk_model", "cost_model",
-              "gross_exposure", "shrinkage", "max_iter")
+              "efq", "gross_exposure", "shrinkage", "max_iter")
 
 
 @dataclass(frozen=True)
@@ -163,7 +163,7 @@ def _weights(context: dict, config: BacktestConfig,
     # four identical portfolios.
     screened = apply_screen(config.universe, spread)
     signs = select_book(config.selection, mu, screened)
-    cost = trading_cost(config.cost_model, spread)
+    cost = trading_cost(config.cost_model, spread, multiple=config.efq)
 
     if config.weighting != "mean_variance":
         return weight_book(config.weighting, signs, mu, sigma,
@@ -218,7 +218,7 @@ def _score(context: dict, values: NDArray[np.float64],
     outcome_values, n_assets = context["outcome_values"], context["n_assets"]
     if config.rebalance == "daily":
         values = _hold_within_day(values, day)
-    cost = trading_cost(config.cost_model, spread)
+    cost = trading_cost(config.cost_model, spread, multiple=config.efq)
 
     valid = np.isfinite(values) & np.isfinite(outcome_values)
     gross = np.where(valid, values * outcome_values, 0.0).sum(axis=1)

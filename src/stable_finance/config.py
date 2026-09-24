@@ -16,13 +16,15 @@ finding about a model from a finding about a backtest.
 
     report = run_backtest(forecast, realized, half_spread=spread)   # default
     space = enumerate_configs()                                     # all of it
-    space = enumerate_configs(cost_model=("mid", "cross"))          # a slice
+    space = enumerate_configs(efq=0.70)                             # a slice
 """
 
 from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, fields, replace
+
+import numpy as np
 
 from stable_finance.costs import COST_MODELS
 from stable_finance.risk import RISK_MODELS
@@ -32,12 +34,22 @@ from stable_finance.weighting import WEIGHTING_RULES
 
 __all__ = [
     "ANNUALIZATIONS",
+    "EFQ_GRID",
     "BacktestConfig",
     "CONFIG_SPACE",
     "DEFAULT_BACKTEST",
     "REBALANCE_RULES",
     "enumerate_configs",
 ]
+
+#: The execution qualities swept, as EFQ (effective / quoted half-spread).
+#: 0 is a midpoint fill and 1 pays the whole quoted spread; 0.55 and 0.88 are
+#: Levy (2022)'s measured direct-market-access and NYSE figures, and 0.70 sits
+#: between them. EFQ REPLACES the old ``cost_model`` sweep as the cost axis,
+#: because it is one continuous measured quantity rather than five named
+#: models, and because a result reported against it can be read by anyone who
+#: knows their own execution.
+EFQ_GRID = (0.0, 0.25, 0.50, 0.70, 0.88, 1.00)
 
 #: How a periodic return series is annualized. ``decisions`` treats every
 #: decision as an independent period, which for an intraday anchor grid
@@ -76,8 +88,12 @@ class BacktestConfig:
     weighting: str = "mean_variance"
     risk_model: str = "shrunk_sample"
     cost_model: str = "cross"
+    #: Execution quality: the multiple of the quoted half-spread actually
+    #: paid. Charged BOTH to the cost-aware allocator and to the scoring, so
+    #: a book is always optimised against the cost it is then billed for.
+    efq: float = 1.0
     rebalance: str = "every_decision"
-    annualization: str = "decisions"
+    annualization: str = "daily"
     gross_exposure: float = 2.0
     shrinkage: float = 0.3
     #: Iteration budget for the cost-aware allocator's proximal solver. A
@@ -99,6 +115,14 @@ class BacktestConfig:
                 raise ValueError(
                     f"{field}={value!r} is not one of {allowed}"
                 )
+        # Type-checked before the numeric test: EFQ is the one axis whose
+        # options are numbers, so a caller passing a name here (as they would
+        # for every other axis) must get the same ValueError and not a
+        # TypeError out of numpy.
+        if (isinstance(self.efq, bool)
+                or not isinstance(self.efq, (int, float))
+                or not np.isfinite(self.efq) or self.efq < 0):
+            raise ValueError("efq must be a finite, non-negative number")
         if self.gross_exposure <= 0:
             raise ValueError("gross_exposure must be positive")
         if not 0.0 <= self.shrinkage <= 1.0:
@@ -125,14 +149,18 @@ DEFAULT_BACKTEST = BacktestConfig()
 #: settings (``gross_exposure``, ``shrinkage``, ``max_iter``) are deliberately
 #: absent: the first two are continuous, so a study should choose its own grid
 #: rather than inherit one, and the third is numerical, not a modelling choice.
+#: ``annualization`` is deliberately ABSENT. It is pure accounting -- the same
+#: trades folded into different periods -- and holding it at ``daily`` makes
+#: every Sharpe here one non-overlapping observation per day annualized at
+#: 252, which is what the execution-quality figure reports. ``cost_model`` is
+#: absent because ``efq`` is now the cost axis.
 CONFIG_SPACE = {
     "universe": UNIVERSE_SCREENS,
     "selection": SELECTION_RULES,
     "weighting": ALLOCATORS,
     "risk_model": RISK_MODELS,
-    "cost_model": COST_MODELS,
+    "efq": EFQ_GRID,
     "rebalance": REBALANCE_RULES,
-    "annualization": ANNUALIZATIONS,
 }
 
 
@@ -165,7 +193,10 @@ def enumerate_configs(**overrides) -> tuple[BacktestConfig, ...]:
     scalars = {}
     for name, value in overrides.items():
         if name in axes:
-            axes[name] = (value,) if isinstance(value, str) else tuple(value)
+            # A scalar is a one-element list, so a caller can pin an axis with
+            # ``efq=0.7`` or ``selection="all"`` as readily as passing a tuple.
+            axes[name] = ((value,) if isinstance(value, (str, float, int))
+                          else tuple(value))
         elif name in {f.name for f in fields(BacktestConfig)}:
             scalars[name] = value
         else:
