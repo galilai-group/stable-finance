@@ -2746,6 +2746,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+hf = [
+    { name = "huggingface-hub" },
+]
 mds = [
     { name = "joblib" },
     { name = "mosaicml-streaming" },
@@ -2761,6 +2764,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", marker = "extra == 'hf'", specifier = ">=0.30" },
     { name = "joblib", marker = "extra == 'mds'", specifier = ">=1.5.0" },
     { name = "mosaicml-streaming", marker = "extra == 'mds'", specifier = ">=0.10.0" },
     { name = "numpy", specifier = ">=2.0" },
@@ -2769,7 +2773,7 @@ requires-dist = [
     { name = "tqdm", marker = "extra == 'mds'", specifier = ">=4.67.0" },
     { name = "zstandard", marker = "extra == 'mds'", specifier = ">=0.25.0" },
 ]
-provides-extras = ["mds"]
+provides-extras = ["mds", "hf"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.0" }]

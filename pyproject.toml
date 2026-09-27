@@ -21,6 +21,9 @@ mds = [
     "tqdm>=4.67.0",
     "zstandard>=0.25.0",
 ]
+hf = [
+    "huggingface-hub>=0.30",
+]
 
 [project.scripts]
 # The data-preparation CLIs, in pipeline order. Each reads its default paths

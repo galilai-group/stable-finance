@@ -86,6 +86,7 @@ from stable_finance.dataset.outcomes import (
     anchor_targets,
 )
 from stable_finance.dataset.schema import MARKET_SCHEMA
+from stable_finance.dataset.source import is_hub, resolve_root
 from stable_finance.dataset.targets import MIN_NAMES
 
 FORMAT_VERSION = 1
@@ -119,9 +120,14 @@ def discover_days(root: str | Path, date_start: str, date_end: str) -> list[Path
     Uses the month ``index.json`` when it exists (the writer's last act, so its
     presence means the month is complete) and falls back to a directory scan
     for a month that is still being written.
+
+    ``root`` may be a Hub spec (see :mod:`stable_finance.dataset.source`). The
+    Hub copy ships ``features.npy.zst`` only, so each day in range is then
+    decompressed beside it, once.
     """
-    root = Path(root)
+    hub = is_hub(root)
     start, end = str(date_start)[:10], str(date_end)[:10]
+    root = resolve_root(root, start, end)
     out: list[Path] = []
     cursor, last = Month.parse(start[:7]), Month.parse(end[:7])
     while cursor <= last:
@@ -140,6 +146,9 @@ def discover_days(root: str | Path, date_start: str, date_end: str) -> list[Path
         raise ValueError(
             f"No daystore days under {root} in [{date_start}, {date_end}]; "
             f"expected {root}/YYYY/MM/YYYY-MM-DD/ records")
+    if hub:
+        for day in out:
+            decompress_day(day, remove_zst=False)
     return out
 
 

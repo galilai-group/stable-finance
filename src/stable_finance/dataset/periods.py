@@ -7,6 +7,7 @@ import datetime as dt
 from pathlib import Path
 
 from stable_finance.dataset.months import Month
+from stable_finance.dataset.source import resolve_root
 
 
 def infer_period_frequency(dataset_root: str | Path) -> str:
@@ -44,13 +45,17 @@ def period_directories(
     *,
     allow_unaligned_dates: bool = False,
 ) -> list[Path]:
-    """Return existing dataset period directories in chronological order."""
+    """Return existing dataset period directories in chronological order.
+
+    ``dataset_root`` may be a Hub spec (see :mod:`stable_finance.dataset.source`);
+    the months in range are then downloaded first and local paths returned.
+    """
     start = dt.date.fromisoformat(str(date_start))
     end = dt.date.fromisoformat(str(date_end))
     frequency = infer_period_frequency(dataset_root)
     if not allow_unaligned_dates:
         validate_period_alignment(start, end, frequency)
-    root = Path(dataset_root)
+    root = resolve_root(dataset_root, start.isoformat(), end.isoformat())
     found = []
     cursor, last = Month(start.year, start.month), Month(end.year, end.month)
     while cursor <= last:
