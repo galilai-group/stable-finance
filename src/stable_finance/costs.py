@@ -127,8 +127,18 @@ def effective_half_spread(
     order was sent. It is one scalar spanning every execution regime a
     strategy can be run in -- ``0`` is a midpoint fill (0% in the units the
     literature quotes), ``EFQ_INFORMED_RANGE`` is where an informed order
-    routed to the market lands, ``1`` is paying the whole quoted spread, and
-    above ``1`` is the regime where the order moves the price it gets.
+    routed to the market lands, and ``1`` is paying the whole quoted spread.
+
+    ABOVE 1 IS NOT AN EXTRAPOLATION. Two ordinary mechanisms put EFQ past
+    100%, and both apply to a strategy like this one. An order larger than
+    the quoted depth walks the book, so the average fill is worse than the
+    touch it started at -- the quoted half-spread prices the first lot, not
+    the whole order. And a signal is rarely traded alone: when others act on
+    the same information, they compete for the same liquidity in the same
+    direction, so the quote moves away before the order completes and the
+    realised half-spread exceeds the one that was displayed. EFQ above 100%
+    is therefore where capacity and crowding live, which is why the axis is
+    worth sweeping past the point where a single small order would stop.
 
     This is the same scaling ``trading_cost(multiple=...)`` applies, named.
     It exists separately because a study that reports a result AS A FUNCTION
