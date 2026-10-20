@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from stable_finance import ForwardReturns, grouped_rank_ic, oracle_forecast
-from stable_finance.evaluation.returns.scoring import _rankdata
+from stable_finance.evaluation._grid import _rankdata
 
 
 def realized(seed=0, *, n_decisions=12, n_assets=300, ties=False):

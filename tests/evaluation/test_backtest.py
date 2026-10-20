@@ -183,9 +183,13 @@ def test_mid_charges_nothing_and_cross_charges_the_half_spread():
     np.testing.assert_allclose(trading_cost("cross", spread), spread)
 
 
-def test_the_add_on_is_charged_in_basis_points_on_top_of_the_spread():
-    spread = np.array([[1e-4]])
-    np.testing.assert_allclose(trading_cost("cross+2bps", spread), [[1e-4 + 2e-4]])
+def test_only_mid_and_cross_are_cost_models():
+    """Flat basis-point add-ons are gone; execution quality is the EFQ multiple."""
+    from stable_finance import COST_MODELS
+
+    assert COST_MODELS == ("mid", "cross")
+    with pytest.raises(ValueError, match="unknown cost model"):
+        trading_cost("cross+2bps", np.array([[1e-4]]))
 
 
 def test_an_unquoted_name_costs_infinity_rather_than_nothing():
@@ -250,7 +254,7 @@ def test_the_default_configuration_runs_and_reports_both_sharpes():
 def test_charging_a_cost_never_improves_the_net_result():
     setup = world()
     free = run_backtest(**setup, config=BacktestConfig(cost_model="mid"))
-    paid = run_backtest(**setup, config=BacktestConfig(cost_model="cross+2bps"))
+    paid = run_backtest(**setup, config=BacktestConfig(cost_model="cross", efq=1.5))
     assert paid.mean_cost_bps >= free.mean_cost_bps
     assert free.mean_cost_bps == pytest.approx(0.0)
 
@@ -259,7 +263,7 @@ def test_the_information_coefficient_does_not_depend_on_the_cost_model():
     """IC is a property of the forecast; only the portfolio sees the cost."""
     setup = world()
     a = run_backtest(**setup, config=BacktestConfig(cost_model="mid"))
-    b = run_backtest(**setup, config=BacktestConfig(cost_model="cross+2bps"))
+    b = run_backtest(**setup, config=BacktestConfig(cost_model="cross", efq=1.5))
     assert a.information_coefficient == pytest.approx(b.information_coefficient)
 
 
@@ -401,7 +405,7 @@ def test_the_series_reproduces_the_reported_sharpe_and_means():
     setup = world(seed=11)
     for annualization in ("decisions", "daily"):
         config = BacktestConfig(annualization=annualization,
-                                cost_model="cross+1bps")
+                                cost_model="cross", efq=1.5)
         report = run_backtest(**setup, config=config, with_series=True)
         series = report.series
         assert series is not None
@@ -431,7 +435,7 @@ def test_the_series_is_absent_unless_asked_for_and_never_serialized():
 
 
 def test_a_cost_multiple_scales_the_charge_and_keeps_unquoted_names_untradable():
-    from stable_finance.evaluation.trades.costs import trading_cost
+    from stable_finance.evaluation.execution import trading_cost
 
     spread = np.array([[1e-4, 2e-4, np.nan]])
     base = trading_cost("cross", spread)
@@ -447,16 +451,21 @@ def test_a_cost_multiple_scales_the_charge_and_keeps_unquoted_names_untradable()
     assert trading_cost("mid", spread)[0, 2] == 0.0
 
 
-def test_the_add_on_scales_with_the_multiple_too():
-    from stable_finance.evaluation.trades.costs import trading_cost
+def test_the_multiple_may_differ_by_name():
+    """A per-name EFQ broadcasts over the grid; unquoted names stay untradable."""
+    from stable_finance.evaluation.execution import trading_cost
 
-    spread = np.array([[1e-4]])
-    assert trading_cost("cross+1bps", spread, multiple=2.0)[0, 0] == pytest.approx(
-        (1e-4 + 1e-4) * 2.0)
+    spread = np.array([[1e-4, 2e-4, np.nan], [3e-4, 4e-4, 5e-4]])
+    per_name = np.array([0.5, 1.0, 2.0])
+    cost = trading_cost("cross", spread, multiple=per_name)
+    np.testing.assert_allclose(cost[:, :2], spread[:, :2] * per_name[:2])
+    assert np.isinf(cost[0, 2]) and cost[1, 2] == pytest.approx(1e-3)
+    with pytest.raises(ValueError):
+        trading_cost("cross", spread, multiple=np.array([1.0, -0.1, 1.0]))
 
 
 def test_a_negative_cost_multiple_is_refused():
-    from stable_finance.evaluation.trades.costs import trading_cost
+    from stable_finance.evaluation.execution import trading_cost
 
     with pytest.raises(ValueError):
         trading_cost("cross", np.array([[1e-4]]), multiple=-1.0)

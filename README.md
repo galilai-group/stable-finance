@@ -30,14 +30,18 @@ runs the downstream adapters and metrics you ask for.
 src/stable_finance/
   evaluation/              the pipeline, one package per stage
     embeddings/            stage 1: the Embeddings contract (what you bring)
-    returns/               stage 2: forward returns; ridge probes, oracle forecasts, IC
+    returns/               stage 2: forward returns; ridge probes (in memory or
+                           streamed) and oracle forecasts
     portfolio/             stage 3: the target portfolio, as if trading were free;
-                           universe, selection, risk, weighting, mean-variance target
-    trades/                stage 4: how far to move given costs and how; rebalance,
-                           trade rules, orders, fills, cost models
-    accounting/            stage 5: what was held and earned; positions, P&L, Sharpe,
-                           execution-quality curves
+                           universe, risk, and construction (selection and weighting,
+                           or the mean-variance target)
+    trades/                stage 4: trading policies, how far to move given costs;
+                           rebalance and trade rules, where a learned policy would go
+    scoring/               stage 5: how good each output is; ic.py (forecast IC),
+                           pnl.py (positions and P&L), sharpe.py (Sharpe, EFQ curves)
     config.py, backtest.py the harness: one named configuration run across all stages
+    execution.py           the execution model: orders, fills, and costs, set by one
+                           number, the EFQ (0 is the mid, 1 crosses the spread)
     market_data.py         MarketData and the market requirements each stage declares
     inputs.py              your table in: realized returns and market data out
   dataset/                 what generic code needs to know about a dataset
@@ -74,8 +78,8 @@ provides:
 - per-horizon covariance estimation and a mean-variance allocator from
   forecasts to weights that charges a proportional transaction cost for moving
   away from the current portfolio; and
-- order and fill contracts with a bid/ask execution simulator that marks the
-  realized position path rather than the target weights.
+- order and fill contracts with an execution simulator, parameterized by EFQ,
+  that marks the realized position path rather than the target weights.
 
 The contracts use dense arrays with shape
 `(decision time, asset, horizon)`. Decisions, assets, and horizons are carried
@@ -170,12 +174,17 @@ from stable_finance import (
 )
 
 orders = orders_from_weights(weights, initial=current)
-fills = simulate_fills(orders, best_bid, best_ask)   # buys at ask, sells at bid
+fills = simulate_fills(orders, best_bid, best_ask)   # efq=1: buys at ask, sells at bid
+mid = simulate_fills(orders, efq=0)                  # midpoint fills, no quotes needed
 held = positions_from_fills(fills, initial=current)  # PortfolioWeights actually held
 results = evaluate_fills(fills, realized_mid_returns, initial=current)
 ```
 
-The simulator fills each order in full at the touch or not at all; an order
+The simulator fills each order in full at `mid * (1 +/- efq * half_spread)`
+or not at all. EFQ is the effective half-spread paid over the quoted one: `0`
+fills at the midpoint, `1` at the touch, and above `1` is size and crowding.
+It may be a scalar or an array that broadcasts to `(decision, asset)`, so a
+per-name execution quality needs no new model. At a positive EFQ an order
 without a positive quote is left unfilled and the realized position lags the
 target. When every order fills, `evaluate_fills` reproduces
 `cross_spread_sharpe` exactly. Depth, partial fills, impact, and commissions
@@ -284,18 +293,16 @@ predictors.
 | `selection` | `all`, `quintile`, `decile`, `decile_long_only` — how much of the ranking to trade |
 | `weighting` | `mean_variance` (cost-aware, path-dependent), `equal`, `inverse_vol`, `min_var`, `erc`, `rank` |
 | `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `embedding` — the last forecasts correlations from the encoder's own representation |
-| `cost_model` | `mid`, `cross`, `cross+0.5bps`, `cross+1bps`, `cross+2bps` |
+| `cost_model` | `mid`, `cross` — free, or the name's own quoted half-spread times `efq` |
 | `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it |
 | `annualization` | `decisions`, `daily` — whether every decision is an independent period |
 
-`trading_cost` also takes a `multiple`, which is the continuous version of
-the cost axis and is preferred over the flat add-ons for reasoning about size
-or execution quality. A flat `+1bp` charges a 2 bp-spread mega-cap and a
-40 bp-spread small-cap the same penalty, whereas impact scales *with*
-illiquidity and the quoted spread is the only observable proxy for it. One
-scalar then spans the whole range: `0` is frictionless, below 1 is the
-fraction of notional that had to cross rather than rest, `1` is crossing
-everything, above 1 is the size regime. Because net return at any multiple is
+`efq` is the continuous cost axis, and `trading_cost` takes it as `multiple`.
+Charging a multiple of each name's own spread, rather than a flat basis-point
+add-on, makes impact scale *with* illiquidity, and the quoted spread is the
+only observable proxy for it. One scalar spans the whole range: `0` is
+frictionless, below 1 is the fraction of notional that had to cross rather
+than rest, `1` is crossing everything, above 1 is the size regime. Because net return at any multiple is
 `gross - multiple * cost`, a sensitivity curve costs one backtest rather than
 one per point.
 
@@ -413,9 +420,10 @@ refuses with `MissingRolesError` when a column is absent:
 |---|---|
 | embeddings to forecast (`fit`, `evaluate_forward_returns`) | nothing |
 | forecast to weights, `cost_model="mid"`, `universe="all"` | nothing |
-| weights to fills at the return's own starting price (`simulate_fills(orders, at="benchmark")`) | nothing |
+| weights to fills at the return's own starting price (`simulate_fills(orders, efq=0)`) | nothing |
 | any crossing cost model, the liquidity screens, `rebalance(cost=...)`, `allocate(cost=...)`, `threshold_selection`, `persistent_selection`, `edge_to_cost`, `evaluate_weights(half_spread=...)` | `half_spread` |
-| weights to fills at the touch (`simulate_fills`, `cross_spread_sharpe`) | `bid_price` and `ask_price` |
+| weights to fills at a positive EFQ (`simulate_fills`) | `mid` and `half_spread`, or both quotes |
+| `cross_spread_sharpe` | `bid_price` and `ask_price` |
 
 The cost-less path needs no market column at any stage. A return is already
 measured at a price the data supports, the one-minute VWAP by default. A
@@ -427,7 +435,7 @@ every stage handles. A missing column is a dataset that never had the
 information. Filling it with NaN would make the whole universe untradable.
 Filling it with zero would report a frictionless result under a
 spread-charged name. Asking for the frictionless result by name, with
-`cost_model="mid"` or `at="benchmark"`, is the honest version of the second.
+`cost_model="mid"` or `efq=0`, is the honest version of the second.
 
 ```python
 from stable_finance import (
@@ -557,7 +565,7 @@ for window in (60, 300, 900):                    # the execution-window sweep
     report = run_backtest(forecast, realized, market=market, config=config)
 ```
 
-Each window fills at its own benchmark, `simulate_fills(..., at="benchmark")`,
+Each window fills at its own benchmark, `simulate_fills(..., efq=0)`,
 at no cost relative to the return, so the sweep shows how much of the signal
 survives entering and exiting more slowly. The best window depends on order
 size against volume, which the backtest does not model, so report the curve.

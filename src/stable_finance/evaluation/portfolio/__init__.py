@@ -1,5 +1,15 @@
-"""Stage 3, forward returns to the target portfolio: universe, selection, risk, and sizing, with no trading costs."""
+"""Stage 3, forward returns to the target portfolio, with no trading costs: the universe, the risk model, and construction (selection and weighting, or the mean-variance target)."""
 
+from stable_finance.evaluation.portfolio.construction import (
+    SELECTION_REQUIRES,
+    SELECTION_RULES,
+    WEIGHTING_REQUIRES,
+    WEIGHTING_RULES,
+    mean_variance_target,
+    select_book,
+    tail_selection,
+    weight_book,
+)
 from stable_finance.evaluation.portfolio.contract import (
     PortfolioWeights,
 )
@@ -12,12 +22,6 @@ from stable_finance.evaluation.portfolio.risk import (
     estimate_risk,
     ledoit_wolf_covariance,
 )
-from stable_finance.evaluation.portfolio.selection import (
-    SELECTION_REQUIRES,
-    SELECTION_RULES,
-    select_book,
-    tail_selection,
-)
 from stable_finance.evaluation.portfolio.universe import (
     UNIVERSE_REQUIRES,
     UNIVERSE_SCREENS,
@@ -25,12 +29,6 @@ from stable_finance.evaluation.portfolio.universe import (
     liquidity_screen,
     presence_screen,
     tradable,
-)
-from stable_finance.evaluation.portfolio.weighting import (
-    WEIGHTING_REQUIRES,
-    WEIGHTING_RULES,
-    mean_variance_target,
-    weight_book,
 )
 
 __all__ = [

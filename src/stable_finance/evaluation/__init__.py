@@ -1,36 +1,28 @@
 """The evaluation pipeline, one package per stage.
 
-    embeddings  ->  returns  ->  portfolio  ->  trades     ->  accounting
-    (you bring)     probes,      universe,      rebalance,      positions,
-                    oracle, IC   selection,     trade rules,    P&L, Sharpe,
-                                 risk, sizing   orders, fills,  execution-
-                                 (no costs)     costs           quality curves
+    embeddings  ->  returns  ->  portfolio  ->  trades     ->  scoring
+    (you bring)     probes,      universe,      policies:       IC, P&L,
+                    oracle       selection,     rebalance,      Sharpe,
+                                 risk, sizing   trade rules     execution-
+                                 (no costs)                     quality curves
 
-Each stage package holds its stage's contract (the object it produces), the
-code that produces it from the stage before, and the metrics that score it.
-The portfolio stage solves for what to hold as if trading were free; the
-trades stage decides how far to move there given what trading costs, and how;
-accounting tracks what was actually held and what it earned. config and
-backtest are the harness that runs all of them under one named
-configuration. market_data is what every stage may read of the observable
-market, with the declarations by which a stage says which market columns it
-needs. inputs turns your own table into realized returns and market data.
+                       execution: orders, fills, costs at an EFQ
+
+Each stage package holds its stage's contract (the object it produces) and
+the code that produces it from the stage before. The portfolio stage solves
+for what to hold as if trading were free. The trades stage holds the policies
+that decide how far to move there given what trading costs. execution is the
+model of what a trade costs and where it fills, set by one number, the EFQ.
+scoring measures each stage's output: the IC of a forecast, and the P&L and
+Sharpe of what a portfolio actually held. config and backtest are the harness
+that runs all of them under one named configuration. market_data is what
+every stage may read of the observable market, with the declarations by which
+a stage says which market columns it needs. inputs turns your own table into
+realized returns and market data.
 """
 
 from stable_finance.evaluation._grid import (
     require_aligned,
-)
-from stable_finance.evaluation.accounting import (
-    BacktestResult,
-    ExecutionQualityCurve,
-    breakeven_efq,
-    cross_spread_sharpe,
-    evaluate_fills,
-    evaluate_weights,
-    mid_price_sharpe,
-    positions_from_fills,
-    sharpe_ratio,
-    sharpe_vs_execution_quality,
 )
 from stable_finance.evaluation.backtest import (
     BacktestReport,
@@ -53,6 +45,20 @@ from stable_finance.evaluation.config import (
 from stable_finance.evaluation.embeddings import (
     Embeddings,
     require_same_observations,
+)
+from stable_finance.evaluation.execution import (
+    COST_MODEL_REQUIRES,
+    COST_MODELS,
+    EFQ_DIRECT_ACCESS,
+    EFQ_INFORMED_RANGE,
+    EFQ_LIT_EXCHANGE,
+    Fills,
+    Orders,
+    effective_half_spread,
+    fill_requires,
+    orders_from_weights,
+    simulate_fills,
+    trading_cost,
 )
 from stable_finance.evaluation.inputs import (
     evaluation_inputs,
@@ -91,37 +97,37 @@ from stable_finance.evaluation.returns import (
     NOISE_MODES,
     ColumnwiseRidge,
     ForwardReturns,
-    InformationCoefficient,
     MonthlyProbeData,
     RidgeProbe,
     StreamingRidge,
-    evaluate_forward_returns,
     fit,
+    oracle_forecast,
+)
+from stable_finance.evaluation.scoring import (
+    BacktestResult,
+    ExecutionQualityCurve,
+    InformationCoefficient,
+    breakeven_efq,
+    cross_spread_sharpe,
+    evaluate_fills,
+    evaluate_forward_returns,
+    evaluate_weights,
     grouped_rank_ic,
     grouped_rank_ic_by_label,
-    oracle_forecast,
+    mid_price_sharpe,
     paired_difference,
     pooled_estimates,
+    positions_from_fills,
+    sharpe_ratio,
+    sharpe_vs_execution_quality,
 )
 from stable_finance.evaluation.trades import (
-    COST_MODEL_REQUIRES,
-    COST_MODELS,
-    EFQ_DIRECT_ACCESS,
-    EFQ_INFORMED_RANGE,
-    EFQ_LIT_EXCHANGE,
-    FILL_REQUIRES,
-    Fills,
     MeanVarianceAllocator,
-    Orders,
     allocate,
     edge_to_cost,
-    effective_half_spread,
-    orders_from_weights,
     persistent_selection,
     rebalance,
-    simulate_fills,
     threshold_selection,
-    trading_cost,
 )
 
 __all__ = [
@@ -142,7 +148,6 @@ __all__ = [
     "EFQ_LIT_EXCHANGE",
     "Embeddings",
     "ExecutionQualityCurve",
-    "FILL_REQUIRES",
     "Fills",
     "ForwardReturns",
     "InformationCoefficient",
@@ -181,6 +186,7 @@ __all__ = [
     "evaluate_forward_returns",
     "evaluate_weights",
     "evaluation_inputs",
+    "fill_requires",
     "fit",
     "grouped_rank_ic",
     "grouped_rank_ic_by_label",

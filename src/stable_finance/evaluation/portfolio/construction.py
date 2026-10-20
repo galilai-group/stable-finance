@@ -1,18 +1,35 @@
-"""How much of each selected name to hold, given a risk model.
+"""Portfolio construction: from a forecast and a risk model to target weights.
 
-Selection says which names are in the book and on which side; weighting sizes
-them. The two are separate axes because they fail differently: a good ranking
-weighted badly concentrates into whichever name the covariance estimate
-happened to call safest, and an equal-weighted book of the wrong names is
-merely flat.
+In practice this is one step, done one of two ways. A sort picks which names
+to hold and on which side, then a simple rule sizes them -- the decile
+portfolios of the academic literature. An optimizer does both at once from the
+forecast, the risk model and a risk aversion. Both live here, and both are
+frictionless: what trading costs is the trades stage's question.
 
-All rules here are PATH-INDEPENDENT -- each decision is sized from that
+SELECTION picks which side of the book each name is on. A forecast orders the
+cross-section; it does not say how much of that order to trade. Holding the
+whole cross-section long-short diversifies best and dilutes the signal most;
+holding only the tails concentrates the signal and the risk. That trade-off is
+a decision the model does not make, so it is an axis.
+
+Selection returns a sign array on the ``(decision, asset)`` grid -- ``+1``
+long, ``-1`` short, ``0`` not held -- which an allocator then sizes. Cuts are
+taken per decision on the names that survived the universe screen, so a
+tighter universe changes which names are in the tails rather than how many.
+
+WEIGHTING sizes the selected names, given a risk model. Selection and
+weighting stay separate configuration axes, even in one module, because they
+fail differently: a good ranking weighted badly concentrates into whichever
+name the covariance estimate happened to call safest, and an equal-weighted
+book of the wrong names is merely flat.
+
+All weighting rules are PATH-INDEPENDENT -- each decision is sized from that
 decision's forecast and risk model alone, with no reference to the portfolio
-currently held. The cost-aware mean-variance allocator in
-:mod:`stable_finance.evaluation.trades.rebalance` is the path-dependent alternative, and the
-difference between them is exactly the value of trading off turnover against
-edge. Legs are sized independently and scaled so a long-short book is dollar
-neutral at the requested gross exposure.
+currently held. The cost-aware rebalance in
+:mod:`stable_finance.evaluation.trades.rebalance` is the path-dependent
+alternative, and the difference between them is exactly the value of trading
+off turnover against edge. Legs are sized independently and scaled so a
+long-short book is dollar neutral at the requested gross exposure.
 """
 
 from __future__ import annotations
@@ -23,7 +40,99 @@ from numpy.typing import ArrayLike, NDArray
 from stable_finance.evaluation.portfolio.contract import PortfolioWeights
 from stable_finance.evaluation.returns.contract import ForwardReturns
 
-__all__ = ["WEIGHTING_RULES", "weight_book"]
+__all__ = [
+    "SELECTION_REQUIRES",
+    "SELECTION_RULES",
+    "WEIGHTING_REQUIRES",
+    "WEIGHTING_RULES",
+    "mean_variance_target",
+    "select_book",
+    "tail_selection",
+    "weight_book",
+]
+
+
+# ── selection: which names, on which side ──────────────────────────────────
+
+def tail_selection(
+    forecast: ArrayLike,
+    eligible: ArrayLike,
+    *,
+    fraction: float,
+    long_only: bool = False,
+) -> NDArray[np.int8]:
+    """Long the top ``fraction`` of each decision, short the bottom.
+
+    The cut is a fraction of that decision's eligible cross-section, not an
+    absolute forecast threshold: forecasts from a rank target, a raw-return
+    probe and a trained head live on entirely different scales, and a fraction
+    is the only cut that means the same thing for all three.
+    """
+    if not 0.0 < fraction <= 0.5:
+        raise ValueError("fraction must lie in (0, 0.5]")
+    values = np.asarray(forecast, dtype=np.float64)
+    usable = np.asarray(eligible, dtype=bool) & np.isfinite(values)
+    if values.shape != usable.shape or values.ndim != 2:
+        raise ValueError("forecast and eligible must be equally shaped 2-D arrays")
+
+    signs = np.zeros(values.shape, dtype=np.int8)
+    for decision in range(values.shape[0]):
+        row = np.flatnonzero(usable[decision])
+        if len(row) < 2:
+            continue
+        count = max(int(np.floor(len(row) * fraction)), 1)
+        # A leg cannot exceed half the cross-section, or the long and short
+        # tails would overlap and a name would be held on both sides.
+        count = min(count, len(row) // 2)
+        if count == 0:
+            continue
+        order = row[np.argsort(values[decision, row], kind="stable")]
+        signs[decision, order[-count:]] = 1
+        if not long_only:
+            signs[decision, order[:count]] = -1
+    return signs
+
+
+def select_book(
+    name: str, forecast: ArrayLike, eligible: ArrayLike
+) -> NDArray[np.int8]:
+    """Dispatch to one named selection rule; see :data:`SELECTION_RULES`.
+
+    ``all`` holds every eligible name, signed by whether its forecast is above
+    or below that decision's cross-sectional median -- the dollar-neutral book
+    a reader would write down from the ranking alone.
+    """
+    values = np.asarray(forecast, dtype=np.float64)
+    usable = np.asarray(eligible, dtype=bool) & np.isfinite(values)
+    if name == "all":
+        signs = np.zeros(values.shape, dtype=np.int8)
+        for decision in range(values.shape[0]):
+            row = np.flatnonzero(usable[decision])
+            if len(row) < 2:
+                continue
+            centre = np.median(values[decision, row])
+            signs[decision, row] = np.where(values[decision, row] >= centre, 1, -1)
+        return signs
+    if name == "quintile":
+        return tail_selection(values, usable, fraction=0.2)
+    if name == "decile":
+        return tail_selection(values, usable, fraction=0.1)
+    if name == "decile_long_only":
+        return tail_selection(values, usable, fraction=0.1, long_only=True)
+    raise ValueError(f"unknown selection {name!r}; choose from {SELECTION_RULES}")
+
+
+#: The selection rules a backtest configuration may name.
+SELECTION_RULES = ("all", "quintile", "decile", "decile_long_only")
+
+#: What each named rule needs of the market: nothing, since each cuts the
+#: forecast ranking alone. ``threshold_selection`` and ``persistent_selection``
+#: compare the forecast with a cost and so need ``half_spread`` when given
+#: one; they are not configuration axes.
+SELECTION_REQUIRES: dict[str, tuple[str, ...]] = {name: () for name in SELECTION_RULES}
+
+
+# ── weighting: how much of each ─────────────────────────────────────────────
 
 #: The path-independent weighting rules a backtest configuration may name.
 #: ``mean_variance`` is handled by the cost-aware allocator instead.
@@ -188,4 +297,3 @@ def mean_variance_target(
     for horizon in range(mu.shape[2]):
         target[:, :, horizon] = np.linalg.solve(sigma[horizon], mu[:, :, horizon].T).T / risk_aversion
     return PortfolioWeights(target, forecast.decisions, forecast.assets, forecast.horizons)
-

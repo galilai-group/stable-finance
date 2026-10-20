@@ -3,12 +3,12 @@
 import numpy as np
 import pytest
 
-from stable_finance.evaluation.accounting.pnl import (
+from stable_finance.evaluation.scoring.sharpe import (
     breakeven_efq,
     sharpe_ratio,
     sharpe_vs_execution_quality,
 )
-from stable_finance.evaluation.trades.costs import (
+from stable_finance.evaluation.execution import (
     EFQ_DIRECT_ACCESS,
     EFQ_INFORMED_RANGE,
     EFQ_LIT_EXCHANGE,

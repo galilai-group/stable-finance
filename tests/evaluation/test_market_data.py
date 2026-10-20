@@ -72,7 +72,8 @@ def test_a_missing_column_is_refused_and_named():
 
 
 def test_every_stage_states_what_it_needs():
-    assert simulate_fills.requires == ("bid_price", "ask_price")
+    assert simulate_fills.requires == ("mid", "half_spread")
+    assert sf.fill_requires(0.0) == () and sf.fill_requires(0.7) == ("mid", "half_spread")
     assert cross_spread_sharpe.requires == ("bid_price", "ask_price")
     assert edge_to_cost.requires == ("half_spread",)
     assert evaluate_weights.requires == ("half_spread",)
@@ -165,7 +166,7 @@ def test_fills_need_both_sides_of_the_book():
     spread_only = MarketData({"half_spread": market["half_spread"]}, DECISIONS, ASSETS)
     univariate = MarketData({"mid": market["mid"]}, DECISIONS, ASSETS)
     for lacking in (spread_only, univariate):
-        with pytest.raises(MissingRolesError, match=r"simulate_fills\(at='touch'\) needs bid_price.*at='benchmark' fills"):
+        with pytest.raises(MissingRolesError, match=r"simulate_fills\(efq>0\) needs .*efq=0 fills"):
             simulate_fills(orders, lacking)
         with pytest.raises(MissingRolesError, match="cross_spread_sharpe"):
             cross_spread_sharpe(PortfolioWeights(weights, DECISIONS, ASSETS, [300]),
@@ -183,10 +184,10 @@ def test_mid_fills_need_no_quotes_and_reproduce_the_mid_marked_sharpe():
     expect = sf.mid_price_sharpe(weights, realized)
     bid, ask = _quotes()
     univariate = MarketData({"mid": (bid + ask) / 2}, DECISIONS, ASSETS)
-    for fills in (simulate_fills(orders, at="benchmark"),
-                  simulate_fills(orders, MarketData.empty(DECISIONS, ASSETS), at="benchmark"),
-                  simulate_fills(orders, univariate, at="benchmark"),
-                  simulate_fills(orders, bid, ask, at="benchmark")):
+    for fills in (simulate_fills(orders, efq=0),
+                  simulate_fills(orders, MarketData.empty(DECISIONS, ASSETS), efq=0),
+                  simulate_fills(orders, univariate, efq=0),
+                  simulate_fills(orders, bid, ask, efq=0)):
         assert np.array_equal(fills.price, fills.mid_price, equal_nan=True)
         np.testing.assert_allclose(sf.positions_from_fills(fills).values, weights.values)
         result = sf.evaluate_fills(fills, realized)[0]
@@ -195,10 +196,36 @@ def test_mid_fills_need_no_quotes_and_reproduce_the_mid_marked_sharpe():
     # A name with no midpoint at a decision is not observed there, so it does not fill.
     gappy = univariate.get("mid").copy()
     gappy[5, 3] = np.nan
-    fills = simulate_fills(orders, MarketData({"mid": gappy}, DECISIONS, ASSETS), at="benchmark")
+    fills = simulate_fills(orders, MarketData({"mid": gappy}, DECISIONS, ASSETS), efq=0)
     assert fills.quantity[5, 3, 0] == 0 and fills.quantity[6, 3, 0] != 0
-    with pytest.raises(ValueError, match="at must be"):
-        simulate_fills(orders, at="vwap")
+    with pytest.raises(ValueError, match="efq must be"):
+        simulate_fills(orders, efq=-0.5)
+
+
+def test_efq_one_fills_at_the_touch_and_efq_scales_the_cost():
+    """One number spans the execution model: 0 is the mid, 1 the touch."""
+    bid, ask = _quotes()
+    rng = np.random.default_rng(4)
+    orders = sf.orders_from_weights(
+        PortfolioWeights(rng.normal(0, 0.1, (D, A, 1)), DECISIONS, ASSETS, [300]))
+    touch = simulate_fills(orders, bid, ask)
+    buy = touch.quantity[..., 0] > 0
+    sell = touch.quantity[..., 0] < 0
+    np.testing.assert_allclose(touch.price[..., 0][buy], ask[buy])
+    np.testing.assert_allclose(touch.price[..., 0][sell], bid[sell])
+
+    mid = touch.mid_price
+    half = simulate_fills(orders, bid, ask, efq=0.5)
+    np.testing.assert_allclose(np.nan_to_num(half.price - mid),
+                               0.5 * np.nan_to_num(touch.price - mid), atol=1e-12)
+    # A per-name EFQ broadcasts over decisions.
+    per_name = np.linspace(0.0, 1.0, A)
+    mixed = simulate_fills(orders, bid, ask, efq=per_name)
+    np.testing.assert_allclose(np.nan_to_num(mixed.price - mid),
+                               per_name[None, :, None] * np.nan_to_num(touch.price - mid),
+                               atol=1e-12)
+    with pytest.raises(ValueError, match="broadcast"):
+        simulate_fills(orders, bid, ask, efq=np.ones(A + 1))
 
 
 def test_cost_reading_stages_accept_a_spread_or_quotes_and_refuse_neither():

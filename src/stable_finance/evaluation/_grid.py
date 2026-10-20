@@ -26,3 +26,15 @@ def require_aligned(left, right) -> None:
     for axis in ("decisions", "assets", "horizons"):
         if not np.array_equal(getattr(left, axis), getattr(right, axis)):
             raise ValueError(f"{axis} are not aligned")
+
+
+def _rankdata(values: np.ndarray) -> np.ndarray:
+    """Return average-tie ranks without requiring scipy."""
+    order = np.argsort(values, kind="stable")
+    sorted_values = values[order]
+    starts = np.r_[True, sorted_values[1:] != sorted_values[:-1]]
+    dense = starts.cumsum()
+    bounds = np.r_[np.flatnonzero(starts), len(values)]
+    ranks = np.empty(len(values), dtype=np.float64)
+    ranks[order] = 0.5 * (bounds[dense] + bounds[dense - 1] + 1)
+    return ranks

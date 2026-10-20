@@ -159,7 +159,7 @@ def rebalance(
     """The weights actually held, moving toward ``target`` only as far as cost allows.
 
     ``target`` is the frictionless holding at each decision, such as
-    :func:`~stable_finance.evaluation.portfolio.weighting.mean_variance_target`.
+    :func:`~stable_finance.evaluation.portfolio.construction.mean_variance_target`.
     ``covariance`` (``(n_horizons, n_assets, n_assets)``) prices the tracking
     error and ``risk_aversion`` its weight against cost. ``cost`` broadcasts to
     ``(n_decisions, n_assets)``; NaN marks an asset that cannot be traded at

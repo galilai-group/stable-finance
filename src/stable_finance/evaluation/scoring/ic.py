@@ -1,4 +1,4 @@
-"""How good a return forecast is: cross-sectional rank information coefficients."""
+"""How good a return forecast is: the cross-sectional rank information coefficient (IC)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike
 
-from stable_finance.evaluation._grid import require_aligned
+from stable_finance.evaluation._grid import _rankdata, require_aligned
 from stable_finance.evaluation.market_data import requires
 from stable_finance.evaluation.returns.contract import ForwardReturns
 
@@ -19,18 +19,6 @@ class InformationCoefficient:
     mean: float
     standard_error: float
     observations: int
-
-
-def _rankdata(values: np.ndarray) -> np.ndarray:
-    """Return average-tie ranks without requiring scipy."""
-    order = np.argsort(values, kind="stable")
-    sorted_values = values[order]
-    starts = np.r_[True, sorted_values[1:] != sorted_values[:-1]]
-    dense = starts.cumsum()
-    bounds = np.r_[np.flatnonzero(starts), len(values)]
-    ranks = np.empty(len(values), dtype=np.float64)
-    ranks[order] = 0.5 * (bounds[dense] + bounds[dense - 1] + 1)
-    return ranks
 
 
 def _pearson_correlation(left: np.ndarray, right: np.ndarray) -> float:

@@ -1,7 +1,7 @@
 import numpy as np
 
 from stable_finance.evaluation.returns.contract import ForwardReturns
-from stable_finance.evaluation.returns.scoring import (
+from stable_finance.evaluation.scoring.ic import (
     evaluate_forward_returns,
     grouped_rank_ic,
     grouped_rank_ic_by_label,

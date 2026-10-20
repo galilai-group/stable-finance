@@ -70,7 +70,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from stable_finance.evaluation.returns.contract import ForwardReturns
-from stable_finance.evaluation.returns.scoring import _rankdata
+from stable_finance.evaluation._grid import _rankdata
 
 __all__ = ["NOISE_MODES", "oracle_forecast"]
 

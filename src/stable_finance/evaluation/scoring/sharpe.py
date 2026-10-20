@@ -1,8 +1,8 @@
-"""How good a portfolio is: Sharpe ratios, gross and after costs, and edge-to-cost.
+"""How good a portfolio's return series is: Sharpe ratios and their EFQ curve.
 
-Weight evaluation with quoted half-spread costs, Sharpe at mid and after
-crossing the observable spread, the cross-sectional edge-to-cost ratio, and
-the Sharpe curve across execution quality.
+The Sharpe ratio of a periodic return series, the Sharpe of a weight path
+marked at mid and after crossing the quoted spread, and the net Sharpe swept
+across execution quality with its break-even EFQ.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from numpy.typing import ArrayLike, NDArray
+from numpy.typing import ArrayLike
 
 from stable_finance.evaluation._grid import require_aligned
 from stable_finance.evaluation.market_data import (
@@ -21,76 +21,6 @@ from stable_finance.evaluation.market_data import (
 )
 from stable_finance.evaluation.portfolio.contract import PortfolioWeights
 from stable_finance.evaluation.returns.contract import ForwardReturns
-from stable_finance.evaluation.trades.contract import Fills
-from stable_finance.evaluation.trades.orders import _initial_positions
-
-
-@dataclass(frozen=True)
-class BacktestResult:
-    """One periodic return series and its summary statistics."""
-
-    gross_returns: NDArray[np.float64]
-    costs: NDArray[np.float64]
-    net_returns: NDArray[np.float64]
-    sharpe: float
-
-
-@requires("half_spread")
-def evaluate_weights(
-    weights: PortfolioWeights,
-    realized: ForwardReturns,
-    *,
-    half_spread: ArrayLike | MarketData | None = None,
-    periods_per_year: float = 252.0,
-) -> tuple[BacktestResult, ...]:
-    """Evaluate weights independently at every horizon.
-
-    ``half_spread`` is the entry half-spread divided by mid price and must have
-    shape ``(n_decisions, n_assets)``. Turnover is ``abs(w_t - w_{t-1})``;
-    the first portfolio is traded from cash. This models crossing the quoted
-    spread and deliberately excludes market impact and commissions.
-
-    ``half_spread=None`` is the frictionless result, stated explicitly.
-    :class:`MarketData` in its place must carry a spread (or both quotes): a
-    market handed over to be charged is never silently charged nothing.
-    """
-    require_aligned(weights, realized)
-    half_spread = market_quantity(half_spread, "half_spread", stage=evaluate_weights,
-                                  like=weights)
-    n_decisions, n_assets, n_horizons = weights.values.shape
-    if half_spread is None:
-        spread = np.zeros((n_decisions, n_assets), dtype=np.float64)
-    else:
-        spread = np.asarray(half_spread, dtype=np.float64)
-        if spread.shape != (n_decisions, n_assets):
-            raise ValueError(
-                "half_spread must have shape "
-                f"{(n_decisions, n_assets)}, got {spread.shape}"
-            )
-        if np.any(np.isfinite(spread) & (spread < 0)):
-            raise ValueError("half_spread cannot be negative")
-
-    results = []
-    for horizon in range(n_horizons):
-        weight = weights.values[:, :, horizon]
-        outcome = realized.values[:, :, horizon]
-        valid = np.isfinite(weight) & np.isfinite(outcome)
-        gross = np.where(valid, weight * outcome, 0.0).sum(axis=1)
-        gross[~valid.any(axis=1)] = np.nan
-
-        previous = np.vstack([np.zeros((1, n_assets)), weight[:-1]])
-        turnover = np.abs(weight - previous)
-        costs = np.where(np.isfinite(turnover) & np.isfinite(spread),
-                         turnover * spread, 0.0).sum(axis=1)
-        costs[~np.isfinite(weight).any(axis=1)] = np.nan
-        net = gross - costs
-        results.append(BacktestResult(
-            gross_returns=gross,
-            costs=costs,
-            net_returns=net,
-            sharpe=sharpe_ratio(net, periods_per_year=periods_per_year),
-        ))
-    return tuple(results)
 
 
 def sharpe_ratio(returns: ArrayLike, *, periods_per_year: float = 252.0) -> float:
@@ -308,52 +238,3 @@ def breakeven_efq(gross: ArrayLike, cost_at_unit_efq: ArrayLike) -> float:
     if mean_gross <= 0:
         return float("nan")
     return float("inf") if mean_cost <= 0 else mean_gross / mean_cost
-
-
-def positions_from_fills(
-    fills: Fills, *, initial: ArrayLike | None = None
-) -> PortfolioWeights:
-    """Weights actually held after each decision's fills."""
-    n_decisions, n_assets, n_horizons = fills.quantity.shape
-    start = _initial_positions(initial, (n_assets, n_horizons))
-    positions = start[None] + np.cumsum(fills.quantity, axis=0)
-    return PortfolioWeights(positions, fills.decisions, fills.assets, fills.horizons)
-
-
-def evaluate_fills(
-    fills: Fills,
-    realized_mid_returns: ForwardReturns,
-    *,
-    initial: ArrayLike | None = None,
-    periods_per_year: float = 252.0,
-) -> tuple[BacktestResult, ...]:
-    """Mark the realized position path at mid and charge each fill's cost.
-
-    Gross return is the position held after the decision's fills times the
-    mid-to-mid forward return. Execution cost is the filled quantity times the
-    fill price's distance from mid, so buys above mid and sells below mid both
-    cost money. One result is returned per horizon.
-    """
-    require_aligned(fills, realized_mid_returns)
-    positions = positions_from_fills(fills, initial=initial).values
-    traded = fills.quantity != 0
-    slippage = np.where(
-        traded, (fills.price - fills.mid_price) / fills.mid_price, 0.0
-    )
-    per_asset_cost = fills.quantity * slippage
-    results = []
-    for horizon in range(len(fills.horizons)):
-        position = positions[:, :, horizon]
-        outcome = realized_mid_returns.values[:, :, horizon]
-        valid = np.isfinite(outcome)
-        gross = np.where(valid, position * outcome, 0.0).sum(axis=1)
-        gross[~valid.any(axis=1)] = np.nan
-        costs = per_asset_cost[:, :, horizon].sum(axis=1)
-        net = gross - costs
-        results.append(BacktestResult(
-            gross_returns=gross,
-            costs=costs,
-            net_returns=net,
-            sharpe=sharpe_ratio(net, periods_per_year=periods_per_year),
-        ))
-    return tuple(results)
