@@ -9,7 +9,7 @@ merely flat.
 All rules here are PATH-INDEPENDENT -- each decision is sized from that
 decision's forecast and risk model alone, with no reference to the portfolio
 currently held. The cost-aware mean-variance allocator in
-:mod:`stable_finance.evaluation.portfolio.allocation` is the path-dependent alternative, and the
+:mod:`stable_finance.evaluation.trades.rebalance` is the path-dependent alternative, and the
 difference between them is exactly the value of trading off turnover against
 edge. Legs are sized independently and scaled so a long-short book is dollar
 neutral at the requested gross exposure.
@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+
+from stable_finance.evaluation.portfolio.contract import PortfolioWeights
+from stable_finance.evaluation.returns.contract import ForwardReturns
 
 __all__ = ["WEIGHTING_RULES", "weight_book"]
 
@@ -156,3 +159,33 @@ def weight_book(
                 raw, total = np.ones(len(members)), float(len(members))
             weights[decision, members] = leg * share * np.abs(raw) / total
     return weights
+
+
+def mean_variance_target(
+    forecast: ForwardReturns,
+    covariance: ArrayLike,
+    *,
+    risk_aversion: float = 1.0,
+) -> PortfolioWeights:
+    """The frictionless mean-variance holding, ``Sigma^-1 mu / risk_aversion``.
+
+    What the portfolio would hold if trading were free. ``covariance`` has
+    shape ``(n_horizons, n_assets, n_assets)`` and must be invertible (an
+    estimate from :func:`~stable_finance.evaluation.portfolio.risk.estimate_covariance`
+    is). A missing forecast is a zero expected return. How far to actually
+    move toward this target, given costs, is the trades stage's decision
+    (:func:`~stable_finance.evaluation.trades.rebalance.rebalance`).
+    """
+    if risk_aversion <= 0:
+        raise ValueError("risk_aversion must be positive")
+    mu = np.nan_to_num(np.asarray(forecast.values, dtype=np.float64), nan=0.0)
+    sigma = np.asarray(covariance, dtype=np.float64)
+    if sigma.shape != (mu.shape[2], mu.shape[1], mu.shape[1]):
+        raise ValueError(
+            f"covariance must have shape {(mu.shape[2], mu.shape[1], mu.shape[1])}, "
+            f"got {sigma.shape}")
+    target = np.empty_like(mu)
+    for horizon in range(mu.shape[2]):
+        target[:, :, horizon] = np.linalg.solve(sigma[horizon], mu[:, :, horizon].T).T / risk_aversion
+    return PortfolioWeights(target, forecast.decisions, forecast.assets, forecast.horizons)
+

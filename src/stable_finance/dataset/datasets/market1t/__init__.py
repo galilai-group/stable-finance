@@ -1,15 +1,17 @@
 """Market-1T: the Polygon-derived one-second US-equity dataset.
 
-Everything specific to it lives here: its column schema
-(:data:`MARKET_SCHEMA`), its NYSE calendar with the holiday file and the
-one-second end-of-bar offset (:class:`Market1TCalendar`), Polygon parquet
-ingestion into the sparse mosaic (:mod:`.ingest`, :mod:`.shard_months`), and
-the Fama-French industry map (:mod:`.industry`).
+One processing pipeline, one module per step:
 
-The generic pipeline -- densify, the day store, target tables, panels and
-cells -- reads Market-1T stores through the same schema and calendar
-interfaces as any other dataset, and defaults to this one when a store or a
-caller names nothing else.
+``spec``      its nine-column schema, NYSE calendar and clock, store locations
+``ingest``    raw Polygon parquet to the sparse MDS mosaic; the industry map
+``mosaic``    the MDS mosaic: reader, densify (sparse to dense), reshard
+``views``     sessions to model inputs: grid rebuild, views, panels, cells
+``daystore``  the day-major store, its labels, and evaluation inputs read from it
+``tables``    monthly cross-section tables of the targets
+
+Labels are defined by the generic :class:`~stable_finance.dataset.objective.Objective`
+and computed by :mod:`stable_finance.dataset.outcomes`; everything else here
+is Market-1T's own.
 """
 
 from stable_finance.dataset.datasets.market1t.spec import (

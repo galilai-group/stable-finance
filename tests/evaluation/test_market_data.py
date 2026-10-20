@@ -10,7 +10,6 @@ from stable_finance import (
     ForwardReturns,
     MarketData,
     MissingRolesError,
-    Orders,
     PortfolioWeights,
     allocate,
     cross_spread_sharpe,
@@ -22,7 +21,6 @@ from stable_finance import (
     simulate_fills,
     sweep_configs,
 )
-from stable_finance.dataset import Objective, Timeline
 
 D, A = 40, 12
 DECISIONS, ASSETS = np.arange(D), np.array([f"S{i}" for i in range(A)])
@@ -230,75 +228,44 @@ def test_cost_reading_stages_accept_a_spread_or_quotes_and_refuse_neither():
 # ── from the dataset ─────────────────────────────────────────────────────────
 
 
-def _store(tmp_path, schema_roles, n=12):
-    from stable_finance.dataset import FeatureSchema, FixedSession, sessions_from_frame
-    from stable_finance.dataset import write_daystore
+def test_a_market1t_store_carries_its_book_downstream(tmp_path):
+    from helpers import market1t_store
 
-    cal = FixedSession()
-    o, _ = cal.bounds("2024-03-05")
-    rng = np.random.default_rng(4)
-    rows = {"t": [], "sym": [], **{c: [] for c in schema_roles.values()}}
-    for k in range(n):
-        mid = 20 + k + rng.normal(0, 0.01, 390).cumsum()
-        rows["t"].append(o + 60 * np.arange(390))
-        rows["sym"].append(np.full(390, f"S{k:02d}"))
-        for role, column in schema_roles.items():
-            rows[column].append({"mid": mid, "bid_price": mid - 0.01,
-                                 "ask_price": mid + 0.01}[role])
-    frame = {key: np.concatenate(v) for key, v in rows.items()}
-    schema = FeatureSchema.from_roles(**schema_roles)
-    sessions = sessions_from_frame(frame, schema, Timeline(cal, bar_seconds=60), time="t", ticker="sym",
-                                   stamp="start")
-    return write_daystore(sessions, tmp_path, Timeline(cal, bar_seconds=60),
-                          objective=Objective(horizons=(300,)))
+    from stable_finance.dataset.datasets.market1t.daystore import DayRecord
 
-
-def test_a_univariate_store_supports_only_frictionless_trading(tmp_path):
-    days = _store(tmp_path, {"mid": "px"})
-    market = market_from_days(days, anchors=[3600, 7200])
-    assert market.available == ("mid",)
-    assert market.shape == (2, 12)
-    with pytest.raises(MissingRolesError):
-        simulate_fills(Orders(np.zeros((2, 12, 1)), market.decisions, market.assets, [300]),
-                       market)
-    assert not DEFAULT_BACKTEST.supported_by(market) and MID.supported_by(market)
-
-
-def test_a_quoted_store_carries_its_book_downstream(tmp_path):
-    days = _store(tmp_path, {"bid_price": "b", "ask_price": "a"})
+    days = market1t_store(tmp_path, ["2023-01-03"], n_tickers=6)
     market = market_from_days(days, anchors=[3600])
-    assert market.has("bid_price", "ask_price", "half_spread", "mid")
-    from stable_finance.dataset.storage.daystore import DayRecord
-
+    assert market.has("bid_price", "ask_price", "half_spread", "mid", "vwap", "volume")
     record = DayRecord(days[0])
     row = record.anchor_row(3600)
     expect = np.asarray(record.features[:, record.schema.role_index("bid_price"), row])
     np.testing.assert_allclose(market["bid_price"][0], expect)
+    assert DEFAULT_BACKTEST.supported_by(market)
 
 
 def test_a_panel_cache_without_quotes_says_so(tmp_path):
-    from stable_finance import MarketPanel
-    from stable_finance.dataset import (
-        FixedSession, PanelCache, ViewSpec, build_session_panel, panel_cache_key,
-        sessions_from_series,
-    )
     from helpers import IdentityStats as _IdentityStats
 
-    cal = FixedSession()
-    o, _ = cal.bounds("2024-03-05")
-    sessions = [s for k in range(3) for s in sessions_from_series(
-        o + np.arange(400), 10 + k + np.linspace(0, 1, 400), timeline=Timeline(cal, bar_seconds=1), ticker=f"S{k}",
-        stamp="start")]
+    from stable_finance import MarketPanel
+    from stable_finance.dataset import (
+        FeatureSchema, MarketSession, PanelCache, ViewSpec, build_session_panel,
+        panel_cache_key, standard_open_est,
+    )
+
+    start = standard_open_est("2023-01-03")
+    sessions = [MarketSession(f"S{k}", "2023-01-03", np.arange(start, start + 400),
+                              (10 + k + np.linspace(0, 1, 400))[:, None],
+                              FeatureSchema.univariate()) for k in range(3)]
     rows = [r for s in sessions for r in build_session_panel(
-        s, [150, 200], _IdentityStats(), timeline=cal, target_types=("return",),
-        horizons=(10,), view_spec=ViewSpec(sequence_length=4, aggregation_seconds=(1, 1)))]
+        s, [150, 200], _IdentityStats(), target_types=("return",), horizons=(10,),
+        view_spec=ViewSpec(sequence_length=4, aggregation_seconds=(1, 1)))]
     assert rows and all(r.quote is None for r in rows)
     key = panel_cache_key(anchors_per_day=2)
     cache = PanelCache(tmp_path)
-    cache.build("2024-03", key, [(np.stack([r.view for r in rows]), rows)])
-    assert cache.load("2024-03", key).quotes is None
+    cache.build("2023-01", key, [(np.stack([r.view for r in rows]), rows)])
+    assert cache.load("2023-01", key).quotes is None
 
-    panel = MarketPanel.from_cache(tmp_path, "2024-03", anchors_per_day=2)
+    panel = MarketPanel.from_cache(tmp_path, "2023-01", anchors_per_day=2)
     assert not panel.has_quotes and "half_spread" not in panel.take([0, 1])
     with pytest.raises(MissingRolesError):
         panel.half_spread()

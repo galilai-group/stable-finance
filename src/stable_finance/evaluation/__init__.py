@@ -1,50 +1,61 @@
 """The evaluation pipeline, one package per stage.
 
-    embeddings  ->  returns  ->  portfolio  ->  trades
-    (you bring)     probes,      universe,      orders,
-                    oracle, IC   selection,     positions,
-                                 risk, sizing,  fill scoring
-                                 backtest
-                                     |              |
-                                     +--------------+
-                                     execution_model:
-                                     costs, fill rules
+    embeddings  ->  returns  ->  portfolio  ->  trades     ->  accounting
+    (you bring)     probes,      universe,      rebalance,      positions,
+                    oracle, IC   selection,     trade rules,    P&L, Sharpe,
+                                 risk, sizing   orders, fills,  execution-
+                                 (no costs)     costs           quality curves
 
 Each stage package holds its stage's contract (the object it produces), the
 code that produces it from the stage before, and the metrics that score it.
-``execution_model`` is shared by the two stages that trade: the portfolio
-stage charges its costs, and the trades stage fills orders by its rules.
-``market_data`` is what every stage may read of the observable market, with
-the declarations by which a stage says which market columns it needs.
-``from_dataset`` builds market data and realized returns from the dataset's
-stores.
+The portfolio stage solves for what to hold as if trading were free; the
+trades stage decides how far to move there given what trading costs, and how;
+accounting tracks what was actually held and what it earned. config and
+backtest are the harness that runs all of them under one named
+configuration. market_data is what every stage may read of the observable
+market, with the declarations by which a stage says which market columns it
+needs. inputs turns your own table into realized returns and market data.
 """
 
 from stable_finance.evaluation._grid import (
     require_aligned,
 )
+from stable_finance.evaluation.accounting import (
+    BacktestResult,
+    ExecutionQualityCurve,
+    breakeven_efq,
+    cross_spread_sharpe,
+    evaluate_fills,
+    evaluate_weights,
+    mid_price_sharpe,
+    positions_from_fills,
+    sharpe_ratio,
+    sharpe_vs_execution_quality,
+)
+from stable_finance.evaluation.backtest import (
+    BacktestReport,
+    PnLSeries,
+    run_backtest,
+    sweep_configs,
+)
+from stable_finance.evaluation.config import (
+    ALLOCATORS,
+    ANNUALIZATIONS,
+    AXIS_REQUIRES,
+    CONFIG_SPACE,
+    DEFAULT_BACKTEST,
+    EFQ_GRID,
+    REBALANCE_RULES,
+    BacktestConfig,
+    check_config,
+    enumerate_configs,
+)
 from stable_finance.evaluation.embeddings import (
     Embeddings,
     require_same_observations,
 )
-from stable_finance.evaluation.execution_model import (
-    COST_MODEL_REQUIRES,
-    COST_MODELS,
-    EFQ_DIRECT_ACCESS,
-    EFQ_INFORMED_RANGE,
-    EFQ_LIT_EXCHANGE,
-    FILL_REQUIRES,
-    breakeven_efq,
-    effective_half_spread,
-    simulate_fills,
-    trading_cost,
-)
-from stable_finance.evaluation.from_dataset import (
-    MarketPanel,
-    decision_labels,
-    find_cached_month,
-    forward_returns_from_days,
-    market_from_days,
+from stable_finance.evaluation.inputs import (
+    evaluation_inputs,
     to_grid,
 )
 from stable_finance.evaluation.market_data import (
@@ -53,13 +64,6 @@ from stable_finance.evaluation.market_data import (
     requires,
 )
 from stable_finance.evaluation.portfolio import (
-    ALLOCATORS,
-    ANNUALIZATIONS,
-    AXIS_REQUIRES,
-    CONFIG_SPACE,
-    DEFAULT_BACKTEST,
-    EFQ_GRID,
-    REBALANCE_RULES,
     RISK_MODEL_REQUIRES,
     RISK_MODELS,
     SELECTION_REQUIRES,
@@ -68,36 +72,18 @@ from stable_finance.evaluation.portfolio import (
     UNIVERSE_SCREENS,
     WEIGHTING_REQUIRES,
     WEIGHTING_RULES,
-    BacktestConfig,
-    BacktestReport,
-    BacktestResult,
-    ExecutionQualityCurve,
-    MeanVarianceAllocator,
-    PnLSeries,
     PortfolioWeights,
-    allocate,
     apply_screen,
-    check_config,
-    cross_spread_sharpe,
     diagonal_covariance,
-    edge_to_cost,
     embedding_covariance,
-    enumerate_configs,
     estimate_covariance,
     estimate_risk,
-    evaluate_weights,
     ledoit_wolf_covariance,
     liquidity_screen,
-    mid_price_sharpe,
-    persistent_selection,
+    mean_variance_target,
     presence_screen,
-    run_backtest,
     select_book,
-    sharpe_ratio,
-    sharpe_vs_execution_quality,
-    sweep_configs,
     tail_selection,
-    threshold_selection,
     tradable,
     weight_book,
 )
@@ -118,11 +104,24 @@ from stable_finance.evaluation.returns import (
     pooled_estimates,
 )
 from stable_finance.evaluation.trades import (
+    COST_MODEL_REQUIRES,
+    COST_MODELS,
+    EFQ_DIRECT_ACCESS,
+    EFQ_INFORMED_RANGE,
+    EFQ_LIT_EXCHANGE,
+    FILL_REQUIRES,
     Fills,
+    MeanVarianceAllocator,
     Orders,
-    evaluate_fills,
+    allocate,
+    edge_to_cost,
+    effective_half_spread,
     orders_from_weights,
-    positions_from_fills,
+    persistent_selection,
+    rebalance,
+    simulate_fills,
+    threshold_selection,
+    trading_cost,
 )
 
 __all__ = [
@@ -149,7 +148,6 @@ __all__ = [
     "InformationCoefficient",
     "MARKET_QUANTITIES",
     "MarketData",
-    "MarketPanel",
     "MeanVarianceAllocator",
     "MonthlyProbeData",
     "NOISE_MODES",
@@ -172,7 +170,6 @@ __all__ = [
     "breakeven_efq",
     "check_config",
     "cross_spread_sharpe",
-    "decision_labels",
     "diagonal_covariance",
     "edge_to_cost",
     "effective_half_spread",
@@ -183,14 +180,13 @@ __all__ = [
     "evaluate_fills",
     "evaluate_forward_returns",
     "evaluate_weights",
-    "find_cached_month",
+    "evaluation_inputs",
     "fit",
-    "forward_returns_from_days",
     "grouped_rank_ic",
     "grouped_rank_ic_by_label",
     "ledoit_wolf_covariance",
     "liquidity_screen",
-    "market_from_days",
+    "mean_variance_target",
     "mid_price_sharpe",
     "oracle_forecast",
     "orders_from_weights",
@@ -199,6 +195,7 @@ __all__ = [
     "pooled_estimates",
     "positions_from_fills",
     "presence_screen",
+    "rebalance",
     "require_aligned",
     "require_same_observations",
     "requires",

@@ -11,7 +11,7 @@ from sklearn.exceptions import NotFittedError
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
-from stable_finance.dataset.storage.locations import Month
+from stable_finance.dataset.datasets.market1t.spec import Month
 from stable_finance.evaluation.embeddings.contract import (
     Embeddings,
     require_same_observations,
@@ -211,5 +211,5 @@ def fit(
     return RidgeProbe(alpha=alpha, min_samples=min_samples).fit(embeddings, targets)
 
 #: The embedding-to-forecast stage reads no market columns; its target was
-#: formed from whatever price the dataset supports (``dataset.spec.schema``).
+#: formed from whatever price the dataset supports (``dataset.schema``).
 fit.requires = ()

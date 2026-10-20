@@ -31,22 +31,22 @@ src/stable_finance/
   evaluation/              the pipeline, one package per stage
     embeddings/            stage 1: the Embeddings contract (what you bring)
     returns/               stage 2: forward returns; ridge probes, oracle forecasts, IC
-    portfolio/             stage 3: weights; universe, selection, risk, weighting,
-                           allocation, the backtest config and runner, Sharpe
-    trades/                stage 4: orders, fills, realized positions and their score
-    execution_model/       shared by stages 3 and 4: cost models, EFQ, fill rules
+    portfolio/             stage 3: the target portfolio, as if trading were free;
+                           universe, selection, risk, weighting, mean-variance target
+    trades/                stage 4: how far to move given costs and how; rebalance,
+                           trade rules, orders, fills, cost models
+    accounting/            stage 5: what was held and earned; positions, P&L, Sharpe,
+                           execution-quality curves
+    config.py, backtest.py the harness: one named configuration run across all stages
     market_data.py         MarketData and the market requirements each stage declares
-    from_dataset.py        market data and realized returns built from the stores
-  dataset/                 market time series in, sessions, views and labels out
-    spec/                  what a dataset is: schema (roles, price methods),
-                           calendar (sessions, decision grid)
-    storage/               where it lives: locations, meta (dataset.json),
-                           mosaic (MDS, densify, reshard), daystore
-    loader/                what a model sees: grid, views, panels (+ cache), cells
-    labels/                what it is scored on: families, objective, tables
-    ingest.py              any table or array in, bar length and stamp declared
-    datasets/              concrete datasets, one package each
-      market1t/            Market-1T: spec, Polygon ingestion, industry map
+    inputs.py              your table in: realized returns and market data out
+  dataset/                 what generic code needs to know about a dataset
+    schema.py              column roles (mid, vwap, bid_price, ...) and price methods
+    anchors.py             decision grid and measurement window (AnchorSpec)
+    outcomes.py            target families: returns, spread and volatility changes
+    objective.py           one label definition, keyed, and its cross-sectional forms
+    datasets/market1t/     Market-1T's one pipeline, a module per step:
+                           spec, ingest, mosaic, views, daystore, tables
   _moved.py                old module paths, kept importable
 tests/                     mirrors the package: dataset/ and evaluation/<stage>/
 ```
@@ -114,33 +114,46 @@ crossed = cross_spread_sharpe(
 )
 ```
 
-## Forecasts to weights to orders
+## Forecasts to a target, to trades
 
-`MeanVarianceAllocator` closes the gap between `y_hat` and weights. At each
-decision it solves
+The portfolio stage says what to hold as if trading were free; the trades
+stage decides how far to move there given what trading costs. For
+mean-variance the target is the closed form `w* = Sigma^-1 mu / risk_aversion`,
+and each rebalance then solves
 
 ```text
-max_w  mu'w - (risk_aversion / 2) w'Sigma w - sum_i cost_i |w_i - w_prev_i|
+min_w  (risk_aversion / 2) (w - w*)'Sigma (w - w*) + sum_i cost_i |w_i - w_prev_i|
 ```
 
-where `mu` is the forecast, `Sigma` the fitted covariance, and `cost_i` a
-proportional transaction cost per unit of weight traded, for instance the
-quoted half-spread over mid. The cost term is what makes the optimal portfolio
-depend on the portfolio currently held: small forecast changes do not justify
-paying the spread, so decisions are solved in order and each starts from the
-previous solution. With zero cost the allocator reduces to the closed-form
-`Sigma^-1 mu / risk_aversion`. The problem is convex and solved by
-accelerated proximal gradient descent, so nothing beyond numpy is required.
+tracking error against the target, priced by its own risk model, against the
+cost of trading from `w_prev`. `cost_i` is a proportional cost per unit of
+weight traded, for instance the quoted half-spread over mid. This is exactly
+the cost-aware mean-variance problem, because
+
+```text
+mu'w - (risk_aversion / 2) w'Sigma w = -(risk_aversion / 2) (w - w*)'Sigma (w - w*) + const
+```
+
+so `rebalance(mean_variance_target(...))` gives the weights `allocate` gets in
+one solve. The cost term is what makes the held portfolio depend on the one
+already held: small forecast changes do not justify paying the spread, so
+decisions are solved in order and each starts from the previous solution. The
+problem is convex and solved by accelerated proximal gradient descent, whose
+proximal step is the trade rule itself.
 
 ```python
-from stable_finance import MeanVarianceAllocator, allocate
+from stable_finance import (
+    MeanVarianceAllocator, allocate, estimate_covariance, mean_variance_target, rebalance,
+)
 
-allocator = MeanVarianceAllocator(risk_aversion=5.0, shrinkage=0.1)
-allocator.fit(train_returns)                        # Sigma per horizon
-weights = allocator.predict(forecast, cost=half_spread, initial=current)
+sigma = estimate_covariance(train_returns, shrinkage=0.1)        # Sigma per horizon
+target = mean_variance_target(forecast, sigma, risk_aversion=5.0)  # portfolio stage
+held = rebalance(target, sigma, risk_aversion=5.0, cost=half_spread, initial=current)
 
-# Enter at forecasts with your own covariance: skip fitting.
-weights = allocate(forecast, covariance, risk_aversion=5.0, cost=half_spread)
+# The same in one step, from a forecast.
+held = allocate(forecast, sigma, risk_aversion=5.0, cost=half_spread)
+held = MeanVarianceAllocator(risk_aversion=5.0, shrinkage=0.1).fit(train_returns) \
+    .predict(forecast, cost=half_spread, initial=current)
 ```
 
 `estimate_covariance` is the fitted estimator's public core: a pairwise sample
@@ -401,7 +414,7 @@ refuses with `MissingRolesError` when a column is absent:
 | embeddings to forecast (`fit`, `evaluate_forward_returns`) | nothing |
 | forecast to weights, `cost_model="mid"`, `universe="all"` | nothing |
 | weights to fills at the return's own starting price (`simulate_fills(orders, at="benchmark")`) | nothing |
-| any crossing cost model, the liquidity screens, `allocate(cost=...)`, `threshold_selection`, `persistent_selection`, `edge_to_cost`, `evaluate_weights(half_spread=...)` | `half_spread` |
+| any crossing cost model, the liquidity screens, `rebalance(cost=...)`, `allocate(cost=...)`, `threshold_selection`, `persistent_selection`, `edge_to_cost`, `evaluate_weights(half_spread=...)` | `half_spread` |
 | weights to fills at the touch (`simulate_fills`, `cross_spread_sharpe`) | `bid_price` and `ask_price` |
 
 The cost-less path needs no market column at any stage. A return is already
@@ -438,264 +451,125 @@ would declare `("open", "high", "low", "close")` in its table or with
 way. `half_spread=` remains accepted wherever it was, as market data holding
 that quantity alone.
 
-## Dataset architecture
+## Bringing your own data
 
-The dataset layer accepts any market time series. A dataset is a schema, a
-timeline and, if it has raw files of its own, a reader. Nothing downstream
-assumes any of them:
-
-- **`FeatureSchema` says what the columns mean, by role.** The roles are
-  `mid`, `open`, `high`, `low`, `close`, `vwap`, `volume`, `n_trades`,
-  `bid_price`, `ask_price`, `bid_size` and `ask_size`. None is required, and a
-  single column is read as the midpoint.
-- **`Timeline` is the dataset's clock, and its only description of time.**
-  It holds the calendar (when the market is open: `FixedSession`,
-  `ContinuousSession`, or a dataset's own, like Market-1T's NYSE calendar with
-  its holiday file), how long a row is, and the decision grid. Every builder
-  reads time from it, so ingestion, stores, panels and labels cannot disagree.
-  `market1t_timeline()` is Market-1T's: one-second bars, a decision every five
-  minutes from 09:30.
-- **The price method says what a return measures.** `vwap` is the
-  volume-weighted trade price, `mid` the time-averaged midpoint, `close` the
-  time-averaged close. Each is read over the objective's measurement window,
-  60 seconds by default, so the default Market-1T price is the one-minute VWAP.
+A dataset needs no machinery of its own. Map its columns to roles, say when
+decisions are made, and `evaluation_inputs` returns the realized forward
+returns and the observable market on one `(decision, asset)` grid, ready for
+every stage:
 
 ```python
-from stable_finance.dataset import (
-    ContinuousSession, FeatureSchema, FixedSession, Objective, Timeline,
-    sessions_from_frame, sessions_from_series, write_daystore,
-)
+from stable_finance import DEFAULT_BACKTEST, evaluation_inputs, run_backtest
+from stable_finance.dataset import FeatureSchema
 
-# Any table: map roles to the columns you have.
-schema = FeatureSchema.from_roles(close="c", high="h", low="l", volume="v")
-sessions = sessions_from_frame(frame, schema, Timeline(ContinuousSession("UTC"), bar_seconds=60),
-                               time="ts", stamp="start")
-
-# One price series, on one-minute bars, read as the midpoint.
-clock = Timeline(FixedSession(), bar_seconds=60)
-sessions = sessions_from_series(ts, prices, timeline=clock, stamp="start")
-write_daystore(sessions, "/data/my_days", clock, objective=Objective(price="mid"))
+schema = FeatureSchema.from_roles(mid="px")                  # one price column is enough
+# schema = FeatureSchema.from_roles(vwap="px", volume="qty", bid_price="b", ask_price="a")
+realized, market = evaluation_inputs(frame, schema, decisions, horizons=[300, 900])
+report = run_backtest(forecast, realized, market=market,
+                      config=DEFAULT_BACKTEST.replace(cost_model="mid"))
 ```
 
-**Every series states how long a row is and which end of it its timestamp
-marks:** the first through its timeline, the second as `stamp`. Neither has
-a safe default. A minute
-series read as one-second data has every horizon and window sixty times too
-short. A bar stamped at its start but read as stamped at its end puts the
-minute after each timestamp into every view ending there. That minute is the
-first minute of the window the return is measured from. Stored rows are
-always stamped at the end of their bar, so a row holds only what was known
-by its timestamp. Start-stamped input is moved there at ingestion.
-Timestamps off the declared grid are refused, not dropped. So is a grid
-coarser than declared, which is almost always a mis-declared bar length.
-Market-1T's long-standing one-second offset is this same rule at one-second
-bars.
+`frame` is a DataFrame or a mapping of columns with a timestamp, an optional
+asset column, and the schema's columns. Timestamps say when an observation
+became known, which is the end of its bar for bar data. Nothing else about
+time is required: no calendar, no bar length, no session.
 
-Every target family declares the roles it needs. `return` needs a price,
-`volatility_change` a midpoint, and `spread_change` both sides of the book.
-`supported_targets(schema)` lists what a schema can form, and asking for
-anything else raises `MissingRolesError` naming the absent roles. Stores
-default to the supported families, so a univariate day store carries returns
-and volatility changes and no spread changes. A panel built from a schema
-without quotes reports `quote=None`, and the cross-spread cost models then
-have nothing to price against.
+There is no lookahead by construction. The market at a decision is the last
+observation stamped at or before it. A return's price at decision `t` is
+measured over the observations stamped in `(t, t + window]`, strictly after
+the decision, and its forward price over `(t + h, t + h + window]`. The price
+is the schema's richest unless you name one: VWAP weighted by volume, else
+the time-averaged midpoint, else the close. A window with no observation has
+no price, and the return is NaN rather than a guess.
 
-Every duration is in seconds and must be a whole number of the timeline's
-bars: the decision step, horizons and the measurement window. Decisions are
-seconds past the timeline's per-date origin, which for Market-1T is the
-standard 09:30 open. Decision `a` is made at the end of the bar that starts
-`a` seconds after the origin. `AnchorSpec` is the older form of the same
-geometry plus a measurement window. It is kept because the target functions
-and existing callers take it, and `timeline.anchor_spec(window)` builds one.
+**Roles decide what is possible downstream.** The roles are `mid`, `open`,
+`high`, `low`, `close`, `vwap`, `volume`, `n_trades`, `bid_price`,
+`ask_price`, `bid_size` and `ask_size`. None is required. Every target family
+and every stage declares the roles it needs. A univariate series gets returns
+and frictionless portfolios, and a backtest that charges the spread is
+refused with `MissingRolesError` naming the missing columns.
 
-**Each stored day is checked against its clock.** The day store's
-`check_chronology` refuses a day that does not fall in a session, whose rows
-are not the session's bars, whose origin is not the clock's, or whose
-decisions are not the clock's grid. That last check also guarantees every
-name in a day decides at the same instants. It also refuses data placed
-before a name's first row, where a view could read it. Conversions and the
-generic writer run it on every day. `timeline.same_clock(other, dates)` says
-whether two datasets can be combined row for row.
+The target families themselves (`stable_finance.dataset.outcomes`) and the
+`Objective` that names a label (`stable_finance.dataset.objective`) are
+generic too, for a dataset that builds its own dense sessions.
 
-**Objectives are separate from the data and the loader.** The store holds
-the raw series. The loader cuts views of rows up to a decision and nothing
-after. An `Objective` turns the session around a decision into labels, and
-names everything that defines them:
+## Market-1T
 
-- the target families and horizons;
-- `window_seconds`, the measurement window at each end of a return, which is
-  also how long a position takes to enter and exit;
-- the price method;
-- the cross-section the standardized labels are taken over. Today that is
-  every name observed in the cell, once it has 20 of them.
+`stable_finance.dataset.datasets.market1t` is the Polygon-derived one-second
+US-equity dataset's full pipeline, a module per step:
 
-```python
-from stable_finance.dataset import Objective
+| Module | Step |
+|---|---|
+| `spec` | its nine-column schema, NYSE calendar with holiday file, clock (`Timeline`), and store locations, local or Hugging Face |
+| `ingest` | raw Polygon parquet to the sparse MDS mosaic, one range or every month, and the Fama-French industry map |
+| `mosaic` | the MDS mosaic: reader, sparse-to-dense, date-ordered copy |
+| `views` | sessions to model inputs: grid rebuild, views, evaluation panels and their cache, training cells |
+| `daystore` | the day-major store, its labels and objective caches, and market data and returns read from it |
+| `tables` | monthly cross-section tables of the targets |
 
-five = Objective(horizons=(900,), window_seconds=300)   # labels named return_900@300
-record.labels(anchor, batch, five)       # standardized against the full cell
-record.cross_section(mask)               # ranks within a screened universe
-```
-
-Raw labels are facts about one name. The z-score, uniform and rank forms are
-derived from the raw values of every name in the cell. A batch of K names is
-therefore labelled against the whole cross-section, not ranked among itself.
-Restricting to a universe is a cheap downstream step.
-
-**Caches are optimizations, never definitions.** A day record's stored
-targets are its `default_objective`. Any other objective is computed on
-demand from the stored one-second features, and `persist=True` or
-`materialize_objective` caches it under `objectives/<key>/`. The key is a
-hash of the definition, so a cached label is always tied to the definition
-that produced it. A new horizon or window is a new key, not a rebuild of the
-store. Target tables record their window, and the panel builder refuses a
-table built over a different window from its labels.
-
-`forward_returns_from_days` turns any objective into `ForwardReturns` on the
-same grid as `market_from_days`. That is the execution-window sweep:
-
-```python
-from stable_finance import forward_returns_from_days, market_from_days, run_backtest
-
-market = market_from_days(days)
-for window in (60, 300, 900):
-    realized = forward_returns_from_days(days, Objective(window_seconds=window))
-    report = run_backtest(forecast, realized, market=market, config=config)
-```
-
-Each window is filled at its own benchmark, `simulate_fills(..., at="benchmark")`,
-at no cost relative to the return. What changes across the sweep is how much
-of the signal survives entering and exiting more slowly. The best window
-depends on order size against volume, which the backtest does not model, so
-report the curve rather than pick one window.
-
-**Storage is separate from datasets.** `stable_finance.dataset.storage`
-holds the storage formats: the ticker-day MDS mosaic with its sparse-to-dense
-and date-ordered conversions (`mosaic`), and the day-major store
-(`daystore`). Each is generic over schema, calendar and bar
-spacing, and each store describes itself: a mosaic month carries
-`dataset.json` and a day record's `meta.json` carries its schema, origin, bar
-spacing, calendar and price method. Readers rebuild the schema from the store
-rather than importing a constant. A store without those fields is Market-1T at
-1 Hz, which is every store written before they existed, and it reads exactly as
-before. Local and Hugging Face roots resolve the same way for every layout.
-
-**Market-1T is one dataset.** `stable_finance.dataset.datasets.market1t` holds what is
-specific to it: `MARKET_SCHEMA` and `Market1TCalendar` with its holiday file
-(`spec`), Polygon parquet ingestion for one range or every month (`ingest`),
-and the Fama-French industry map (`industry`). It remains the default wherever
-a caller or a store names nothing else, and its targets are bit-identical to
-the single-dataset implementation. Old module paths stay importable through
-the table in `_moved.py`, so existing imports and `python -m` invocations keep
-working.
-
-MosaicML Streaming is the v1 mosaic backend:
-
-```bash
-uv sync --extra mds
-```
-
-```python
-from stable_finance.dataset.storage.mosaic import StreamingMarketDataset
-
-train = StreamingMarketDataset.from_month(mosaic_dir, "2020-01")  # schema from dataset.json
-```
-
-Storage is kept behind a backend-neutral `MarketSession`. A later LanceDB
-backend can therefore produce the same object. Sessions retain explicit date
-boundaries so a future multi-day framer can insert learned open and close
-tokens without changing storage or target APIs.
-
-`MarketSession.bar_seconds` makes native resolution explicit, and
-`resample_session(session, 60)` produces schema-correct minute bars (first and
-last levels, OHLC extrema, summed activity, volume-weighted VWAP). Target
-tables should still be built from the finest source before discarding it:
-spread-change and volatility-change use within-bar information that aggregated
-columns cannot reconstruct.
-
-View geometry is configuration. `ViewSpec()` records the current 2,048-token,
-50–100% of session recipe. `AnchorSpec()` independently records the session,
-decision-grid, and forward-measurement geometry. Sequence length, view scale,
-resolution, anchor spacing, and future slack are therefore configuration rather
-than hidden dataset constants.
-
-Raw outcome construction is also injectable and selective. Request only the
-task families and horizons needed by a model or evaluation:
-
-```python
-from stable_finance.dataset import compute_pair_targets
-
-y = compute_pair_targets(
-    session.features,
-    decision_index,
-    horizons=[300, 900],
-    types=["return"],
-    schema=session.schema,      # default: Market-1T
-    price="vwap",               # default: the schema's richest price
-)
-```
-
-The return, spread-change, and volatility-change definitions are shared with
-the vectorized anchor-grid path. Each requested family builds its cumulative
-statistics once and reuses them across horizons; unrequested families do no
-work. Risk-factor-adjusted returns are an optional extension of the same call.
-
-The same selectivity applies when building cross-sectional target tables:
-
-```bash
-sf-build-targets \
-  --mosaic-dir /data/market/mds --holiday-csv market_holidays.csv \
-  --out-dir /data/market/targets --start 2023-01 --end 2023-12 \
-  --target-types return --horizons 300 900 --transforms uniform
-```
-
-Market-1T's Polygon-to-MDS conversion lives with the rest of Market-1T
-rather than in a model repository:
-
-```bash
-python -m stable_finance.dataset.datasets.market1t.ingest \
-  --base-path /data/polygon/snapshots/1Hz \
-  --output /data/market/mds --start 2023-01 --end 2023-12
-```
-
-Training on cross-sectional cells reads a second layout, the day-major store
-(`stable_finance.dataset.storage.daystore`): one record per trading day holding the
-whole cross-section as a channel-major `(tickers, channels, rows)` float32
-memmap, dense exactly as the mosaic stores it, with the forward targets and
-every cross-sectional transform precomputed at every anchor for its default
-objective (any other objective is computed from the stored series and can
-be cached beside it, see above). A cell -- K stocks
-at one (date, anchor, resolution) -- is then K contiguous slices of one file
-and a `(K, T, H)` block of labels, and `stable_finance.dataset.loader.cells` turns it
-into normalized views in one vectorized pass. The store is written from the
-dense mosaic and verified against it day by day:
+The commands run it in order: `sf-shard-months` and `sf-write-mds` (raw
+parquet to sparse MDS), `sf-densify` (sparse to dense sessions),
+`sf-build-targets` (monthly anchor tables), `sf-daystore` (dense MDS to the
+day-major store), `sf-industry-map` ((month, ticker) to FF49) and
+`sf-reshard` (a date-ordered copy of a month). Each takes its default paths
+from the environment (`RAW_DATA_DIR`, `METADATA_PATH`, `MOSAIC_DIR`,
+`HOLIDAY_CSV`, `DAYSTORE_DIR`, ...). MosaicML Streaming is the mosaic's
+backend (`uv sync --extra mds`).
 
 ```bash
 sf-daystore --mosaic-dir /data/market/mds_dense --out-dir /data/market/days \
   --start 2023-01 --end 2023-12 --holiday-csv market_holidays.csv --workers 8
 ```
 
-`--horizons`, `--window` and `--price` set the store's default objective;
-`sf-build-targets` takes the same `--window` and `--price`.
+**The clock.** `market1t_timeline()` is Market-1T's one description of time:
+the NYSE calendar, one-second bars stamped at their end, and a decision every
+five minutes from 09:30. Decision `a` is made at the end of the bar that
+starts `a` seconds after the open. Every builder reads time from it. Each
+stored day is checked against it by `check_chronology`, which refuses a day
+whose rows, origin or decisions disagree with the clock, or that holds data
+before a name's first row.
 
-The data-preparation pipeline is a set of console scripts, in order:
-`sf-shard-months` (Market-1T raw parquet to sparse MDS, every month,
-resumable), `sf-write-mds` (Market-1T, one range, or `--risk-factors`), `sf-densify` (sparse to dense
-sessions), `sf-build-targets` (per-month anchor tables), `sf-daystore` (dense
-MDS to the day-major store), `sf-industry-map` (Market-1T (month, ticker) to FF49) and
-`sf-reshard` (a date-ordered copy of a month). Each takes its default paths
-from the environment (`RAW_DATA_DIR`, `METADATA_PATH`, `MOSAIC_DIR`,
-`HOLIDAY_CSV`, `DAYSTORE_DIR`, ...) so a consumer repository sets them once.
+**The day store** holds one record per trading day: the whole cross-section
+as a channel-major `(tickers, channels, rows)` float32 memmap, with the
+forward targets and every cross-sectional transform precomputed at every
+anchor. A training cell, K stocks at one (date, anchor, resolution), is then
+K contiguous slices of one file, and `views` turns it into normalized views
+in one vectorized pass.
+
+**Labels are objectives, and caches are only caches.** An `Objective` names
+everything that defines a label: target families, horizons, the measurement
+window at each end of a return (also how long a position takes to enter and
+exit), the price, and the cross-section the standardized labels are taken
+over, which is every name observed in the cell once it has 20. A day
+record's stored targets are its default objective. Any other objective is
+computed from the stored one-second series, and cached under a hash of its
+definition when asked. A batch of K names is labelled against the whole
+cross-section, not ranked among itself.
+
+```python
+from stable_finance import forward_returns_from_days, market_from_days, run_backtest
+from stable_finance.dataset import Objective
+
+record.labels(anchor, batch, Objective(horizons=(900,), window_seconds=300))
+market = market_from_days(days)
+for window in (60, 300, 900):                    # the execution-window sweep
+    realized = forward_returns_from_days(days, Objective(window_seconds=window))
+    report = run_backtest(forecast, realized, market=market, config=config)
+```
+
+Each window fills at its own benchmark, `simulate_fills(..., at="benchmark")`,
+at no cost relative to the return, so the sweep shows how much of the signal
+survives entering and exiting more slowly. The best window depends on order
+size against volume, which the backtest does not model, so report the curve.
 
 `build_session_panel` is the model-neutral injection point immediately before
-encoding. It returns normalized views, raw/transformed targets, and
-`ViewMetadata` separately. `PanelCache` preserves that separation on disk;
-model integrations may encode the metadata into tokens at batch time without
-embedding a token layout into the stored dataset.
+encoding. It returns normalized views, labels and `ViewMetadata` separately,
+and `PanelCache` preserves that separation on disk. A model integration may
+implement `MonthlyProbeData`, so the probe can be fit with
+`RidgeProbe().fit_month("2020-01", source)`.
 
-A model integration may implement `MonthlyProbeData`, allowing the existing
-probe to be fit with `RidgeProbe().fit_month("2020-01", source)` while keeping
-checkpoint and encoder concerns outside this repository.
+Every module path published before this layout remains importable through the
+table in `_moved.py`, and `python -m` on an old path runs its command.
 
 ## Development
 

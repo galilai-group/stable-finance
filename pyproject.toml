@@ -31,11 +31,11 @@ hf = [
 # DAYSTORE_DIR, ...) so a consumer repo sets them once.
 sf-shard-months = "stable_finance.dataset.datasets.market1t.ingest:shard_main"  # Market-1T: raw parquet -> sparse MDS, all months
 sf-write-mds = "stable_finance.dataset.datasets.market1t.ingest:main"           # Market-1T: one range, or --risk-factors
-sf-densify = "stable_finance.dataset.storage.mosaic:densify_main"      # sparse MDS -> dense sessions
-sf-build-targets = "stable_finance.dataset.labels.tables:main"         # per-month cross-section tables
-sf-daystore = "stable_finance.dataset.storage.daystore:main"           # dense MDS -> day-major store
-sf-industry-map = "stable_finance.dataset.datasets.market1t.industry:main"      # Market-1T: (month, ticker) -> FF49
-sf-reshard = "stable_finance.dataset.storage.mosaic:reshard_main"      # date-ordered copy of a month
+sf-densify = "stable_finance.dataset.datasets.market1t.mosaic:densify_main"      # sparse MDS -> dense sessions
+sf-build-targets = "stable_finance.dataset.datasets.market1t.tables:main"         # per-month cross-section tables
+sf-daystore = "stable_finance.dataset.datasets.market1t.daystore:main"           # dense MDS -> day-major store
+sf-industry-map = "stable_finance.dataset.datasets.market1t.ingest:industry_main"      # Market-1T: (month, ticker) -> FF49
+sf-reshard = "stable_finance.dataset.datasets.market1t.mosaic:reshard_main"      # date-ordered copy of a month
 
 [dependency-groups]
 dev = [

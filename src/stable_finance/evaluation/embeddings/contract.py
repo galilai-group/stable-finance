@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-import numpy as np
 from typing import TYPE_CHECKING
 
+import numpy as np
 from numpy.typing import NDArray
 
 from stable_finance.evaluation._grid import _one_dimensional

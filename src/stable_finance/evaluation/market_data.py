@@ -15,10 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from stable_finance.dataset.spec.schema import (
-    ROLES,
-    MissingRolesError,
-)
+from stable_finance.dataset.schema import ROLES, MissingRolesError
 from stable_finance.evaluation._grid import _one_dimensional
 
 __all__ = ["DERIVATIONS", "MARKET_QUANTITIES", "MarketData", "market_quantity",
@@ -50,9 +47,9 @@ class MarketData:
     ``columns`` maps a quantity in :data:`MARKET_QUANTITIES` to an array.
     ``mid`` and ``half_spread`` are derived from ``bid_price`` and
     ``ask_price`` when not given. Build one from the dataset with
-    :func:`stable_finance.evaluation.from_dataset.market_from_days` (whatever roles the
+    :func:`stable_finance.dataset.datasets.market1t.daystore.market_from_days` (whatever roles the
     dataset's schema had), from a panel cache with
-    :meth:`stable_finance.evaluation.from_dataset.MarketPanel.market`, or directly.
+    :meth:`stable_finance.dataset.datasets.market1t.views.MarketPanel.market`, or directly.
     """
 
     columns: dict

@@ -184,7 +184,6 @@ def estimate_risk(
     min_samples: int = 2,
 ) -> NDArray[np.float64]:
     """Dispatch to one named risk model; see :data:`RISK_MODELS`."""
-    from stable_finance.evaluation.portfolio.allocation import estimate_covariance
 
     if name == "diagonal":
         return diagonal_covariance(history, min_samples=min_samples)
@@ -210,3 +209,52 @@ RISK_MODELS = ("diagonal", "shrunk_sample", "ledoit_wolf", "embedding")
 #: estimated from returns (``embedding`` also needs the embeddings, which are
 #: not market data and are checked where they are used).
 RISK_MODEL_REQUIRES: dict[str, tuple[str, ...]] = {name: () for name in RISK_MODELS}
+
+
+def estimate_covariance(
+    returns: ForwardReturns,
+    *,
+    shrinkage: float = 0.1,
+    min_samples: int = 2,
+) -> NDArray[np.float64]:
+    """Per-horizon asset covariance estimated from a realized-return history.
+
+    Decisions are the samples. Each pair of assets is estimated over the
+    decisions where both are finite, the result is shrunk toward its diagonal
+    by ``shrinkage``, and negative eigenvalues are clipped so the allocation
+    objective is convex. The returned array has shape
+    ``(n_horizons, n_assets, n_assets)``.
+    """
+    if not 0.0 <= shrinkage <= 1.0:
+        raise ValueError("shrinkage must lie in [0, 1]")
+    if min_samples < 2:
+        raise ValueError("min_samples must be at least 2")
+    n_decisions, n_assets, n_horizons = returns.values.shape
+    covariances = np.empty((n_horizons, n_assets, n_assets), dtype=np.float64)
+    for horizon in range(n_horizons):
+        x = returns.values[:, :, horizon]
+        finite = np.isfinite(x)
+        counts = finite.sum(axis=0)
+        if (counts < min_samples).any():
+            asset = returns.assets[int(np.argmin(counts))]
+            raise ValueError(
+                f"asset {asset!r} has {int(counts.min())} finite returns at "
+                f"horizon {returns.horizons[horizon]!r}; need {min_samples}"
+            )
+        mean = np.where(finite, x, 0.0).sum(axis=0) / counts
+        centered = np.where(finite, x - mean, 0.0)
+        pairs = finite.T.astype(np.float64) @ finite.astype(np.float64)
+        sample = (centered.T @ centered) / np.maximum(pairs - 1, 1)
+        sample[pairs < 2] = 0.0
+        diagonal = np.diag(np.diag(sample))
+        shrunk = (1 - shrinkage) * sample + shrinkage * diagonal
+        eigenvalues, eigenvectors = np.linalg.eigh((shrunk + shrunk.T) / 2)
+        if eigenvalues.max() <= 0:
+            raise ValueError(
+                f"returns at horizon {returns.horizons[horizon]!r} have no variance"
+            )
+        # A tiny floor keeps the risk term strictly convex so that assets with
+        # (numerically) zero variance cannot receive unbounded weight.
+        eigenvalues = np.maximum(eigenvalues, 1e-8 * eigenvalues.max())
+        covariances[horizon] = (eigenvectors * eigenvalues) @ eigenvectors.T
+    return covariances

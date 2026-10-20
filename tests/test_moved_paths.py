@@ -38,7 +38,7 @@ def test_old_names_import_from_old_paths():
 
     import stable_finance as sf
 
-    assert run_backtest is sf.run_backtest and DayRecord.__module__.endswith("storage.daystore")
+    assert run_backtest is sf.run_backtest and DayRecord.__module__.endswith("market1t.daystore")
     assert ForwardReturns is sf.ForwardReturns and MarketData is sf.MarketData
     assert grouped_rank_ic is sf.grouped_rank_ic and sharpe_ratio is sf.sharpe_ratio
     assert DENSE_MDS_COLUMNS and MARKET_SCHEMA and _validated_quotes

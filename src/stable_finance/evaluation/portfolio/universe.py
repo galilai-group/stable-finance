@@ -100,7 +100,7 @@ def apply_screen(name: str, half_spread: ArrayLike | None,
     """
     if half_spread is None:
         if UNIVERSE_REQUIRES.get(name):
-            from stable_finance.dataset.spec.schema import MissingRolesError
+            from stable_finance.dataset.schema import MissingRolesError
 
             raise MissingRolesError(
                 f"universe={name!r} screens on the quoted half-spread, and the "
