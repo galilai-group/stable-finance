@@ -132,6 +132,7 @@ from stable_finance.dataset.outcomes import (
     supported_targets,
 )
 from stable_finance.dataset.schema import FeatureSchema, default_schema
+from stable_finance.dataset.characteristics import months_since_1926, trailing_from_days
 from stable_finance.dataset.market import MarketData
 from stable_finance.evaluation.returns.contract import ForwardReturns
 
@@ -969,48 +970,192 @@ def decision_labels(dates: ArrayLike, anchors: ArrayLike) -> NDArray[np.str_]:
     anchor = np.char.zfill(np.char.mod("%d", np.asarray(anchors).astype(np.int64)), 4)
     return np.char.add(np.asarray(dates).astype("U10"), np.char.add("|", anchor))
 
+def _rows_reduce(record: DayRecord, columns: list[int], lo: int, hi: int, how: str) -> np.ndarray:
+    """``(len(columns), N)`` reduction of the rows ``[lo, hi)`` of each column.
+
+    ``how`` is ``"mean"``, ``"min"`` or ``"max"`` over the finite values; a
+    name with none in the range, or a range off the session, is NaN.
+    """
+    out = np.full((len(columns), record.n_tickers), np.nan)
+    lo, hi = max(int(lo), 0), min(int(hi), record.rows)
+    if hi <= lo or not columns:
+        return out
+    block = np.asarray(record.features[:, columns, lo:hi], dtype=np.float64)   # (N, R, rows)
+    finite = np.isfinite(block)
+    any_finite = finite.any(axis=2)
+    if how == "mean":
+        value = np.where(finite, block, 0.0).sum(axis=2) / np.maximum(finite.sum(axis=2), 1)
+    elif how == "min":
+        value = np.where(finite, block, np.inf).min(axis=2)
+    else:
+        value = np.where(finite, block, -np.inf).max(axis=2)
+    out[:] = np.where(any_finite, value, np.nan).T
+    return out
+
+
+def _closes_and_dollars(record: DayRecord) -> tuple[np.ndarray, np.ndarray]:
+    """Each name's last price of the day, and its dollar volume over the day."""
+    schema = record.schema
+    n = record.n_tickers
+    if schema.has("bid_price", "ask_price"):
+        bid, ask = (np.asarray(record.features[:, schema.role_index(r), :], dtype=np.float64)
+                    for r in ("bid_price", "ask_price"))
+        price = np.where(np.isfinite(bid) & np.isfinite(ask) & (bid > 0) & (ask >= bid),
+                         (bid + ask) / 2, np.nan)
+    else:
+        role = next((r for r in ("mid", "close", "vwap") if schema.has(r)), None)
+        price = (np.asarray(record.features[:, schema.role_index(role), :], dtype=np.float64)
+                 if role else np.full((n, record.rows), np.nan))
+    finite = np.isfinite(price)
+    last = np.where(finite.any(axis=1), record.rows - 1 - np.argmax(finite[:, ::-1], axis=1), 0)
+    closes = np.where(finite.any(axis=1), price[np.arange(n), last], np.nan)
+    dollars = np.full(n, np.nan)
+    traded = next((r for r in ("vwap", "close", "mid") if schema.has(r)), None)
+    if schema.has("volume") and traded is not None:
+        volume = np.asarray(record.features[:, schema.role_index("volume"), :], dtype=np.float64)
+        paid = np.asarray(record.features[:, schema.role_index(traded), :], dtype=np.float64)
+        dollars = np.nan_to_num(volume * paid, nan=0.0).sum(axis=1)
+    return closes, dollars
+
+
 def market_from_days(days, *, anchors: ArrayLike | None = None,
-                     roles: tuple[str, ...] | None = None) -> MarketData:
+                     roles: tuple[str, ...] | None = None, lookback: int = 0,
+                     delay_seconds: int = 5, depth_seconds: int = 5,
+                     window_seconds: int | None = None) -> MarketData:
     """The market a day store recorded, as :class:`MarketData`, by role.
 
     ``days`` are day-record paths or :class:`~stable_finance.dataset.datasets.market1t.daystore.DayRecord`
-    objects. Each decision is a (date, anchor) with ``anchors`` in seconds past
-    the origin (default: each day's own anchor grid) and is labelled by
-    :func:`decision_labels`; assets are every ticker seen, sorted. A column is
-    included for every role the store's schema maps (or just ``roles``), so a
-    dataset's columns flow downstream unchanged and a stage that needs one it
-    lacks is refused: a univariate store yields ``mid`` only, which supports
-    frictionless portfolios and nothing priced at the touch.
+    objects, in date order. Each decision is a (date, anchor) with ``anchors``
+    in seconds past the origin (default: each day's own anchor grid) and is
+    labelled by :func:`decision_labels`; assets are every ticker seen, sorted.
+    A column is included for every role the store's schema maps (or just
+    ``roles``), so a dataset's columns flow downstream unchanged and a stage
+    that needs one it lacks is refused: a univariate store yields ``mid``
+    only, which supports frictionless portfolios and nothing priced at the
+    touch.
 
     Values are the decision row's bar. A name before its first quote, or an
     anchor off the session, is NaN.
+
+    The store's rows after the decision supply what the execution models
+    need, so every model runs on the store as it is:
+
+    * ``exec_bid_price`` and ``exec_ask_price``: the touch ``delay_seconds``
+      after the decision, the quotes an order sent at the decision meets
+      (the first row at or after arrival).
+    * a book of one level, when the schema maps ``bid_size`` and
+      ``ask_size``: that touch, with each side's quoted size averaged over
+      the ``depth_seconds`` before arrival, a few seconds of the top of the
+      book standing in for the depth the store never saw.
+    * ``window_best_buy`` and ``window_best_sell``, with ``window_seconds``:
+      the lowest ask and highest bid in the window after the decision, which
+      a limit order is filled against.
+    * ``adv``, ``idio_vol`` and ``market_vol``, with ``lookback``: from the
+      daily dollar volume and closes of the ``lookback`` records before each
+      decision's record. The first ``lookback`` records serve only as that
+      history and yield no decisions. The volatilities need twenty daily
+      returns in the window (see
+      :func:`~stable_finance.dataset.characteristics.trailing_from_days`).
+    * ``time_trend``, always: the paper's months since June 1926.
+
+    Market cap is not in the store, so ``impact_stock`` needs a
+    ``market_cap`` column added by the caller.
     """
 
     records = [d if isinstance(d, DayRecord) else DayRecord(d) for d in days]
     if not records:
         raise ValueError("no days")
+    if lookback < 0 or lookback >= len(records):
+        raise ValueError(f"lookback must leave at least one record to decide on; "
+                         f"got {lookback} of {len(records)}")
+    if delay_seconds < 0 or depth_seconds < 1:
+        raise ValueError("delay_seconds must be non-negative and depth_seconds positive")
+    if window_seconds is not None and window_seconds < 1:
+        raise ValueError("window_seconds must be positive")
     schema = records[0].schema
     for record in records:
         if record.schema != schema:
             raise ValueError(f"{record.date}: schema differs from {records[0].date}")
     wanted = tuple(schema.role_map) if roles is None else tuple(roles)
     schema.require(*wanted, purpose="market_from_days")
+    quoted = schema.has("bid_price", "ask_price")
+    sized = quoted and schema.has("bid_size", "ask_size")
     assets = np.asarray(sorted({str(t) for r in records for t in r.tickers}))
     asset_of = {ticker: i for i, ticker in enumerate(assets.tolist())}
+    quote_columns = [schema.role_index(r) for r in ("bid_price", "ask_price")] if quoted else []
+    size_columns = [schema.role_index(r) for r in ("bid_size", "ask_size")] if sized else []
+
+    if lookback:
+        closes = np.full((len(records), len(assets)), np.nan)
+        dollars = np.full((len(records), len(assets)), np.nan)
+        for i, record in enumerate(records):
+            columns = [asset_of[str(t)] for t in record.tickers]
+            closes[i, columns], dollars[i, columns] = _closes_and_dollars(record)
+        adv, idio, mvol = trailing_from_days(closes, dollars, lookback)
+
     labels, blocks = [], []
-    for record in records:
+    extra = {name: [] for name in ("exec_bid_price", "exec_ask_price", "book_bid_size",
+                                   "book_ask_size", "window_best_buy", "window_best_sell",
+                                   "adv", "idio_vol", "market_vol", "time_trend")}
+    for i, record in enumerate(records[lookback:], start=lookback):
         grid = (record.anchors if anchors is None
                 else np.asarray(anchors, dtype=np.int64))
         columns = [asset_of[str(t)] for t in record.tickers]
+        bar = record.bar_seconds
+        depth_rows = max(1, -(-depth_seconds // bar))
+        trend = float(months_since_1926(np.datetime64(record.date, "s"))[()])
         for anchor in grid:
             values = record.market_at(int(anchor), wanted)
             block = np.full((len(wanted), len(assets)), np.nan)
             block[:, columns] = values
             blocks.append(block)
             labels.append((record.date, int(anchor)))
+            row = record.anchor_row(int(anchor))
+            arrival = -(-(int(anchor) + delay_seconds - record.open_tod) // bar)
+            for name in extra:
+                extra[name].append(np.full(len(assets), np.nan))
+            if quoted and 0 <= arrival < record.rows:
+                live = record.first_row <= arrival
+                touch = np.asarray(record.features[:, quote_columns, arrival], dtype=np.float64)
+                touch[~live] = np.nan
+                extra["exec_bid_price"][-1][columns] = touch[:, 0]
+                extra["exec_ask_price"][-1][columns] = touch[:, 1]
+                if sized:
+                    sizes = _rows_reduce(record, size_columns, arrival + 1 - depth_rows,
+                                         arrival + 1, "mean")
+                    extra["book_bid_size"][-1][columns] = sizes[0]
+                    extra["book_ask_size"][-1][columns] = sizes[1]
+            if window_seconds is not None and quoted:
+                lo, hi = row + 1, row + 1 + -(-window_seconds // bar)
+                extra["window_best_buy"][-1][columns] = _rows_reduce(
+                    record, quote_columns[1:], lo, hi, "min")[0]
+                extra["window_best_sell"][-1][columns] = _rows_reduce(
+                    record, quote_columns[:1], lo, hi, "max")[0]
+            if lookback:
+                extra["adv"][-1][:] = adv[i]
+                extra["idio_vol"][-1][:] = idio[i]
+                extra["market_vol"][-1][:] = mvol[i]
+            extra["time_trend"][-1][:] = trend
     stacked = np.stack(blocks, axis=1)                   # (roles, decisions, assets)
     decisions = decision_labels([d for d, _ in labels], [a for _, a in labels])
-    return MarketData({role: stacked[k] for k, role in enumerate(wanted)}, decisions, assets)
+    columns = {role: stacked[k] for k, role in enumerate(wanted)}
+    columns["time_trend"] = np.stack(extra["time_trend"])
+    if quoted:
+        columns["exec_bid_price"] = np.stack(extra["exec_bid_price"])
+        columns["exec_ask_price"] = np.stack(extra["exec_ask_price"])
+    if sized:
+        columns["book_bid_price"] = columns["exec_bid_price"][..., None]
+        columns["book_ask_price"] = columns["exec_ask_price"][..., None]
+        columns["book_bid_size"] = np.stack(extra["book_bid_size"])[..., None]
+        columns["book_ask_size"] = np.stack(extra["book_ask_size"])[..., None]
+    if window_seconds is not None and quoted:
+        columns["window_best_buy"] = np.stack(extra["window_best_buy"])
+        columns["window_best_sell"] = np.stack(extra["window_best_sell"])
+    if lookback:
+        for name in ("adv", "idio_vol", "market_vol"):
+            columns[name] = np.stack(extra[name])
+    return MarketData(columns, decisions, assets)
+
 
 def forward_returns_from_days(days, objective=None, *, target_type: str = "return",
                               transform: str = "raw", anchors: ArrayLike | None = None,

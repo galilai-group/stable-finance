@@ -8,8 +8,9 @@ you bring              the harness runs
 =====================  =====================================================
 ``Embeddings``         a ridge probe fit on ``train``, then everything below
 ``ForwardReturns``     universe, selection, risk and sizing, then trading
-``PortfolioWeights``   trading toward your targets under the execution model
-``Orders``             your orders, filled under the execution model
+``PortfolioWeights``   the optimal portfolio: trading toward it under the
+                       execution model, which decides the deltas under cost
+``Orders``             your deltas, filled under the execution model
 =====================  =====================================================
 
 Every level is scored the same way, so a Sharpe from embeddings and one from
@@ -310,32 +311,14 @@ def _score(context: dict, values: NDArray[np.float64],
            config: BacktestConfig, *,
            with_series: bool = False) -> BacktestReport:
     """Mark a book, charge it, and annualize -- the axes that act on a book."""
-    spread, day = context["spread"], context["day"]
-    outcome_values, n_assets = context["outcome_values"], context["n_assets"]
+    day = context["day"]
     if config.rebalance == "daily":
         values = _hold_within_day(values, day)
-    if config.cost_model in ("book", "impact", "impact_stock"):
-        return _score_fills(context, _fills_toward(context, values, config), config,
-                            with_series=with_series)
-    cost = _cost(config, spread, values.shape)
-
-    valid = np.isfinite(values) & np.isfinite(outcome_values)
-    gross = np.where(valid, values * outcome_values, 0.0).sum(axis=1)
-    previous = np.vstack([np.zeros((1, n_assets)), values[:-1]])
-    turnover_per_asset = np.abs(values - previous)
-    # An unquoted name carries an INFINITE cost, and 0 * inf is a NaN with a
-    # warning attached. The zero is the meaningful half: such a name is
-    # screened out of the book, so its turnover is zero and it is charged
-    # nothing. Zeroing the cost before the multiply says that directly instead
-    # of producing a NaN and then masking it.
-    finite_cost = np.isfinite(cost)
-    charged = np.where(
-        finite_cost & np.isfinite(turnover_per_asset),
-        turnover_per_asset * np.where(finite_cost, cost, 0.0), 0.0,
-    )
-    costs = charged.sum(axis=1)
-    return _report(context, config, gross, costs, turnover_per_asset, values,
-                   with_series=with_series)
+    # Every model is scored from its fills, so a cross fill is billed the
+    # touch the order met (the arrival quotes, when the market carries them)
+    # while the allocator planned against the quoted spread at the decision.
+    return _score_fills(context, _fills_toward(context, values, config), config,
+                        with_series=with_series)
 
 
 def _fills_toward(context: dict, values: NDArray[np.float64], config: BacktestConfig):
@@ -348,8 +331,10 @@ def _fills_toward(context: dict, values: NDArray[np.float64], config: BacktestCo
         return execute(orders_from_weights(target), context["market"], model=config.cost_model,
                        equity=config.equity, schedule=_schedule(context, config),
                        impact=config.impact)
-    return fill_path(target, context["market"], model=config.cost_model,
-                     efq=config.efq, equity=config.equity)
+    # Otherwise chase the target from what is really held: a name that is
+    # not priced at a decision is held, not moved for free.
+    return fill_path(target, context["market"], model=config.cost_model, efq=config.efq,
+                     equity=config.equity)
 
 
 def _schedule(context: dict, config: BacktestConfig) -> int:
@@ -430,7 +415,9 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         mean_gross_exposure=float(np.abs(values).sum(axis=1).mean()),
         periods_per_year=float(periods_per_year),
         n_periods=int(len(net)),
-        mean_names_held=float((np.abs(values) > 0).sum(axis=1).mean()),
+        # A position is a holding above roundoff: a path of fills that returns
+        # to flat leaves a weight of a few ulps, not a name held.
+        mean_names_held=float((np.abs(values) > 1e-12).sum(axis=1).mean()),
         series=PnLSeries(
             periods=period_labels.astype(str),
             gross=gross.copy(), net=net.copy(), cost=costs_series.copy(),

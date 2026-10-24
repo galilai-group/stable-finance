@@ -371,3 +371,38 @@ def test_the_panel_builder_takes_an_objective_and_checks_the_table_window(days):
 
     with pytest.raises(ValueError, match="60s window"):
         build_session_panel(session, [3600], OneMinuteTable(), objective=two, view_spec=view)
+
+
+def test_market_from_days_reads_what_every_execution_model_needs(tmp_path):
+    paths = market1t_store(tmp_path, ["2023-01-03", "2023-01-04"], n_tickers=4)
+    market = market_from_days(paths, lookback=1, delay_seconds=5, depth_seconds=3,
+                              window_seconds=300)
+    first, second = DayRecord(paths[0]), DayRecord(paths[1])
+    assert len(market.decisions) == len(second.anchors)       # the first day is history
+    assert market.level == "book"
+    k = 10
+    row = second.anchor_row(int(second.anchors[k]))
+    bid, ask, bsz, asz, vol, vwap = (second.schema.role_index(r) for r in (
+        "bid_price", "ask_price", "bid_size", "ask_size", "volume", "vwap"))
+    f = np.asarray(second.features, dtype=np.float64)
+    np.testing.assert_allclose(market.get("bid_price")[k], f[:, bid, row])
+    np.testing.assert_allclose(market.get("exec_ask_price")[k], f[:, ask, row + 5])
+    np.testing.assert_allclose(market.get("book_ask_price")[k, :, 0], f[:, ask, row + 5])
+    np.testing.assert_allclose(market.get("book_bid_size")[k, :, 0],
+                               f[:, bsz, row + 3:row + 6].mean(axis=1))
+    np.testing.assert_allclose(market.get("window_best_buy")[k],
+                               f[:, ask, row + 1:row + 301].min(axis=1))
+    np.testing.assert_allclose(market.get("window_best_sell")[k],
+                               f[:, bid, row + 1:row + 301].max(axis=1))
+    g = np.asarray(first.features, dtype=np.float64)
+    np.testing.assert_allclose(market.get("adv")[k],
+                               np.nan_to_num(g[:, vol] * g[:, vwap]).sum(axis=1), rtol=1e-6)
+    assert np.isnan(market.get("idio_vol")).all()             # one day is not twenty
+    assert market.get("time_trend")[k, 0] == (2023 - 1926) * 12 - 5 + 1
+    # The arrival quote is a different number from the decision's.
+    assert not np.allclose(market.get("exec_bid_price"), market.get("bid_price"), equal_nan=True)
+    # Without history there is no dollar volume to size against, and no decisions are lost.
+    plain = market_from_days(paths)
+    assert len(plain.decisions) == 2 * len(second.anchors) and not plain.has("adv")
+    with pytest.raises(ValueError, match="lookback"):
+        market_from_days(paths, lookback=2)

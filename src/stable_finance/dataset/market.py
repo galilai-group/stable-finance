@@ -38,6 +38,7 @@ __all__ = [
     "BOOK_QUANTITIES",
     "CHARACTERISTICS",
     "DERIVATIONS",
+    "EXECUTION_QUANTITIES",
     "MARKET_LEVELS",
     "MARKET_QUANTITIES",
     "WINDOW_QUANTITIES",
@@ -58,6 +59,13 @@ BOOK_QUANTITIES = ("book_bid_price", "book_bid_size", "book_ask_price", "book_as
 #: is filled against, and they are AFTER the decision.
 WINDOW_QUANTITIES = ("window_best_buy", "window_best_sell")
 
+#: The touch as it stands when an order reaches the market, ``delay``
+#: seconds after the decision it was made at: what an EFQ fill is priced
+#: off, while its cost is still measured against the decision price. The
+#: readers sample it (five seconds after the decision by default); a market
+#: that supplies only the decision's quotes fills at those, with no delay.
+EXECUTION_QUANTITIES = ("exec_bid_price", "exec_ask_price")
+
 #: Average daily dollar volume of the name, as of the decision: the scale an
 #: order's size is measured against by the price-impact model. In the paper
 #: it is calibrated to (Frazzini, Israel and Moskowitz, 2018) it is the past
@@ -77,8 +85,8 @@ CHARACTERISTICS = ("idio_vol", "market_vol", "time_trend")
 #: half-spread over mid (quoted, or estimated from bars), average daily
 #: dollar volume, the characteristics, depth, and the execution-window
 #: extremes.
-MARKET_QUANTITIES = (*ROLES, "half_spread", ADV, *CHARACTERISTICS, *BOOK_QUANTITIES,
-                     *WINDOW_QUANTITIES)
+MARKET_QUANTITIES = (*ROLES, "half_spread", ADV, *CHARACTERISTICS, *EXECUTION_QUANTITIES,
+                     *BOOK_QUANTITIES, *WINDOW_QUANTITIES)
 
 #: What each level of market data needs, from least to most informative.
 MARKET_LEVELS: dict[str, tuple[str, ...]] = {
@@ -89,14 +97,23 @@ MARKET_LEVELS: dict[str, tuple[str, ...]] = {
 }
 
 #: Quantities derived when not supplied directly, and from what. Derivations
-#: chain: a book gives the touch, and the touch gives mid and half-spread.
+#: chain both ways: a book gives the touch, and the touch gives mid and
+#: half-spread; a touch WITH SIZES is a book of one level, which is all a
+#: dataset of top-of-book quotes can say about depth, and lets the book model
+#: run on it. The quotes at arrival default to the decision's.
 DERIVATIONS: dict[str, tuple[str, ...]] = {
     "mid": ("bid_price", "ask_price"),
     "half_spread": ("bid_price", "ask_price"),
+    "exec_bid_price": ("bid_price",),
+    "exec_ask_price": ("ask_price",),
     "bid_price": ("book_bid_price",),
     "ask_price": ("book_ask_price",),
     "bid_size": ("book_bid_size",),
     "ask_size": ("book_ask_size",),
+    "book_bid_price": ("exec_bid_price", "bid_size"),
+    "book_ask_price": ("exec_ask_price", "ask_size"),
+    "book_bid_size": ("bid_size",),
+    "book_ask_size": ("ask_size",),
 }
 
 
@@ -190,14 +207,17 @@ class MarketData:
         """The most informative level this market supports."""
         return self.levels[-1]
 
-    def has(self, *quantities: str) -> bool:
+    def has(self, *quantities: str, _seen: frozenset = frozenset()) -> bool:
         for quantity in quantities:
             if quantity not in MARKET_QUANTITIES:
                 raise KeyError(f"unknown market quantity {quantity!r}")
             if quantity in self.columns:
                 continue
             sources = DERIVATIONS.get(quantity)
-            if sources is None or not self.has(*sources):
+            # Derivations run both ways between a book and its touch; a
+            # quantity already being asked for is not a source for itself.
+            if sources is None or quantity in _seen or not self.has(
+                    *sources, _seen=_seen | {quantity}):
                 return False
         return True
 
@@ -219,6 +239,10 @@ class MarketData:
             return self.columns[quantity]
         if quantity in ("bid_price", "ask_price", "bid_size", "ask_size"):
             return self.get(DERIVATIONS[quantity][0])[:, :, 0]
+        if quantity in EXECUTION_QUANTITIES:
+            return self.get(DERIVATIONS[quantity][0])
+        if quantity in BOOK_QUANTITIES:
+            return self.get(DERIVATIONS[quantity][0])[:, :, None]
         bid, ask = self.get("bid_price"), self.get("ask_price")
         # A crossed or one-sided book has no midpoint and no spread. A negative
         # half-spread would book a REBATE for crossing it.

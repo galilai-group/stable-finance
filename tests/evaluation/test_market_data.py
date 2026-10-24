@@ -53,7 +53,11 @@ MID = DEFAULT_BACKTEST.replace(cost_model="mid")
 def test_mid_and_half_spread_are_derived_from_the_book():
     bid, ask = _quotes()
     market = MarketData({"bid_price": bid, "ask_price": ask}, DECISIONS, ASSETS)
-    assert market.available == ("mid", "bid_price", "ask_price", "half_spread")
+    assert market.available == ("mid", "bid_price", "ask_price", "half_spread",
+                                "exec_bid_price", "exec_ask_price")
+    # Arrival quotes default to the decision's; sizes do not come from nowhere.
+    np.testing.assert_array_equal(market["exec_ask_price"], ask)
+    assert not market.has("bid_size") and not market.has("book_bid_size")
     np.testing.assert_allclose(market["mid"], (bid + ask) / 2)
     np.testing.assert_allclose(market["half_spread"], (ask - bid) / (bid + ask))
     crossed = MarketData({"bid_price": ask, "ask_price": bid}, DECISIONS, ASSETS)
@@ -127,7 +131,9 @@ def test_quotes_and_their_half_spread_give_the_same_backtest():
     market = MarketData({"bid_price": bid, "ask_price": ask}, DECISIONS, ASSETS)
     by_market = run_backtest(forecast, realized, market=market)
     by_spread = run_backtest(forecast, realized, half_spread=market["half_spread"])
-    assert by_market.as_dict() == by_spread.as_dict()
+    a, b = by_market.as_dict(), by_spread.as_dict()
+    assert a.keys() == b.keys()
+    assert all(a[k] == pytest.approx(b[k]) if isinstance(a[k], float) else a[k] == b[k] for k in a)
     with pytest.raises(ValueError, match="not both"):
         run_backtest(forecast, realized, market=market, half_spread=market["half_spread"])
     misaligned = MarketData({"bid_price": bid, "ask_price": ask}, DECISIONS + 1, ASSETS)
@@ -304,3 +310,20 @@ def test_a_panel_cache_without_quotes_says_so(tmp_path):
         panel.half_spread()
     market = panel.market([0], ["d"], ["S0"], decision_axis=["d"], asset_axis=["S0"])
     assert market.available == ()
+
+
+def test_a_touch_with_sizes_is_a_book_of_one_level():
+    bid, ask = _quotes()
+    sizes = np.full((D, A), 300.0)
+    market = MarketData({"bid_price": bid, "ask_price": ask, "bid_size": sizes,
+                         "ask_size": sizes, "exec_ask_price": ask + 0.01}, DECISIONS, ASSETS)
+    assert market.level == "book"
+    assert market.get("book_bid_size").shape == (D, A, 1)
+    # The one level is the touch the order meets, not the decision's quote.
+    np.testing.assert_array_equal(market.get("book_ask_price")[:, :, 0], ask + 0.01)
+    np.testing.assert_array_equal(market.get("book_bid_price")[:, :, 0], bid)
+    # And a real book still gives its touch and sizes back.
+    deep = MarketData({"book_bid_price": bid[..., None], "book_ask_price": ask[..., None],
+                       "book_bid_size": sizes[..., None], "book_ask_size": sizes[..., None]},
+                      DECISIONS, ASSETS)
+    np.testing.assert_array_equal(deep.get("bid_size"), sizes)

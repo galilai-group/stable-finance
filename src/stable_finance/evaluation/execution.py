@@ -12,7 +12,10 @@ it:
 
 ``mid``    fills at the price the realized return is measured from, at no
            cost. Needs nothing: a bare price series runs.
-``cross``  pays ``efq`` times the half-spread: quoted, or estimated from bars.
+``cross``  pays ``efq`` times the half-spread at the touch the order meets
+           when it reaches the market -- the readers sample it five seconds
+           after the decision -- measured against the decision price. A
+           spread estimated from bars fills at the decision price plus it.
 ``book``   walks the depth for the order's size, so a large order pays more
            per share than a small one and may only partly fill. Needs depth
            and the portfolio's ``equity``, to turn weight into shares.
@@ -21,7 +24,10 @@ it:
            basis points is ``a + b x + c sqrt(x)`` in the order's size ``x``
            as a percent of the name's average daily dollar volume, and the
            order is worked over a schedule of decisions (one trading day in
-           the paper) at the midpoint as it evolves. Needs ``adv`` and
+           the paper) at the midpoint as it evolves. This is passive
+           execution: the paper's orders rest as limit orders and pay no
+           spread, only impact, so an order here is already the resting
+           trade and carries no limit of its own. Needs ``adv`` and
            ``equity``. See :func:`impact_cost`. This is the simple
            institutional model.
 ``impact_stock``
@@ -67,6 +73,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from stable_finance.dataset.market import (
+    EXECUTION_QUANTITIES,
     ADV,
     BOOK_QUANTITIES,
     CHARACTERISTICS,
@@ -216,12 +223,15 @@ def _efq_array(efq: ArrayLike, name: str = "efq") -> NDArray[np.float64]:
 
 @dataclass(frozen=True)
 class Orders:
-    """Signed trade requests on the :class:`PortfolioWeights` grid.
+    """Signed trade requests on the :class:`PortfolioWeights` grid: the deltas.
 
     ``values`` is the requested change in weight, as a fraction of portfolio
-    equity: positive buys, negative sells, zero and NaN mean no order. Convert
-    to shares outside this contract by multiplying by equity and dividing by
-    the reference price.
+    equity: positive buys, negative sells, zero and NaN mean no order. The
+    deltas between the optimal portfolio and the one held, with no regard to
+    cost, come from :func:`orders_from_weights`; the deltas a policy chooses
+    to trade given cost come from the trades stage, which hands its path to
+    the same function. Convert to shares outside this contract by
+    multiplying by equity and dividing by the reference price.
     """
 
     values: NDArray[np.floating]
@@ -313,10 +323,13 @@ def orders_from_weights(
     weights: PortfolioWeights, *, initial: ArrayLike | None = None,
     limit: ArrayLike | None = None,
 ) -> Orders:
-    """Orders that move the portfolio along the target weight path.
+    """The deltas that move the portfolio along the target weight path.
 
-    Each decision's order is the target weight minus the previous decision's
-    target weight; the first decision trades from ``initial`` (default cash),
+    Hand it the optimal portfolio and these are the cost-free deltas: each
+    decision's order is the target weight minus the previous decision's
+    target weight. Hand it the path a policy chose
+    (:func:`~stable_finance.evaluation.trades.rebalance.rebalance`) and they
+    are the deltas under cost. The first decision trades from ``initial`` (default cash),
     which broadcasts to ``(n_assets, n_horizons)``. A NaN target is treated as
     zero exposure. Orders are generated from targets, not fills, so a missed
     fill is not retried at the next decision; feed realized positions back
@@ -357,7 +370,12 @@ def simulate_fills(orders: Orders, best_bid: ArrayLike | MarketData | None = Non
 
     Buys pay above the midpoint and sells receive below it, by ``efq`` times
     the quoted half-spread. ``efq=1`` is the touch: a buy at the ask and a
-    sell at the bid. ``efq=0`` is a midpoint fill, worked over the objective's
+    sell at the bid. The touch is the one the order MEETS: market data
+    carrying ``exec_bid_price`` and ``exec_ask_price`` (the quotes
+    ``delay_seconds`` after the decision, as the readers sample them) is
+    filled at those, and the cost is still measured against the decision
+    price, so the drift while the order travelled is part of it. Without
+    them the decision's own quotes stand in. ``efq=0`` is a midpoint fill, worked over the objective's
     measurement window at the price the realized return is measured from, and
     so costs nothing relative to that return. ``efq`` is a scalar or an array
     that broadcasts to ``(n_decisions, n_assets)``.
@@ -385,7 +403,7 @@ def simulate_fills(orders: Orders, best_bid: ArrayLike | MarketData | None = Non
         raise ValueError(f"efq must broadcast to {expected}, got shape {efq.shape}") from None
     crossing = bool(efq.any())
 
-    mid = spread = None
+    mid = spread = arrival = None
     if isinstance(best_bid, MarketData):
         if best_ask is not None:
             raise ValueError("pass market data or two quote arrays, not both")
@@ -400,6 +418,11 @@ def simulate_fills(orders: Orders, best_bid: ArrayLike | MarketData | None = Non
         mid = _reference_price(market)
         if crossing:
             spread = market.get("half_spread")
+            if market.has(*EXECUTION_QUANTITIES):
+                bid, ask = (market.get(q) for q in EXECUTION_QUANTITIES)
+                quoted = np.isfinite(bid) & np.isfinite(ask) & (bid > 0) & (ask >= bid)
+                arrival = np.where(quoted, (bid + ask) / 2, np.nan)
+                spread = np.where(quoted, (ask - bid) / 2 / np.where(quoted, arrival, 1.0), np.nan)
     elif best_bid is not None or best_ask is not None:
         if best_bid is None or best_ask is None:
             raise TypeError("pass both quotes, market data, or nothing")
@@ -419,9 +442,12 @@ def simulate_fills(orders: Orders, best_bid: ArrayLike | MarketData | None = Non
     if mid.shape != expected:
         raise ValueError(f"mid must have shape {expected}")
     priced = np.isfinite(mid) & (mid > 0)
+    # A crossing fill is priced off the midpoint the order meets; a midpoint
+    # fill (efq=0) is worked at the price the return is measured from.
+    at = mid if arrival is None else np.where(efq == 0, mid, arrival)
     if crossing:
         spread = np.asarray(spread, dtype=np.float64)
-        priced &= np.isfinite(spread) | (efq == 0)
+        priced &= (np.isfinite(spread) & np.isfinite(at) & (at > 0)) | (efq == 0)
         paid = np.where(efq == 0, 0.0, np.nan_to_num(spread, nan=0.0) * efq)
     else:
         paid = np.zeros(expected)
@@ -429,7 +455,7 @@ def simulate_fills(orders: Orders, best_bid: ArrayLike | MarketData | None = Non
     requested = np.nan_to_num(orders.values, nan=0.0)
     fillable = (requested != 0) & priced[:, :, None]
     side = np.sign(requested)
-    price = np.where(fillable, mid[:, :, None] * (1 + side * paid[:, :, None]), np.nan)
+    price = np.where(fillable, np.nan_to_num(at)[:, :, None] * (1 + side * paid[:, :, None]), np.nan)
     reference = np.where(fillable, mid[:, :, None], np.nan)
     return Fills(np.where(fillable, requested, 0.0), price, reference,
                  orders.decisions, orders.assets, orders.horizons)
@@ -460,8 +486,9 @@ def execute(orders: Orders, market: MarketData | None = None, *, model: str = "c
     """
     limits = orders.limit is not None
     if model in ("impact", "impact_stock") and limits:
-        raise ValueError("the impact model works orders over a schedule and has no "
-                         "limit; pass market orders")
+        raise ValueError("the impact model already works each order passively over its "
+                         "schedule, as resting limit orders; a limit of its own has no "
+                         "meaning there, so pass market orders")
     needed = execution_requires(model, limits=limits)
     if market is None:
         market = MarketData.empty(orders.decisions, orders.assets)
@@ -727,7 +754,9 @@ def fill_path(weights: PortfolioWeights, market: MarketData | None = None, *,
     target = np.nan_to_num(weights.values, nan=0.0)
     n_decisions, n_assets, n_horizons = target.shape
     held = _initial_positions(initial, (n_assets, n_horizons))
-    efq = np.broadcast_to(_efq_array(efq), (n_decisions, n_assets))
+    efq = np.broadcast_to(_efq_array(efq if model == "cross" else 0.0), (n_decisions, n_assets))
+    if model in ("mid", "cross") and limit is None:
+        return _chase_at_touch(weights, market, efq, held)
     columns = {} if market is None else market.columns
     quantity, price, mid = (np.zeros(target.shape), np.full(target.shape, np.nan),
                             np.full(target.shape, np.nan))
@@ -744,6 +773,28 @@ def fill_path(weights: PortfolioWeights, market: MarketData | None = None, *,
         quantity[t], price[t], mid[t] = fill.quantity[0], fill.price[0], fill.mid_price[0]
         held = held + fill.quantity[0]
     return Fills(quantity, price, mid, weights.decisions, weights.assets, weights.horizons)
+
+
+def _chase_at_touch(weights: PortfolioWeights, market: MarketData | None, efq, held) -> Fills:
+    """:func:`fill_path` for fills that are all or nothing, in one pass.
+
+    At the mid or across the spread an order fills in full wherever the name
+    is priced and not at all elsewhere, so the position held is the target
+    at the last priced decision: a name that stops quoting is held until it
+    quotes again, then traded to that decision's target. That is a forward
+    fill along the decisions, and the orders are its differences.
+    """
+    target = np.nan_to_num(weights.values, nan=0.0)
+    n_decisions, n_assets, n_horizons = target.shape
+    probe = Orders(np.ones(target.shape), weights.decisions, weights.assets, weights.horizons)
+    fillable = simulate_fills(probe, market, efq=efq).quantity != 0        # (D, A, H)
+    index = np.where(fillable, np.arange(n_decisions)[:, None, None], -1)
+    np.maximum.accumulate(index, axis=0, out=index)
+    path = np.where(index >= 0, np.take_along_axis(target, np.maximum(index, 0), axis=0),
+                    held[None])
+    previous = np.concatenate([held[None], path[:-1]], axis=0)
+    orders = Orders(path - previous, weights.decisions, weights.assets, weights.horizons)
+    return simulate_fills(orders, market, efq=efq)
 
 
 def trading_cost(

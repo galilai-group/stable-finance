@@ -184,8 +184,10 @@ results = evaluate_fills(fills, realized_mid_returns, initial=current)
 ```
 
 The simulator fills each order in full at `mid * (1 +/- efq * half_spread)`
-or not at all. EFQ is the effective half-spread paid over the quoted one: `0`
-fills at the midpoint, `1` at the touch, and above `1` is size and crowding.
+or not at all, at the touch the order meets on arrival when the market data
+carries it, and measured against the decision price. EFQ is the effective
+half-spread paid over the quoted one: `0` fills at the midpoint, `1` at the
+touch, and above `1` is size and crowding.
 It may be a scalar or an array that broadcasts to `(decision, asset)`, so a
 per-name execution quality needs no new model. At a positive EFQ an order
 without a positive quote is left unfilled and the realized position lags the
@@ -421,8 +423,8 @@ stages below it, and every level is scored the same way:
 |---|---|
 | `Embeddings`, with `train=(embeddings, returns)` | a ridge probe, then everything below |
 | `ForwardReturns` | universe, selection, risk and sizing, then trading |
-| `PortfolioWeights` | trading toward your targets |
-| `Orders`, optionally with limits | your orders, filled |
+| `PortfolioWeights`, the optimal portfolio | the deltas toward it, decided under cost by the trades stage, then filled |
+| `Orders`, the deltas, optionally with limits | your orders, filled |
 
 Market data comes in levels, and a richer level derives the poorer ones: a
 book's first level is the best bid and ask, which give the mid and the
@@ -432,18 +434,29 @@ half-spread.
 |---|---|---|
 | `mid` | a price series | returns, and fills at the mid at no cost |
 | `bars` | `high`, `low`, `close` | a spread estimated from the bars, so costs can be charged |
-| `quotes` | `bid_price`, `ask_price` | the quoted spread |
+| `quotes` | `bid_price`, `ask_price` | the quoted spread; with `bid_size` and `ask_size`, a book of one level |
 | `book` | depth on both sides | orders that walk the book for their size |
 
+Quotes are read twice: at the decision, and again when the order reaches the
+market, `delay_seconds` later (five by default in both readers), as
+`exec_bid_price` and `exec_ask_price`. An EFQ fill is priced off the touch it
+meets and measured against the decision price, so the drift in between is
+part of the cost. Top-of-book sizes are averaged over the `depth_seconds`
+before arrival, a few seconds of the touch standing in for depth the data
+never saw, which is what lets the book model run on Market-1T as it is.
+
 The execution model is the bridge between the two axes, and each one needs a
-level. It is the config's `cost_model`:
+level. It is the config's `cost_model`, and every model is scored the same
+way, from its fills: the position held is what the fills produced, and the
+cost is each fill's distance from the decision price. A name that is not
+priced at a decision is held until it is, never moved for free.
 
 | `cost_model` | Fills at | Needs |
 |---|---|---|
 | `mid` | the price the return is measured from, at no cost | nothing |
-| `cross` | `mid * (1 +/- efq * half_spread)` | a spread, quoted or estimated |
+| `cross` | the touch on arrival, `efq` of its half-spread paid, measured from the decision price | a spread, quoted or estimated |
 | `book` | the depth, level by level, up to the order's size; the rest is unfilled | depth, and `equity` in the config |
-| `impact` | the evolving mid plus the price impact of Frazzini, Israel and Moskowitz (2018), worked over a trading day | `adv`, and `equity` in the config |
+| `impact` | the evolving mid plus the price impact of Frazzini, Israel and Moskowitz (2018), worked passively over a trading day as resting orders, so no spread | `adv`, and `equity` in the config |
 | `impact_stock` | the same, with the paper's stock-specific terms: market cap, idiosyncratic volatility, market volatility, time trend | `adv`, `market_cap`, `idio_vol`, `market_vol`, `time_trend`, and `equity` |
 
 `impact` and `impact_stock` are the institutional cost models, simple and
@@ -537,6 +550,8 @@ from stable_finance import (
 )
 
 market = market_from_days(day_paths)          # whatever roles the dataset has
+market = market_from_days(day_paths, lookback=20, window_seconds=300)   # and adv,
+    # volatilities, arrival quotes, the one-level book, and window extremes
 DEFAULT_BACKTEST.requires                     # {'cost_model': ('half_spread',)}
 run_backtest(forecast, realized, market=market)      # refused without quotes
 space = enumerate_configs(market=market)      # only what the market supports

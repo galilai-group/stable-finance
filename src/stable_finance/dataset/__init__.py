@@ -7,6 +7,7 @@ Generic, for any dataset:
 ``outcomes``   the target families: returns, spread and volatility changes, by role
 ``objective``  one label definition with a cache key, and its cross-sectional forms
 ``universe``   which names the data can price at all: quoted, and present often enough
+``characteristics``  trailing dollar volume and volatilities, for the impact models
 
 A dataset with no machinery of its own needs nothing more: pass its table to
 :func:`stable_finance.evaluation.inputs.evaluation_inputs` for evaluation.
@@ -23,10 +24,18 @@ from stable_finance.dataset.anchors import (
     TO_CLOSE,
     AnchorSpec,
 )
+from stable_finance.dataset.characteristics import (
+    average_daily_dollar_volume,
+    daily_returns,
+    months_since_1926,
+    trailing_from_days,
+    volatilities,
+)
 from stable_finance.dataset.market import (
     ADV,
     BOOK_QUANTITIES,
     CHARACTERISTICS,
+    EXECUTION_QUANTITIES,
     MARKET_LEVELS,
     MARKET_QUANTITIES,
     WINDOW_QUANTITIES,
@@ -130,6 +139,7 @@ __all__ = [
     "DEFAULT_ANCHOR_SPEC",
     "DEFAULT_TARGET_HORIZONS",
     "EASTERN_TIME",
+    "EXECUTION_QUANTITIES",
     "MARKET_LEVELS",
     "MARKET_QUANTITIES",
     "MARKET_SCHEMA",
@@ -167,6 +177,7 @@ __all__ = [
     "anchor_offsets",
     "anchor_targets",
     "as_timeline",
+    "average_daily_dollar_volume",
     "bar_half_spread",
     "build_cross_section_metadata",
     "build_norm_groups",
@@ -176,6 +187,7 @@ __all__ = [
     "check_targets",
     "choose_cell_aggregation",
     "compute_pair_targets",
+    "daily_returns",
     "default_price",
     "default_schema",
     "evenly_spaced_anchors",
@@ -189,6 +201,7 @@ __all__ = [
     "market1t_timeline",
     "market_from_days",
     "mid_series",
+    "months_since_1926",
     "next_month",
     "normalize",
     "period_directories",
@@ -202,7 +215,9 @@ __all__ = [
     "supported_targets",
     "timeline_bounds_est",
     "tradable",
+    "trailing_from_days",
     "validate_period_alignment",
+    "volatilities",
     "window_realized_volatility",
     "window_spread",
 ]

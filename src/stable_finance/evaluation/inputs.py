@@ -34,8 +34,14 @@ the execution window's best buy and sell prices, ``window_best_buy`` and
 ``window_best_sell``, over the same ``(t, t + window]`` the return starts
 from: the lowest ask and highest bid, else the lowest low and highest high,
 else the price's own range. They are what a limit order is filled against.
-``adv_lookback`` adds the average daily dollar volume over the bars before
-each decision, which the ``impact`` execution models size orders against.
+Quotes are also read ``delay_seconds`` after each decision, as
+``exec_bid_price`` and ``exec_ask_price``: the touch an order sent at the
+decision actually meets. With ``bid_size`` and ``ask_size`` mapped, that touch
+and its sizes, averaged over the ``depth_seconds`` before arrival for a less
+noisy figure, stand as a book of one level, so the book model runs on
+top-of-book data. ``adv_lookback`` adds the average daily dollar volume over
+the bars before each decision, which the ``impact`` execution models size
+orders against.
 ``vol_lookback`` adds what ``impact_stock`` also needs: each name's
 idiosyncratic volatility and the market's volatility, from the daily
 returns in the lookback, and the time trend from the decision's date. A
@@ -49,6 +55,12 @@ from collections.abc import Mapping
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from stable_finance.dataset.characteristics import (
+    average_daily_dollar_volume,
+    daily_returns,
+    months_since_1926,
+    volatilities,
+)
 from stable_finance.dataset.market import MarketData, bar_half_spread
 from stable_finance.dataset.schema import FeatureSchema, price_values, resolve_price
 from stable_finance.evaluation.returns.contract import ForwardReturns
@@ -121,75 +133,6 @@ def _estimated_half_spread(stamps, high, low, close, when, lookback):
     return np.sqrt(np.maximum(mean, 0.0)) / 2
 
 
-def _daily_returns(stamps, prices):
-    """Each UTC day with a close-to-close return: its number, last stamp, and return."""
-    day = stamps // 86_400
-    last = np.r_[day[1:] != day[:-1], True]
-    days, ends, closes = day[last], stamps[last], prices[last]
-    with np.errstate(invalid="ignore", divide="ignore"):
-        returns = closes[1:] / closes[:-1] - 1.0
-    return days[1:], ends[1:], returns
-
-
-def _volatilities(daily, when, lookback, min_days: int = 20):
-    """Idiosyncratic and market volatility, annualized in percent, as of each decision.
-
-    Returns are aligned by day across names, and a day is known once the
-    last of the names' closes for it is in, so no decision sees a day's
-    cross-section before it is complete.
-    """
-    days = np.unique(np.concatenate([d for d, _, _ in daily]))
-    panel = np.full((len(days), len(daily)), np.nan)
-    ends = np.zeros(len(days), dtype=np.int64)
-    for j, (d, e, r) in enumerate(daily):
-        rows = np.searchsorted(days, d)
-        panel[rows, j] = r
-        np.maximum.at(ends, rows, e)
-    market = np.nanmean(panel, axis=1) if len(days) else np.zeros(0)
-    lo = np.searchsorted(ends, when - lookback, side="right")
-    hi = np.searchsorted(ends, when, side="right")
-    idio = np.full((len(when), len(daily)), np.nan)
-    mvol = np.full(len(when), np.nan)
-    for t in range(len(when)):
-        m = market[lo[t]:hi[t]]
-        rows = panel[lo[t]:hi[t]]
-        ok_m = np.isfinite(m)
-        if ok_m.sum() >= min_days:
-            mvol[t] = np.std(m[ok_m], ddof=1) * np.sqrt(252) * 100
-        for j in range(len(daily)):
-            r = rows[:, j]
-            ok = np.isfinite(r) & ok_m
-            if ok.sum() < min_days:
-                continue
-            x, y = m[ok], r[ok]
-            beta = np.cov(x, y, ddof=1)[0, 1] / max(np.var(x, ddof=1), 1e-30)
-            resid = y - y.mean() - beta * (x - x.mean())
-            idio[t, j] = np.std(resid, ddof=2) * np.sqrt(252) * 100
-    return idio, np.broadcast_to(mvol[:, None], idio.shape).copy()
-
-
-def _months_since_1926(when):
-    """The paper's time trend: months since June 1926, which is 1."""
-    dates = np.asarray(when, dtype="datetime64[s]").astype("datetime64[M]")
-    return (dates - np.datetime64("1926-06", "M")).astype(np.int64) + 1
-
-
-def _average_daily_dollar_volume(stamps, volume, price, when, lookback):
-    """Dollar volume in ``(t - lookback, t]`` per distinct UTC day observed in it."""
-    dollars = np.nan_to_num(volume * price, nan=0.0)
-    total = np.concatenate([[0.0], np.cumsum(dollars)])
-    day = stamps // 86_400
-    new_day = np.r_[True, day[1:] != day[:-1]] if len(day) else np.zeros(0, bool)
-    days_seen = np.concatenate([[0], np.cumsum(new_day)])
-    lo = np.searchsorted(stamps, when - lookback, side="right")
-    hi = np.searchsorted(stamps, when, side="right")
-    # Days in the window: those starting inside it, plus the one straddling its start.
-    n_days = days_seen[hi] - days_seen[lo] + (lo < hi).astype(np.int64) * (
-        ~new_day[np.minimum(lo, max(len(day) - 1, 0))] if len(day) else 0)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return np.where(n_days > 0, (total[hi] - total[lo]) / np.maximum(n_days, 1), np.nan)
-
-
 def evaluation_inputs(
     frame: Mapping,
     schema: FeatureSchema,
@@ -200,6 +143,8 @@ def evaluation_inputs(
     asset: str | None = "ticker",
     price: str | None = None,
     window_seconds: int = 60,
+    delay_seconds: int = 5,
+    depth_seconds: int = 5,
     spread_lookback: int | None = None,
     adv_lookback: int | None = None,
     vol_lookback: int | None = None,
@@ -211,6 +156,13 @@ def evaluation_inputs(
     a table without that column) is a single series named ``"series"``. The
     market data carries every role the schema maps, so a stage that needs a
     column the table lacks is refused downstream rather than guessed at.
+
+    ``delay_seconds`` is how long after a decision its orders reach the
+    market: the quotes then (the last at or before ``t + delay``) are the
+    ``exec_*`` quantities an EFQ fill is priced off. ``depth_seconds`` is the
+    window before arrival over which the quoted sizes are averaged to stand
+    as the book's one level; both need quotes, and the sizes need
+    ``bid_size`` and ``ask_size``.
 
     ``spread_lookback`` (seconds) estimates the half-spread from the bars in
     the lookback before each decision; it needs ``high``, ``low`` and
@@ -245,6 +197,10 @@ def evaluation_inputs(
         raise ValueError("decisions must be a non-empty 1-D array and horizons positive seconds")
     if window_seconds < 1:
         raise ValueError("window_seconds must be positive")
+    if delay_seconds < 0 or depth_seconds < 1:
+        raise ValueError("delay_seconds must be non-negative and depth_seconds positive")
+    quoted = schema.has("bid_price", "ask_price")
+    sized = quoted and schema.has("bid_size", "ask_size")
     if spread_lookback is not None:
         if schema.has("bid_price", "ask_price"):
             raise ValueError("the table has quotes, so its spread is observed; "
@@ -273,6 +229,7 @@ def evaluation_inputs(
     best = np.full((2, len(when), len(assets)), np.nan)
     estimated = np.full((len(when), len(assets)), np.nan)
     adv = np.full((len(when), len(assets)), np.nan)
+    arrival = np.full((4, len(when), len(assets)), np.nan)   # bid, ask, bid size, ask size
     daily = []                                   # per asset: (day end stamps, returns)
     role_columns = [schema.role_index(r) for r in roles]
     for j, name in enumerate(assets):
@@ -294,9 +251,9 @@ def evaluation_inputs(
         best[0, :, j] = _range_extreme(buy, lo, hi, np.minimum, np.inf)
         best[1, :, j] = _range_extreme(sell, lo, hi, np.maximum, -np.inf)
         if vol_lookback is not None:
-            daily.append(_daily_returns(ts, p))
+            daily.append(daily_returns(ts, p))
         if adv_lookback is not None:
-            adv[:, j] = _average_daily_dollar_volume(
+            adv[:, j] = average_daily_dollar_volume(
                 ts, x[:, schema.role_index("volume")], x[:, schema.role_index(adv_price)],
                 when, adv_lookback)
         if spread_lookback is not None:
@@ -307,16 +264,32 @@ def evaluation_inputs(
         seen = last >= 0
         if roles:
             market[:, seen, j] = x[last[seen]][:, role_columns].T
+        if quoted:
+            at = np.searchsorted(ts, when + delay_seconds, side="right") - 1
+            there = at >= 0
+            for k, role in enumerate(("bid_price", "ask_price")):
+                arrival[k, there, j] = x[at[there], schema.role_index(role)]
+            if sized:
+                for k, role in enumerate(("bid_size", "ask_size")):
+                    size = x[:, schema.role_index(role)]
+                    arrival[2 + k, :, j] = _window_prices(
+                        ts, size, np.isfinite(size).astype(np.float64),
+                        when + delay_seconds - depth_seconds, depth_seconds)
     realized = ForwardReturns(returns, when, assets, hs)
     columns = {role: market[k] for k, role in enumerate(roles)}
     columns["window_best_buy"], columns["window_best_sell"] = best
+    if quoted:
+        columns["exec_bid_price"], columns["exec_ask_price"] = arrival[0], arrival[1]
+    if sized:
+        columns["book_bid_price"], columns["book_ask_price"] = arrival[0][..., None], arrival[1][..., None]
+        columns["book_bid_size"], columns["book_ask_size"] = arrival[2][..., None], arrival[3][..., None]
     if spread_lookback is not None:
         columns["half_spread"] = estimated
     if adv_lookback is not None:
         columns["adv"] = adv
     if vol_lookback is not None:
-        columns["idio_vol"], columns["market_vol"] = _volatilities(daily, when, vol_lookback)
-        columns["time_trend"] = np.broadcast_to(_months_since_1926(when)[:, None],
+        columns["idio_vol"], columns["market_vol"] = volatilities(daily, when, vol_lookback)
+        columns["time_trend"] = np.broadcast_to(months_since_1926(when)[:, None],
                                                 (len(when), len(assets))).copy()
     data = MarketData(columns, when, assets,
                       frozenset({"half_spread"}) if spread_lookback is not None else frozenset())

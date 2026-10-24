@@ -98,3 +98,26 @@ def test_simulate_fills_validates_quotes():
         simulate_fills(orders, np.full((2, 2), 101.0), np.full((2, 2), 99.0))
     with pytest.raises(ValueError, match="must have shape"):
         simulate_fills(orders, np.full((3, 2), 99.0), np.full((3, 2), 101.0))
+
+
+def test_a_crossing_fill_meets_the_touch_at_arrival_and_is_measured_from_the_decision():
+    from stable_finance import MarketData, Orders, execute
+
+    decisions, assets = np.arange(2), ["A", "B"]
+    bid, ask = np.full((2, 2), 99.0), np.full((2, 2), 101.0)
+    # By the time the order arrives the market has moved up a dollar.
+    market = MarketData({"bid_price": bid, "ask_price": ask,
+                         "exec_bid_price": bid + 1, "exec_ask_price": ask + 1}, decisions, assets)
+    orders = Orders(np.array([[[0.01], [-0.01]]] * 2), decisions, assets, [600])
+    touch = execute(orders, market)
+    assert touch.price[0, 0, 0] == pytest.approx(102.0)        # the ask on arrival
+    assert touch.price[0, 1, 0] == pytest.approx(100.0)        # the bid on arrival
+    np.testing.assert_allclose(touch.mid_price, 100.0)          # cost is from the decision mid
+    half = execute(orders, market, efq=0.5)
+    assert half.price[0, 0, 0] == pytest.approx(101.0 * (1 + 0.5 / 101.0))
+    # A midpoint fill is worked at the price the return is measured from.
+    free = execute(orders, market, efq=0.0)
+    np.testing.assert_allclose(free.price, 100.0)
+    # Without arrival quotes the decision's touch stands in.
+    same = execute(orders, market.select("bid_price", "ask_price"))
+    assert same.price[0, 0, 0] == pytest.approx(101.0)

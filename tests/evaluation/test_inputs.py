@@ -88,3 +88,25 @@ def test_a_single_series_needs_no_asset_column():
     assert realized.assets.tolist() == ["series"] and np.isfinite(realized.values).all()
     with pytest.raises(KeyError):
         evaluation_inputs(frame, FeatureSchema.univariate("price"), [T0 + 600], [300])
+
+
+def test_quotes_are_read_at_arrival_and_sizes_over_the_depth_window():
+    from stable_finance import evaluation_inputs
+    from stable_finance.dataset import FeatureSchema
+
+    t0 = 1_700_000_000
+    i = np.arange(100)
+    table = {"timestamp": t0 + i, "ticker": np.full(100, "A"), "bid": 100.0 + i,
+             "ask": 101.0 + i, "bsz": i.astype(float), "asz": 2.0 * i}
+    schema = FeatureSchema.from_roles(bid_price="bid", ask_price="ask", bid_size="bsz",
+                                      ask_size="asz")
+    _, market = evaluation_inputs(table, schema, [t0 + 10], [30], delay_seconds=5,
+                                  depth_seconds=3)
+    assert market.level == "book"
+    assert market.get("bid_price")[0, 0] == 110.0                 # the decision's quote
+    assert market.get("exec_bid_price")[0, 0] == 115.0            # five seconds later
+    assert market.get("book_ask_price")[0, 0, 0] == 116.0
+    assert market.get("book_bid_size")[0, 0, 0] == pytest.approx(np.mean([13, 14, 15]))
+    assert market.get("book_ask_size")[0, 0, 0] == pytest.approx(2 * np.mean([13, 14, 15]))
+    _, prompt = evaluation_inputs(table, schema, [t0 + 10], [30], delay_seconds=0)
+    assert prompt.get("exec_bid_price")[0, 0] == 110.0
