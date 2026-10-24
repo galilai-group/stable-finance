@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
+from stable_finance.dataset.anchors import TO_CLOSE
 from stable_finance.evaluation._grid import _one_dimensional
 
 
@@ -16,6 +17,10 @@ class ForwardReturns:
 
     ``values`` has shape ``(n_decisions, n_assets, n_horizons)``. Missing
     observations are represented by NaN and are ignored by metrics.
+
+    A horizon is a positive duration, or
+    :data:`~stable_finance.dataset.anchors.TO_CLOSE`: held into the closing
+    auction, so its length differs by decision.
     """
 
     values: NDArray[np.floating]
@@ -31,8 +36,9 @@ class ForwardReturns:
         expected = (len(decisions), len(assets), len(horizons))
         if values.shape != expected:
             raise ValueError(f"values must have shape {expected}, got {values.shape}")
-        if np.any(np.asarray(horizons, dtype=np.float64) <= 0):
-            raise ValueError("horizons must contain positive durations")
+        h = np.asarray(horizons, dtype=np.float64)
+        if np.any((h <= 0) & (h != TO_CLOSE)):
+            raise ValueError("horizons must contain positive durations or TO_CLOSE")
         object.__setattr__(self, "values", values)
         object.__setattr__(self, "decisions", decisions)
         object.__setattr__(self, "assets", assets)

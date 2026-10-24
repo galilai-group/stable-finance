@@ -18,6 +18,16 @@ def test_contract_rejects_a_shape_that_does_not_match_its_axes():
         contract(np.zeros((2, 3, 1)))
 
 
+def test_a_horizon_is_a_positive_duration_or_to_close():
+    from stable_finance.dataset.anchors import TO_CLOSE
+
+    held_to_close = ForwardReturns(np.zeros((2, 2, 2)), [1, 2], ["A", "B"], [300, TO_CLOSE])
+    assert list(held_to_close.horizons) == [300, TO_CLOSE]
+    for bad in (0, -2):
+        with pytest.raises(ValueError, match="positive durations or TO_CLOSE"):
+            ForwardReturns(np.zeros((2, 2, 1)), [1, 2], ["A", "B"], [bad])
+
+
 def test_alignment_checks_axis_values_not_only_shape():
     returns = contract()
     weights = PortfolioWeights(np.zeros((2, 2, 1)), [1, 2], ["B", "A"], [300])
