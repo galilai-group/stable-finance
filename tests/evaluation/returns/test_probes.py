@@ -9,7 +9,6 @@ import stable_finance as sf
 from stable_finance import (
     ColumnwiseRidge, Embeddings, ForwardReturns, RidgeProbe, StreamingRidge,
 )
-from stable_finance.dataset import Month
 
 
 def panel(seed=0):
@@ -82,21 +81,24 @@ def test_ridge_probe_must_be_fitted_before_prediction():
         RidgeProbe().predict(embeddings)
 
 
-def test_ridge_probe_can_fit_from_a_month_provider():
+def test_ridge_probe_fits_from_a_period_provider_of_any_dataset():
+    """A period is the dataset's own split key; the probe never interprets it."""
     embeddings, targets = panel()
+    fold = ("fold", 3)
 
     class Source:
-        def embeddings(self, month):
-            assert month == Month(2020, 1)
+        def embeddings(self, period):
+            assert period == fold
             return embeddings
 
-        def forward_returns(self, month):
-            assert month == Month(2020, 1)
+        def forward_returns(self, period):
+            assert period == fold
             return targets
 
-    probe = RidgeProbe().fit_month("2020-01", Source())
-    assert probe.fit_month_ == Month(2020, 1)
+    probe = RidgeProbe().fit_period(fold, Source())
+    assert probe.fit_period_ == fold
     assert np.isfinite(probe.predict(embeddings).values).all()
+    assert RidgeProbe.fit_month is RidgeProbe.fit_period
 
 
 def test_ridge_probe_is_an_sklearn_estimator():

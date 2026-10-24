@@ -39,16 +39,17 @@ src/stable_finance/
                            rebalance and trade rules, where a learned policy would go
     scoring/               stage 5: how good each output is; ic.py (forecast IC),
                            pnl.py (positions and P&L), sharpe.py (Sharpe, EFQ curves)
-    config.py, backtest.py the harness: one named configuration run across all stages
-    execution.py           the execution model: orders, fills, and costs, set by one
-                           number, the EFQ (0 is the mid, 1 crosses the spread)
-    market_data.py         MarketData and the market requirements each stage declares
+    config.py, backtest.py the harness: one named configuration, entered at any level
+    execution.py           the execution models: fill at the mid, across the spread
+                           at an EFQ, or through the book; limit orders
     inputs.py              your table in: realized returns and market data out
   dataset/                 what generic code needs to know about a dataset
     schema.py              column roles (mid, vwap, bid_price, ...) and price methods
     anchors.py             decision grid and measurement window (AnchorSpec)
     outcomes.py            target families: returns, spread and volatility changes
     objective.py           one label definition, keyed, and its cross-sectional forms
+    market.py              MarketData by level (mid, bars, quotes, book), and the
+                           market requirements each stage declares
     datasets/market1t/     Market-1T's one pipeline, a module per step:
                            spec, ingest, mosaic, views, daystore, tables
   _moved.py                old module paths, kept importable
@@ -408,12 +409,99 @@ returns the same rows as `MarketData` on a grid. A panel built from a dataset
 without quotes records that, and its market data carries no bid or ask
 rather than NaN ones.
 
+## Any input level, any market data
+
+The code is a grid. One axis is what you bring; the other is what market data
+you have. `run_backtest` takes the input at any level and runs only the
+stages below it, and every level is scored the same way:
+
+| You bring | The harness runs |
+|---|---|
+| `Embeddings`, with `train=(embeddings, returns)` | a ridge probe, then everything below |
+| `ForwardReturns` | universe, selection, risk and sizing, then trading |
+| `PortfolioWeights` | trading toward your targets |
+| `Orders`, optionally with limits | your orders, filled |
+
+Market data comes in levels, and a richer level derives the poorer ones: a
+book's first level is the best bid and ask, which give the mid and the
+half-spread.
+
+| Level | Needs | What it supports |
+|---|---|---|
+| `mid` | a price series | returns, and fills at the mid at no cost |
+| `bars` | `high`, `low`, `close` | a spread estimated from the bars, so costs can be charged |
+| `quotes` | `bid_price`, `ask_price` | the quoted spread |
+| `book` | depth on both sides | orders that walk the book for their size |
+
+The execution model is the bridge between the two axes, and each one needs a
+level. It is the config's `cost_model`:
+
+| `cost_model` | Fills at | Needs |
+|---|---|---|
+| `mid` | the price the return is measured from, at no cost | nothing |
+| `cross` | `mid * (1 +/- efq * half_spread)` | a spread, quoted or estimated |
+| `book` | the depth, level by level, up to the order's size; the rest is unfilled | depth, and `equity` in the config |
+| `impact` | the evolving mid plus the price impact of Frazzini, Israel and Moskowitz (2018), worked over a trading day | `adv`, and `equity` in the config |
+| `impact_stock` | the same, with the paper's stock-specific terms: market cap, idiosyncratic volatility, market volatility, time trend | `adv`, `market_cap`, `idio_vol`, `market_vol`, `time_trend`, and `equity` |
+
+`impact` and `impact_stock` are the institutional cost models, simple and
+stock-specific, independent of EFQ. The paper fits the
+realized cost of $1.7 trillion of live institutional orders, each worked with
+resting limit orders over about a trading day, and finds it concave in size:
+in basis points, `a + b x + c sqrt(x)` for an order of `x` percent of the
+name's average daily dollar volume, with the U.S. estimates `b = -0.53` and
+`c = 11.21` (Table VII, column 10). The model here does two things with it.
+The position ramps linearly over the next trading day, read from the `days`
+labels, so an intraday signal earns only the part of its return it has
+actually bought; and each slice fills at that decision's own mid plus the
+formula's impact. Orders in the same name within one day are one parent
+order, since concavity would otherwise reward slicing. `execution_days=0`
+fills everything at the decision, which is the paper's own accounting. The
+cost does not depend on how long you take: the paper's patience is in its
+coefficients. `evaluation_inputs(..., adv_lookback=...)` computes `adv` from
+a volume column.
+
+`impact_stock` adds the rest of column 10: cost falls with the log of market
+cap (-0.14 per log billion), rises with the name's idiosyncratic volatility
+(+0.31 per annualized percent) and the market's (+0.12), and drifts with a
+time trend (+0.01 per month). The paper never reports the intercept, so the
+level is pinned: a name at the reference characteristics pays the simple
+model's cost. The firm-size reference is the paper's own median traded firm,
+$4.9 billion; the volatility and time references are not reported by the
+paper and are set to ordinary values for its sample (30%, 17%, May 2007),
+overridable through `ImpactStockCoefficients`. `evaluation_inputs(...,
+vol_lookback=...)` computes the volatilities from daily returns and the
+time trend from the dates; market cap comes through a `market_cap` column
+role.
+
+An order may carry a `limit`, the most slippage it accepts as a fraction of
+the decision price. What a model can fill within the limit fills. The rest
+rests, and fills at the limit only if the execution window traded through it.
+That needs the window's best prices, `window_best_buy` and `window_best_sell`,
+which `evaluation_inputs` provides at every level. Queue position is not
+modelled, so a resting fill is an upper bound. When fills can fall short,
+`fill_path` trades toward each target from the position actually held.
+
+```python
+from stable_finance import DEFAULT_BACKTEST, Orders, run_backtest
+
+run_backtest(embeddings, realized, market=market, train=(train_emb, train_ret))
+run_backtest(forecast, realized, market=market)
+run_backtest(weights, realized, market=market,
+             config=DEFAULT_BACKTEST.replace(cost_model="book", equity=1e6))
+run_backtest(Orders(q, decisions, assets, horizons, limit=0.0), realized,
+             market=market)                    # rest at the mid
+```
+
 ## Each stage says what it needs of the market
 
 `MarketData` is the observable market on the `(decision, asset)` grid, one
-array per role. The roles are the dataset schema's roles, plus `half_spread`.
-`mid` and `half_spread` are derived from `bid_price` and `ask_price` when not
-supplied. Every stage that reads the market declares what it needs, and
+array per role, as of the decision. The quantities are the dataset schema's
+roles, `half_spread`, the four book quantities, which add a level axis, and
+the two execution-window prices, which are the only quantities from after the
+decision. `mid` and `half_spread` are derived from `bid_price` and
+`ask_price`, and those from the book, when not supplied. `estimated` names
+the quantities that were estimated rather than observed. Every stage that reads the market declares what it needs, and
 refuses with `MissingRolesError` when a column is absent:
 
 | Stage | Needs |
@@ -422,7 +510,11 @@ refuses with `MissingRolesError` when a column is absent:
 | forecast to weights, `cost_model="mid"`, `universe="all"` | nothing |
 | weights to fills at the return's own starting price (`simulate_fills(orders, efq=0)`) | nothing |
 | any crossing cost model, the liquidity screens, `rebalance(cost=...)`, `allocate(cost=...)`, `threshold_selection`, `persistent_selection`, `edge_to_cost`, `evaluate_weights(half_spread=...)` | `half_spread` |
-| weights to fills at a positive EFQ (`simulate_fills`) | `mid` and `half_spread`, or both quotes |
+| weights to fills at a positive EFQ (`simulate_fills`, `cost_model="cross"`) | `half_spread`, or both quotes |
+| fills through the book (`cost_model="book"`) | `book_bid_price`, `book_bid_size`, `book_ask_price`, `book_ask_size` |
+| the impact model (`cost_model="impact"`) | `adv`, average daily dollar volume |
+| the stock-specific impact model (`cost_model="impact_stock"`) | `adv`, `market_cap`, `idio_vol`, `market_vol`, `time_trend` |
+| limit orders, any model but `impact` | `window_best_buy` and `window_best_sell`, and a decision price |
 | `cross_spread_sharpe` | `bid_price` and `ask_price` |
 
 The cost-less path needs no market column at any stage. A return is already
@@ -453,10 +545,9 @@ them (`COST_MODEL_REQUIRES`, `UNIVERSE_REQUIRES`, `WEIGHTING_REQUIRES`, ...).
 A configuration states its needs in `requires`, and a sweep checks every
 configuration before running any. Without a spread, `enumerate_configs`
 yields the frictionless space: cost model `mid`, EFQ zero, universe `all`.
-No current rule reads OHLC. A rule that did, say one sized off the bar range,
-would declare `("open", "high", "low", "close")` in its table or with
-`@requires(...)`, and a market without those columns would refuse it the same
-way. `half_spread=` remains accepted wherever it was, as market data holding
+A custom rule that reads other roles, say one sized off the bar range, declares
+`("open", "high", "low", "close")` in its table or with `@requires(...)`, and
+a market without those columns refuses it the same way. `half_spread=` remains accepted wherever it was, as market data holding
 that quantity alone.
 
 ## Bringing your own data
@@ -492,10 +583,14 @@ no price, and the return is NaN rather than a guess.
 
 **Roles decide what is possible downstream.** The roles are `mid`, `open`,
 `high`, `low`, `close`, `vwap`, `volume`, `n_trades`, `bid_price`,
-`ask_price`, `bid_size` and `ask_size`. None is required. Every target family
+`ask_price`, `bid_size`, `ask_size` and `market_cap`. None is required. Every target family
 and every stage declares the roles it needs. A univariate series gets returns
 and frictionless portfolios, and a backtest that charges the spread is
-refused with `MissingRolesError` naming the missing columns.
+refused with `MissingRolesError` naming the missing columns. Bars without
+quotes can be charged: `spread_lookback=` estimates the half-spread from the
+high, low and close of the bars before each decision (Abdi and Ranaldo,
+2017), and marks it as estimated. Depth comes in as arrays on `MarketData`
+directly; there is no table format for it yet.
 
 The target families themselves (`stable_finance.dataset.outcomes`) and the
 `Objective` that names a label (`stable_finance.dataset.objective`) are
@@ -573,8 +668,8 @@ size against volume, which the backtest does not model, so report the curve.
 `build_session_panel` is the model-neutral injection point immediately before
 encoding. It returns normalized views, labels and `ViewMetadata` separately,
 and `PanelCache` preserves that separation on disk. A model integration may
-implement `MonthlyProbeData`, so the probe can be fit with
-`RidgeProbe().fit_month("2020-01", source)`.
+implement `ProbeData`, so the probe can be fit on one of the dataset's own
+periods with `RidgeProbe().fit_period(period, source)`.
 
 Every module path published before this layout remains importable through the
 table in `_moved.py`, and `python -m` on an old path runs its command.

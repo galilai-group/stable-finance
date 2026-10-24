@@ -6,25 +6,40 @@
                                  risk, sizing   trade rules     execution-
                                  (no costs)                     quality curves
 
-                       execution: orders, fills, costs at an EFQ
+             execution: orders filled at the mid, across the spread at an
+             EFQ, or through the book, each needing its level of market data
 
 Each stage package holds its stage's contract (the object it produces) and
 the code that produces it from the stage before. The portfolio stage solves
 for what to hold as if trading were free. The trades stage holds the policies
 that decide how far to move there given what trading costs. execution is the
-model of what a trade costs and where it fills, set by one number, the EFQ.
+model of where a trade fills and what it costs, for each level of market data.
 scoring measures each stage's output: the IC of a forecast, and the P&L and
 Sharpe of what a portfolio actually held. config and backtest are the harness
-that runs all of them under one named configuration. market_data is what
-every stage may read of the observable market, with the declarations by which
-a stage says which market columns it needs. inputs turns your own table into
-realized returns and market data.
+that runs any of them under one named configuration, starting from whichever
+level you bring. The observable market, by level from a bare price series to
+the book, is stable_finance.dataset.market; every stage declares what it
+needs of it. inputs turns your own table into realized returns and market
+data.
 """
 
+from stable_finance.dataset.market import (
+    ADV,
+    BOOK_QUANTITIES,
+    CHARACTERISTICS,
+    DERIVATIONS,
+    MARKET_LEVELS,
+    MARKET_QUANTITIES,
+    WINDOW_QUANTITIES,
+    MarketData,
+    bar_half_spread,
+    requires,
+)
 from stable_finance.evaluation._grid import (
     require_aligned,
 )
 from stable_finance.evaluation.backtest import (
+    LEVELS,
     BacktestReport,
     PnLSeries,
     run_backtest,
@@ -37,6 +52,7 @@ from stable_finance.evaluation.config import (
     CONFIG_SPACE,
     DEFAULT_BACKTEST,
     EFQ_GRID,
+    OPTIONAL_SETTINGS,
     REBALANCE_RULES,
     BacktestConfig,
     check_config,
@@ -52,10 +68,18 @@ from stable_finance.evaluation.execution import (
     EFQ_DIRECT_ACCESS,
     EFQ_INFORMED_RANGE,
     EFQ_LIT_EXCHANGE,
+    IMPACT_COEFFICIENTS,
+    IMPACT_STOCK_COEFFICIENTS,
     Fills,
+    ImpactStockCoefficients,
     Orders,
     effective_half_spread,
+    execute,
+    execution_requires,
+    fill_path,
     fill_requires,
+    impact_cost,
+    impact_stock_cost,
     orders_from_weights,
     simulate_fills,
     trading_cost,
@@ -63,11 +87,6 @@ from stable_finance.evaluation.execution import (
 from stable_finance.evaluation.inputs import (
     evaluation_inputs,
     to_grid,
-)
-from stable_finance.evaluation.market_data import (
-    MARKET_QUANTITIES,
-    MarketData,
-    requires,
 )
 from stable_finance.evaluation.portfolio import (
     RISK_MODEL_REQUIRES,
@@ -98,6 +117,7 @@ from stable_finance.evaluation.returns import (
     ColumnwiseRidge,
     ForwardReturns,
     MonthlyProbeData,
+    ProbeData,
     RidgeProbe,
     StreamingRidge,
     fit,
@@ -131,17 +151,21 @@ from stable_finance.evaluation.trades import (
 )
 
 __all__ = [
+    "ADV",
     "ALLOCATORS",
     "ANNUALIZATIONS",
     "AXIS_REQUIRES",
+    "BOOK_QUANTITIES",
     "BacktestConfig",
     "BacktestReport",
     "BacktestResult",
+    "CHARACTERISTICS",
     "CONFIG_SPACE",
     "COST_MODELS",
     "COST_MODEL_REQUIRES",
     "ColumnwiseRidge",
     "DEFAULT_BACKTEST",
+    "DERIVATIONS",
     "EFQ_DIRECT_ACCESS",
     "EFQ_GRID",
     "EFQ_INFORMED_RANGE",
@@ -150,15 +174,22 @@ __all__ = [
     "ExecutionQualityCurve",
     "Fills",
     "ForwardReturns",
+    "IMPACT_COEFFICIENTS",
+    "IMPACT_STOCK_COEFFICIENTS",
+    "ImpactStockCoefficients",
     "InformationCoefficient",
+    "LEVELS",
+    "MARKET_LEVELS",
     "MARKET_QUANTITIES",
     "MarketData",
     "MeanVarianceAllocator",
     "MonthlyProbeData",
     "NOISE_MODES",
+    "OPTIONAL_SETTINGS",
     "Orders",
     "PnLSeries",
     "PortfolioWeights",
+    "ProbeData",
     "REBALANCE_RULES",
     "RISK_MODELS",
     "RISK_MODEL_REQUIRES",
@@ -170,8 +201,10 @@ __all__ = [
     "UNIVERSE_SCREENS",
     "WEIGHTING_REQUIRES",
     "WEIGHTING_RULES",
+    "WINDOW_QUANTITIES",
     "allocate",
     "apply_screen",
+    "bar_half_spread",
     "breakeven_efq",
     "check_config",
     "cross_spread_sharpe",
@@ -186,10 +219,15 @@ __all__ = [
     "evaluate_forward_returns",
     "evaluate_weights",
     "evaluation_inputs",
+    "execute",
+    "execution_requires",
+    "fill_path",
     "fill_requires",
     "fit",
     "grouped_rank_ic",
     "grouped_rank_ic_by_label",
+    "impact_cost",
+    "impact_stock_cost",
     "ledoit_wolf_covariance",
     "liquidity_screen",
     "mean_variance_target",

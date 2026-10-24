@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from stable_finance.evaluation.market_data import MarketData, market_quantity, requires
+from stable_finance.dataset.market import MarketData, market_quantity, requires
 
 
 @requires("half_spread")

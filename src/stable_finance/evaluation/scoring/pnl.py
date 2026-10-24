@@ -14,7 +14,7 @@ from numpy.typing import ArrayLike, NDArray
 
 from stable_finance.evaluation._grid import require_aligned
 from stable_finance.evaluation.execution import Fills, _initial_positions
-from stable_finance.evaluation.market_data import (
+from stable_finance.dataset.market import (
     MarketData,
     market_quantity,
     requires,

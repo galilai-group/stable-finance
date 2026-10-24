@@ -32,7 +32,7 @@ from numpy.typing import ArrayLike
 from sklearn.base import BaseEstimator
 from sklearn.exceptions import NotFittedError
 
-from stable_finance.evaluation.market_data import MarketData, market_quantity, requires
+from stable_finance.dataset.market import MarketData, market_quantity, requires
 from stable_finance.evaluation.portfolio.contract import PortfolioWeights
 from stable_finance.evaluation.portfolio.risk import estimate_covariance
 from stable_finance.evaluation.returns.contract import ForwardReturns

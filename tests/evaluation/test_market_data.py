@@ -72,8 +72,8 @@ def test_a_missing_column_is_refused_and_named():
 
 
 def test_every_stage_states_what_it_needs():
-    assert simulate_fills.requires == ("mid", "half_spread")
-    assert sf.fill_requires(0.0) == () and sf.fill_requires(0.7) == ("mid", "half_spread")
+    assert simulate_fills.requires == ("half_spread",)
+    assert sf.fill_requires(0.0) == () and sf.fill_requires(0.7) == ("half_spread",)
     assert cross_spread_sharpe.requires == ("bid_price", "ask_price")
     assert edge_to_cost.requires == ("half_spread",)
     assert evaluate_weights.requires == ("half_spread",)
@@ -104,7 +104,7 @@ def test_a_custom_stage_declares_and_is_refused_the_same_way():
 
 def test_backtest_without_quotes_refuses_the_spread_charging_default():
     realized = _returns()
-    with pytest.raises(MissingRolesError, match="cost_model='cross'.*cost_model='mid' runs without quotes"):
+    with pytest.raises(MissingRolesError, match="cost_model='cross'.*cost_model='mid' runs on any market data"):
         run_backtest(_forecast(realized), realized)
     with pytest.raises(MissingRolesError, match="universe='tight_50pct'"):
         run_backtest(_forecast(realized), realized, config=MID.replace(universe="tight_50pct"))
@@ -155,7 +155,7 @@ def test_the_config_space_shrinks_to_what_the_market_supports():
 # ── portfolio -> trades ──────────────────────────────────────────────────────
 
 
-def test_fills_need_both_sides_of_the_book():
+def test_fills_need_a_spread():
     bid, ask = _quotes()
     weights = np.random.default_rng(3).normal(0, 0.1, (D, A, 1))
     orders = sf.orders_from_weights(PortfolioWeights(weights, DECISIONS, ASSETS, [300]))
@@ -163,11 +163,16 @@ def test_fills_need_both_sides_of_the_book():
     a, b = simulate_fills(orders, market), simulate_fills(orders, bid, ask)
     np.testing.assert_array_equal(a.price, b.price)
 
+    # A spread alone prices a fill in units of the benchmark: the cost is
+    # still the spread, which is all the P&L needs.
     spread_only = MarketData({"half_spread": market["half_spread"]}, DECISIONS, ASSETS)
+    alone = simulate_fills(orders, spread_only)
+    np.testing.assert_allclose(sf.evaluate_fills(alone, _returns())[0].costs,
+                               sf.evaluate_fills(a, _returns())[0].costs)
     univariate = MarketData({"mid": market["mid"]}, DECISIONS, ASSETS)
+    with pytest.raises(MissingRolesError, match=r"simulate_fills\(efq>0\) needs .*efq=0 fills"):
+        simulate_fills(orders, univariate)
     for lacking in (spread_only, univariate):
-        with pytest.raises(MissingRolesError, match=r"simulate_fills\(efq>0\) needs .*efq=0 fills"):
-            simulate_fills(orders, lacking)
         with pytest.raises(MissingRolesError, match="cross_spread_sharpe"):
             cross_spread_sharpe(PortfolioWeights(weights, DECISIONS, ASSETS, [300]),
                                 _returns(), lacking)

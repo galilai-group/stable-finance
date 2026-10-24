@@ -9,16 +9,8 @@ whose rows happen to have the same length but refer to different observations.
 from __future__ import annotations
 
 import numpy as np
-from numpy.typing import ArrayLike, NDArray
 
-
-def _one_dimensional(name: str, value: ArrayLike) -> NDArray:
-    array = np.asarray(value)
-    if array.ndim != 1:
-        raise ValueError(f"{name} must be one-dimensional, got shape {array.shape}")
-    if len(array) == 0:
-        raise ValueError(f"{name} cannot be empty")
-    return array
+from stable_finance.dataset.market import _one_dimensional  # noqa: F401
 
 
 def require_aligned(left, right) -> None:

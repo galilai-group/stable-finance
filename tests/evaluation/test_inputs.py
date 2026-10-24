@@ -32,7 +32,9 @@ def test_a_univariate_table_gives_returns_and_only_a_midpoint():
     frame = _frame()
     decisions = T0 + 60 * np.arange(10, 400, 30)
     realized, market = evaluation_inputs(frame, FeatureSchema.univariate("px"), decisions, [300, 900])
-    assert realized.values.shape == (len(decisions), 3, 2) and market.available == ("mid",)
+    assert realized.values.shape == (len(decisions), 3, 2)
+    assert market.available == ("mid", "window_best_buy", "window_best_sell")
+    assert market.level == "mid"
     # The base price is the minute after the decision, never the bar ending at it.
     a = frame["ticker"] == "A"
     ts, px = frame["timestamp"][a], frame["px"][a]

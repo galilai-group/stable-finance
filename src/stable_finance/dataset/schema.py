@@ -77,6 +77,7 @@ ROLE_DEFAULTS: dict[str, tuple[str, str, str, bool]] = {
     "ask_size": ("last", "ffill", "order_book_size", True),
     "volume": ("sum", "zero", "trade_size", True),
     "n_trades": ("sum", "zero", "trade_count", True),
+    "market_cap": ("last", "ffill", "market_cap", True),
 }
 ROLES = tuple(ROLE_DEFAULTS)
 
@@ -84,7 +85,7 @@ ROLES = tuple(ROLE_DEFAULTS)
 #: every role's own name, plus Market-1T's two names that differ from it.
 ROLE_ALIASES: dict[str, str] = {**{role: role for role in ROLES},
                                 "vwap_all": "vwap", "n": "n_trades"}
-_GROUP_ORDER = ("price", "order_book_size", "trade_size", "trade_count")
+_GROUP_ORDER = ("price", "order_book_size", "trade_size", "trade_count", "market_cap")
 
 
 class MissingRolesError(ValueError):

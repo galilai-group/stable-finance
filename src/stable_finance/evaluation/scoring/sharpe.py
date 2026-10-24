@@ -13,7 +13,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from stable_finance.evaluation._grid import require_aligned
-from stable_finance.evaluation.market_data import (
+from stable_finance.dataset.market import (
     MarketData,
     market_quantity,
     requires,

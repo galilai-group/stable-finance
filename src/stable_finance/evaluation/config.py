@@ -39,6 +39,7 @@ from stable_finance.evaluation.portfolio.universe import UNIVERSE_REQUIRES, UNIV
 
 __all__ = [
     "ANNUALIZATIONS",
+    "OPTIONAL_SETTINGS",
     "EFQ_GRID",
     "BacktestConfig",
     "CONFIG_SPACE",
@@ -88,6 +89,11 @@ AXIS_REQUIRES: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 
+#: Settings that are ``None`` unless a model needs them, and that labels and
+#: result rows leave out while unset.
+OPTIONAL_SETTINGS = ("equity", "execution_days", "impact")
+
+
 @dataclass(frozen=True)
 class BacktestConfig:
     """One point in the harness configuration space.
@@ -113,6 +119,19 @@ class BacktestConfig:
     annualization: str = "daily"
     gross_exposure: float = 2.0
     shrinkage: float = 0.3
+    #: The portfolio's value in the book's currency. Only ``cost_model='book'``
+    #: reads it, to turn weight into shares, and it is required there: depth
+    #: is in shares, so the same weights walk a book further at larger size.
+    equity: float | None = None
+    #: How long ``cost_model='impact'`` works each order, in trading days,
+    #: measured in decisions from the ``days`` labels. ``None`` is the paper's
+    #: one day; ``0`` fills at the decision, the paper's own accounting.
+    execution_days: float | None = None
+    #: Coefficients for ``cost_model='impact'`` (three, ``(a, b, c)``) or
+    #: ``'impact_stock'`` (eleven, an
+    #: :class:`~stable_finance.evaluation.execution.ImpactStockCoefficients`);
+    #: ``None`` is the paper's U.S. calibration.
+    impact: tuple | None = None
     #: Iteration budget for the cost-aware allocator's proximal solver. A
     #: NUMERICAL setting, not a modelling one: it is not swept, and a value too
     #: low changes the answer rather than approximating it. 400 reproduces the
@@ -146,12 +165,35 @@ class BacktestConfig:
             raise ValueError("shrinkage must lie in [0, 1]")
         if self.max_iter < 1:
             raise ValueError("max_iter must be at least 1")
+        if self.equity is not None and (isinstance(self.equity, bool)
+                                        or not np.isfinite(self.equity) or self.equity <= 0):
+            raise ValueError("equity must be a positive number")
+        if self.cost_model in ("book", "impact", "impact_stock") and self.equity is None:
+            raise ValueError(f"cost_model={self.cost_model!r} needs equity, the portfolio's "
+                             "value in the market's currency, to size its orders")
+        if self.execution_days is not None and (
+                isinstance(self.execution_days, bool)
+                or not np.isfinite(self.execution_days) or self.execution_days < 0):
+            raise ValueError("execution_days must be a non-negative number")
+        if self.impact is not None:
+            values = tuple(self.impact)
+            wanted = 11 if self.cost_model == "impact_stock" else 3
+            if len(values) != wanted or not all(isinstance(v, (int, float)) and np.isfinite(v)
+                                                for v in values):
+                raise ValueError(f"impact must be {wanted} finite coefficients for "
+                                 f"cost_model={self.cost_model!r}")
+            object.__setattr__(self, "impact", tuple(float(v) for v in values))
 
     @property
     def label(self) -> str:
-        """A stable, filename-safe identifier for this configuration."""
+        """A stable, filename-safe identifier for this configuration.
+
+        The optional settings appear only when set, so every label written
+        before they existed still names the same configuration.
+        """
         return "|".join(
             f"{field.name}={getattr(self, field.name)}" for field in fields(self)
+            if not (field.name in OPTIONAL_SETTINGS and getattr(self, field.name) is None)
         )
 
     @property
@@ -218,8 +260,12 @@ def check_config(config: BacktestConfig, market) -> None:
     choice to change: ``cost_model='cross'`` on a market without quotes, for
     instance, rather than a NaN Sharpe or a free trade.
     """
-    hints = {"cost_model": "cost_model='mid' runs without quotes, frictionless at the "
-                           "midpoint the returns are marked at",
+    hints = {"cost_model": "cost_model='mid' runs on any market data, frictionless at "
+                           "the price the returns are marked at; 'cross' needs a "
+                           "spread, quoted or estimated from bars; 'book' needs depth; "
+                           "'impact' needs adv, the average daily dollar volume; "
+                           "'impact_stock' also needs market_cap, idio_vol, market_vol "
+                           "and time_trend",
              "universe": "universe='all' runs without quotes"}
     for axis, needed in config.requires.items():
         try:

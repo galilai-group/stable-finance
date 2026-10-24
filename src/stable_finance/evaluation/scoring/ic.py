@@ -8,7 +8,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from stable_finance.evaluation._grid import _rankdata, require_aligned
-from stable_finance.evaluation.market_data import requires
+from stable_finance.dataset.market import requires
 from stable_finance.evaluation.returns.contract import ForwardReturns
 
 

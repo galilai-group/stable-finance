@@ -93,7 +93,7 @@ from stable_finance.dataset.schema import (
     mid_series,
 )
 from stable_finance.evaluation.inputs import to_grid
-from stable_finance.evaluation.market_data import MarketData
+from stable_finance.dataset.market import MarketData
 
 if TYPE_CHECKING:
     from stable_finance.dataset.datasets.market1t.tables import AnchorTargetStats

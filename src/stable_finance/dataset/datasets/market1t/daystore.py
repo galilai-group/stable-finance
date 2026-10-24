@@ -132,7 +132,7 @@ from stable_finance.dataset.outcomes import (
     supported_targets,
 )
 from stable_finance.dataset.schema import FeatureSchema, default_schema
-from stable_finance.evaluation.market_data import MarketData
+from stable_finance.dataset.market import MarketData
 from stable_finance.evaluation.returns.contract import ForwardReturns
 
 

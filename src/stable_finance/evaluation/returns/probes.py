@@ -30,7 +30,7 @@ numbers leaves far more precision than the fourth decimal an IC is read at.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
 from typing import Protocol
 
 import numpy as np
@@ -40,7 +40,6 @@ from sklearn.exceptions import NotFittedError
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
-from stable_finance.dataset.datasets.market1t.spec import Month
 from stable_finance.evaluation.embeddings.contract import (
     Embeddings,
     require_same_observations,
@@ -48,12 +47,20 @@ from stable_finance.evaluation.embeddings.contract import (
 from stable_finance.evaluation.returns.contract import ForwardReturns
 
 
-class MonthlyProbeData(Protocol):
-    """Model-specific provider used by :meth:`RidgeProbe.fit_month`."""
+class ProbeData(Protocol):
+    """Model-specific provider used by :meth:`RidgeProbe.fit_period`.
 
-    def embeddings(self, month: Month) -> Embeddings: ...
+    A period is whatever key the dataset splits on: a month, a fold, a date
+    range. The library never looks inside it.
+    """
 
-    def forward_returns(self, month: Month) -> ForwardReturns: ...
+    def embeddings(self, period: Hashable) -> Embeddings: ...
+
+    def forward_returns(self, period: Hashable) -> ForwardReturns: ...
+
+
+#: The earlier name, from when every split was a Market-1T month.
+MonthlyProbeData = ProbeData
 
 
 class ColumnwiseRidge(BaseEstimator):
@@ -181,20 +188,20 @@ class RidgeProbe(BaseEstimator):
         self.n_features_in_ = n_features
         return self
 
-    def fit_month(
-        self, month: Month | str, source: MonthlyProbeData
-    ) -> "RidgeProbe":
-        """Load one fit month through a model-specific provider and fit.
+    def fit_period(self, period: Hashable, source: ProbeData) -> "RidgeProbe":
+        """Load one fit period through a model-specific provider and fit.
 
-        Stable-finance owns what a month and return panel mean; the provider
-        owns how a particular model produces embeddings. This keeps checkpoint
-        loading out of the evaluation library while giving orchestration code a
-        month-level API.
+        Stable-finance owns what a return panel means; the provider owns how a
+        particular model produces embeddings, and what a period is. This keeps
+        checkpoint loading out of the evaluation library while giving
+        orchestration code a period-level API.
         """
-        fit_month = Month.parse(month)
-        self.fit(source.embeddings(fit_month), source.forward_returns(fit_month))
-        self.fit_month_ = fit_month
+        self.fit(source.embeddings(period), source.forward_returns(period))
+        self.fit_period_ = period
         return self
+
+    #: The earlier name, from when every split was a Market-1T month.
+    fit_month = fit_period
 
     def predict(self, embeddings: Embeddings) -> ForwardReturns:
         """Predict every fitted horizon, preserving the input observation grid."""

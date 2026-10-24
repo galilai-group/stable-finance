@@ -183,11 +183,11 @@ def test_mid_charges_nothing_and_cross_charges_the_half_spread():
     np.testing.assert_allclose(trading_cost("cross", spread), spread)
 
 
-def test_only_mid_and_cross_are_cost_models():
+def test_the_cost_models_are_the_execution_models():
     """Flat basis-point add-ons are gone; execution quality is the EFQ multiple."""
     from stable_finance import COST_MODELS
 
-    assert COST_MODELS == ("mid", "cross")
+    assert COST_MODELS == ("mid", "cross", "book", "impact", "impact_stock")
     with pytest.raises(ValueError, match="unknown cost model"):
         trading_cost("cross+2bps", np.array([[1e-4]]))
 
