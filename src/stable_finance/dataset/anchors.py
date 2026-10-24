@@ -1,4 +1,11 @@
-"""Decision-anchor geometry for forward-outcome construction."""
+"""Decision-anchor geometry for forward-outcome construction.
+
+:class:`AnchorSpec` says where decisions fall in a session and how long a
+label measures at each end, in seconds, at ``bar_seconds`` per stored row.
+The target functions (:mod:`stable_finance.dataset.outcomes`) take one; a
+dataset's own clock builds it, as Market-1T's
+:class:`~stable_finance.dataset.datasets.market1t.spec.Timeline` does.
+"""
 
 from __future__ import annotations
 
@@ -9,15 +16,21 @@ from dataclasses import dataclass
 class AnchorSpec:
     """Geometry shared by target tables, training crops, and evaluation.
 
-    These defaults describe the current regular-session recipe. Keeping them
+    These defaults describe Market-1T's regular-session recipe. Keeping them
     in a value object lets callers inject a different grid without treating
     dataset geometry as model configuration.
+
+    Every field is in SECONDS. ``bar_seconds`` is the spacing of the stored
+    rows, so the row counts the target builders index with are the ``*_rows``
+    properties: at 1 Hz they equal the seconds, at one-minute bars they are a
+    sixtieth. Every duration must be a whole number of bars.
     """
 
     session_seconds: int = 23_400
     step_seconds: int = 300
     measurement_window_seconds: int = 60
     post_close_seconds: int = 0
+    bar_seconds: int = 1
 
     def __post_init__(self) -> None:
         if self.session_seconds < 1:
@@ -30,6 +43,34 @@ class AnchorSpec:
             raise ValueError("measurement_window_seconds must be positive")
         if self.post_close_seconds < 0:
             raise ValueError("post_close_seconds cannot be negative")
+        if self.bar_seconds < 1:
+            raise ValueError("bar_seconds must be positive")
+        for name in ("session_seconds", "step_seconds",
+                     "measurement_window_seconds", "post_close_seconds"):
+            if getattr(self, name) % self.bar_seconds:
+                raise ValueError(
+                    f"{name}={getattr(self, name)} is not a whole number of "
+                    f"{self.bar_seconds}-second bars")
+
+    def rows(self, seconds: int) -> int:
+        """A duration in seconds as a number of stored rows."""
+        seconds = int(seconds)
+        if seconds % self.bar_seconds:
+            raise ValueError(
+                f"{seconds}s is not a whole number of {self.bar_seconds}-second bars")
+        return seconds // self.bar_seconds
+
+    @property
+    def session_rows(self) -> int:
+        return self.session_seconds // self.bar_seconds
+
+    @property
+    def step_rows(self) -> int:
+        return self.step_seconds // self.bar_seconds
+
+    @property
+    def window_rows(self) -> int:
+        return self.measurement_window_seconds // self.bar_seconds
 
     @property
     def anchors_per_session(self) -> int:
@@ -41,14 +82,15 @@ class AnchorSpec:
 
         Rows 0..session_seconds-1 are the regular session, so the auction
         prints at ``session_seconds`` itself. It is not part of the session
-        and never enters a view.
+        and never enters a view. A row index, like every index the target
+        builders take.
         """
-        return self.session_seconds
+        return self.session_rows
 
     @property
     def rows_retained(self) -> int:
         """Rows a stored session holds, regular session plus the tail."""
-        return self.session_seconds + self.post_close_seconds
+        return (self.session_seconds + self.post_close_seconds) // self.bar_seconds
 
     @property
     def measures_close(self) -> bool:
@@ -62,6 +104,7 @@ class AnchorSpec:
 
 
 DEFAULT_ANCHOR_SPEC = AnchorSpec()
+
 
 # Named compatibility constants for concise numerical code and downstream
 # scripts. New APIs should accept an AnchorSpec where geometry is configurable.

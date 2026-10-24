@@ -1,0 +1,894 @@
+"""Market-1T's raw files in: Polygon parquet to the sparse mosaic, and the industry map.
+
+INGEST. Market-1T ingestion: Polygon snapshot parquet to the sparse MDS mosaic, one range or every month.
+
+INGEST. Market-1T ingestion: Polygon snapshot parquet to the sparse MDS mosaic.
+
+Each MDS sample is one date-ticker observation: all sparse rows for a given
+ticker on a given date, stored as variable-length ndarray columns. Output is
+organized by calendar period (month or quarter) with a strong shuffle within
+each period.  Output directory structure: ``{out_base}/{year}/{MM}/``.
+
+Usage:
+    # Normal MDS conversion:
+    python -m stable_finance.dataset.datasets.market1t.ingest --start 2023-01 --end 2023-02 \
+        --cal-freq mnth --metadata
+
+    # Risk factor extraction (separate invocation):
+    python -m stable_finance.dataset.datasets.market1t.ingest --start 2023-01 --end 2023-12 \
+        --risk-factors IWM
+
+The record layout is :data:`~stable_finance.dataset.datasets.market1t.mosaic.MDS_COLUMNS`.
+
+MONTHLY DRIVER. Convert every month of raw Polygon snapshots to MDS, resumably and in parallel.
+
+The month-level driver over ``market1t.ingest``: discovers every ``YYYY/MM``
+directory under the raw root (or takes an explicit list / range), skips
+months whose output already holds an index (so a re-run after a crash only
+does the remainder; ``--force`` re-shards them), runs ``GROUP_SIZE`` months
+at a time as separate processes, and keeps one log per month.
+
+Usage:
+    sf-shard-months                      # all months
+    sf-shard-months 2020-07 2021-08      # just these
+    sf-shard-months --start 2015-01 --end 2019-12
+    sf-shard-months --group-size 4 --force
+
+Paths come from the flags or the environment: RAW_DATA_DIR, MOSAIC_DIR,
+METADATA_PATH, HOLIDAY_CSV. The output is the SPARSE tick layout;
+``densify`` turns it into the dense sessions training reads, and
+``daystore`` regroups those by day.
+
+INDUSTRY MAP. Per-month ticker -> Fama-French 49 industry map, for same-industry pairing.
+
+One row per (month, ticker) with the firm's FF49 code, joined through the
+point-in-time gvkey link (industry membership is monthly, so no mosaic scan
+is needed). Built over EVERY month the mosaic holds so no sweep, eval or
+ad-hoc month can fall outside it -- the map is built once.
+
+Sources (paths are arguments; the files themselves live with the consumer):
+
+  * Compustat North America Fundamentals Annual, columns
+    gvkey/datadate/fyear/sich, screened INDL/STD/C. ``sich`` is the
+    HISTORICAL (as-reported) SIC, so the label attached to a month is the one
+    in force at the time rather than a current header code applied
+    retroactively.
+  * Ken French's FF49 definition file (Siccodes49.txt): 598 SIC ranges over
+    49 industries, from the data library's Detail link.
+  * A point-in-time ticker <-> gvkey link with valid_start_date /
+    valid_end_date.
+
+This replaced an earlier source (``lab_sample_industry_definitions``) that
+started 2015-01 and covered 6,388 gvkeys -- it forced the same-industry
+campaign onto 14 post-2015 months and left ~17% of the traded universe
+(REITs, Canadian cross-listings, ADRs) unlabelled. On the 2015+ overlap the
+two agree on 99.9% of FF49 codes wherever they report the same underlying
+SIC; the residual is the sich-vs-header-SIC definitional difference.
+
+Conventions:
+  * SIC codes matching no FF49 range are left NULL rather than folded into
+    49 ("Other"). Folding them in would inflate "Other" from ~0.5% to ~3% and
+    turn a residual bucket into a large pseudo-industry, which for
+    same-industry pairing is worse than no label: an unlabelled focal simply
+    degrades to an unrestricted cross_stock draw.
+  * A ticker held by two gvkeys inside one month (mid-month handoffs; 8-14
+    tickers/month, ~0.03%) resolves to the gvkey covering more of the month.
+  * Before a firm's first annual observation its earliest sich is carried
+    back. Without this the 2007 months are near-empty (183 tickers in
+    2007-01, since only firms with a fiscal year ending in early 2007 have
+    reported yet) and only reach full density at 2007-12.
+
+Output parquet columns: month (str YYYY-MM), ticker (str), ff49 (int16,
+always >= 0 -- unmapped tickers are simply absent).
+
+Usage (from a consumer repo that keeps the source files under data/):
+    python -m stable_finance.dataset.datasets.market1t.industry \\
+        --funda data/compustat_funda_sich.csv.gz \\
+        --siccodes data/ff_raw/Siccodes49.txt \\
+        --gvkey-link /data/lab/market-text-data/gvkey_ticker_history.parquet \\
+        --out data/industry_map.parquet
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+from calendar import monthrange
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from streaming import MDSWriter
+from tqdm import tqdm
+
+from stable_finance.dataset.datasets.market1t.mosaic import MDS_COLUMNS, flush_observations
+from stable_finance.dataset.datasets.market1t.spec import (
+    MARKET_SCHEMA,
+    MarketSchedule,
+    timeline_bounds_est,
+)
+from stable_finance.dataset.datasets.market1t.views import sparse_to_dense_grid
+
+
+# ── ingest ───────────────────────────────────────────────────────────────────
+
+FEATURE_COLUMNS = list(MARKET_SCHEMA.columns)
+
+TARGET_COLUMNS = ["ticker", "ts_interval"] + FEATURE_COLUMNS
+
+# Buffer flush threshold: number of partitions to accumulate before shuffling and writing
+BUFFER_FLUSH_PARTITIONS = 200
+
+DEFAULT_METADATA_PATH = os.environ.get("METADATA_PATH")
+DEFAULT_RAW_DATA_DIR = os.environ.get("RAW_DATA_DIR")
+DEFAULT_MOSAIC_DIR = os.environ.get("MOSAIC_DIR", None)
+DEFAULT_RISK_FACTOR_DIR = os.environ.get("RISK_FACTOR_DIR", None)
+
+
+def discover_trading_days(base_path: Path, start: str, end: str) -> list[tuple[str, Path]]:
+    """Find all trading day directories within a date range.
+
+    Args:
+        base_path: Root data path (e.g. .../1Hz)
+        start: Start month 'YYYY-MM' (inclusive)
+        end: End month 'YYYY-MM' (inclusive)
+
+    Returns:
+        List of (date_str, day_dir_path) sorted chronologically.
+    """
+    start_y, start_m = int(start[:4]), int(start[5:7])
+    end_y, end_m = int(end[:4]), int(end[5:7])
+
+    results = []
+    y, m = start_y, start_m
+    while (y, m) <= (end_y, end_m):
+        month_dir = base_path / str(y) / f"{m:02d}"
+        if month_dir.exists():
+            results.extend(
+                (d.stem, d) for d in sorted(month_dir.iterdir())
+            )
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return results
+
+
+def load_metadata_filter(
+    metadata_path: Path, start: str, end: str
+) -> dict[tuple[str, int], set[str]]:
+    """Load metadata.parquet and build a filter lookup.
+
+    Returns:
+        Dict mapping (date_str, partition_id) -> set of valid tickers.
+    """
+    df = pd.read_parquet(metadata_path, columns=["date", "ticker", "partition"])
+
+    # Filter to the requested date range (start/end are YYYY-MM strings)
+    start_date = datetime.date(int(start[:4]), int(start[5:7]), 1)
+    end_y, end_m = int(end[:4]), int(end[5:7])
+    end_date = datetime.date(end_y, end_m, monthrange(end_y, end_m)[1])
+
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    mask = (df["date"] >= start_date) & (df["date"] <= end_date)
+    df = df[mask]
+
+    lookup: dict[tuple[str, int], set[str]] = defaultdict(set)
+    for date, ticker, partition in zip(df["date"], df["ticker"], df["partition"]):
+        lookup[(str(date), int(partition))].add(ticker)
+    return dict(lookup)
+
+
+def get_period_key(date: datetime.date, cal_freq: str) -> tuple[int, str]:
+    """Return ``(year, MM)`` for a given date and frequency.
+
+    For ``"mnth"``: the date's own month.
+    For ``"qtr"``: the quarter-end month (03, 06, 09, 12).
+    """
+    if cal_freq == "mnth":
+        return (date.year, f"{date.month:02d}")
+    elif cal_freq == "qtr":
+        qtr_month = ((date.month - 1) // 3 + 1) * 3
+        return (date.year, f"{qtr_month:02d}")
+    raise ValueError(f"Unknown cal_freq: {cal_freq}")
+
+
+def enumerate_periods(start: str, end: str, cal_freq: str) -> list[tuple[int, str]]:
+    """Return ordered ``(year, MM)`` period keys for the given range.
+
+    Pure date arithmetic — no filesystem access.
+    """
+    start_y, start_m = int(start[:4]), int(start[5:7])
+    end_y, end_m = int(end[:4]), int(end[5:7])
+
+    keys: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    y, m = start_y, start_m
+    while (y, m) <= (end_y, end_m):
+        key = get_period_key(datetime.date(y, m, 1), cal_freq)
+        if key not in seen:
+            seen.add(key)
+            keys.append(key)
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return keys
+
+
+def _period_discovery_range(year: int, mm: str, cal_freq: str) -> tuple[str, str]:
+    """Return ``(start_YYYY-MM, end_YYYY-MM)`` for :func:`discover_trading_days`."""
+    if cal_freq == "mnth":
+        ym = f"{year}-{mm}"
+        return (ym, ym)
+    # qtr: quarter spans 3 months ending at mm
+    end_month = int(mm)
+    start_month = end_month - 2
+    return (f"{year}-{start_month:02d}", f"{year}-{mm}")
+
+
+def discover_and_convert_period(
+    base_path: Path,
+    out_base: Path,
+    period_key: tuple[int, str],
+    cal_freq: str,
+    ticker_filter: dict[tuple[str, int], set[str]] | None = None,
+    pbar_position: int = 0,
+    schedule: MarketSchedule | None = None,
+) -> tuple[int, int, int]:
+    """Discover trading days, scan partitions, and convert one period.
+
+    Returns:
+        ``(n_trading_days, n_partitions, n_observations)``
+    """
+    year, mm = period_key
+    disc_start, disc_end = _period_discovery_range(year, mm, cal_freq)
+    trading_days = discover_trading_days(base_path, disc_start, disc_end)
+
+    if schedule is not None:
+        trading_days = [(d, p) for d, p in trading_days if not schedule.is_closed(d)]
+
+    # Scan partitions for this period's trading days
+    entries: list[tuple[str, int, Path]] = []
+    for date_str, day_dir in trading_days:
+        for part_dir in sorted(day_dir.iterdir()):
+            partition_id = int(part_dir.name.split("=", 1)[1])
+            entries.append((date_str, partition_id, part_dir / "0.parquet"))
+    random.shuffle(entries)
+
+    n_obs = convert_period(out_base, period_key, entries, ticker_filter, pbar_position)
+    return (len(trading_days), len(entries), n_obs)
+
+
+def convert_period(
+    out_base: Path,
+    period_key: tuple[int, str],
+    entries: list[tuple[str, int, Path]],
+    ticker_filter: dict[tuple[str, int], set[str]] | None = None,
+    pbar_position: int = 0,
+) -> int:
+    """Convert one period of data to MDS format.
+
+    Each partition file is read, optionally filtered by metadata, grouped by
+    ticker, and each ticker group becomes one MDS observation with
+    variable-length ndarray columns.
+    """
+    if not entries:
+        return 0
+
+    year, mm = period_key
+    out_dir = out_base / str(year) / mm
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    total_obs = 0
+    buffer: list[dict] = []
+    partitions_in_buffer = 0
+    label = f"{year}/{mm}"
+
+    with MDSWriter(
+        out=str(out_dir),
+        columns=MDS_COLUMNS,
+        compression="zstd",
+        exist_ok=True,
+    ) as writer:
+        pbar = tqdm(
+            total=len(entries),
+            desc=label,
+            unit="part",
+            position=pbar_position,
+            leave=True,
+        )
+
+        for date_str, partition_id, path in entries:
+            if ticker_filter is not None:
+                valid_tickers = ticker_filter.get((date_str, partition_id), set())
+                if not valid_tickers:
+                    pbar.update(1)
+                    continue
+                df = pd.read_parquet(path, columns=TARGET_COLUMNS)
+                df = df[df["ticker"].isin(valid_tickers)]
+            else:
+                df = pd.read_parquet(path, columns=TARGET_COLUMNS)
+
+            for ticker, group in df.groupby("ticker", sort=False):
+                group = group.sort_values("ts_interval")
+
+                # Convert ts_interval from nanoseconds to seconds as int32
+                ts_sec = (group["ts_interval"].to_numpy() / 1e9).astype(np.int64)
+                assert ts_sec.max() <= np.iinfo(np.int32).max, (
+                    f"ts overflow: {ts_sec.max()} > {np.iinfo(np.int32).max} "
+                    f"for {ticker} on {date_str}"
+                )
+                ts_sec = ts_sec.astype(np.int32)
+
+                # Build features array (N, 9) as float32
+                features = group[FEATURE_COLUMNS].to_numpy().astype(np.float32)
+                assert not np.any(np.isinf(features)), (
+                    f"inf in features for {ticker} on {date_str}"
+                )
+
+                buffer.append({
+                    "ticker": str(ticker),
+                    "date": date_str,
+                    "ts_interval": ts_sec,
+                    "features": features,
+                })
+
+            partitions_in_buffer += 1
+            pbar.update(1)
+            pbar.set_postfix(obs=f"{total_obs:,}", buf=partitions_in_buffer)
+
+            if partitions_in_buffer >= BUFFER_FLUSH_PARTITIONS:
+                total_obs += flush_observations(buffer, writer)
+                pbar.set_postfix(obs=f"{total_obs:,}")
+                buffer = []
+                partitions_in_buffer = 0
+
+        # Flush remainder
+        if buffer:
+            total_obs += flush_observations(buffer, writer)
+            pbar.set_postfix(obs=f"{total_obs:,}", flush="final")
+
+        pbar.close()
+
+    return total_obs
+
+
+# ---------------------------------------------------------------------------
+# Risk factor extraction
+# ---------------------------------------------------------------------------
+
+# Column indices for fill logic (same as streaming_dataset.py)
+_FFILL_INDICES = MARKET_SCHEMA.forward_fill_indices
+_ZEROFILL_INDICES = MARKET_SCHEMA.zero_fill_indices
+
+
+def discover_ticker_partitions(
+    day_dir: Path, tickers: list[str]
+) -> dict[str, int]:
+    """Scan partitions of one day to find which partition holds each ticker.
+
+    Returns:
+        {ticker: partition_id}. Raises if any ticker not found.
+    """
+    remaining = set(tickers)
+    result: dict[str, int] = {}
+
+    for part_dir in day_dir.iterdir():
+        if not remaining:
+            break
+        if not part_dir.is_dir() or not part_dir.name.startswith("partition="):
+            continue
+        parquet_file = part_dir / "0.parquet"
+        if not parquet_file.exists():
+            continue
+        partition_id = int(part_dir.name.split("=", 1)[1])
+        df = pd.read_parquet(parquet_file, columns=["ticker"])
+        found = remaining & set(df["ticker"].unique())
+        for t in found:
+            result[t] = partition_id
+        remaining -= found
+
+    if remaining:
+        raise ValueError(
+            f"Tickers not found in {day_dir}: {remaining}. "
+            f"Available partitions were scanned but these tickers are missing."
+        )
+    return result
+
+
+def convert_risk_factors(
+    base_path: Path, out_dir: Path, tickers: list[str],
+    start: str, end: str,
+) -> None:
+    """Extract risk factor data as dense 1Hz numpy arrays.
+
+    For each ticker, produces:
+        {out_dir}/{ticker}/features.npy  — (n_dates, 23400, 9) float32
+        {out_dir}/{ticker}/meta.json     — ordered dates, shape, column names
+    """
+    trading_days = discover_trading_days(base_path, start, end)
+    if not trading_days:
+        raise ValueError(f"No trading days found in {base_path} for {start}–{end}")
+
+    print(f"Risk factor extraction: {len(trading_days)} trading days, tickers={tickers}")
+
+    # Discover partitions from the LAST (most recent) trading day
+    last_date_str, last_day_dir = trading_days[-1]
+    print(f"Discovering partitions from {last_date_str}...")
+    ticker_partitions = discover_ticker_partitions(last_day_dir, tickers)
+    for t, p in ticker_partitions.items():
+        print(f"  {t} → partition={p}")
+
+    # Pre-compute grid size from any date
+    ts_open, ts_close = timeline_bounds_est(trading_days[0][0])
+    grid_size = ts_close - ts_open  # 23400 for standard 6.5h trading day
+
+    # Extract each ticker
+    for ticker in tickers:
+        partition_id = ticker_partitions[ticker]
+        ticker_dir = out_dir / ticker
+        ticker_dir.mkdir(parents=True, exist_ok=True)
+
+        dates: list[str] = []
+        day_arrays: list[np.ndarray] = []
+
+        for date_str, day_dir in tqdm(trading_days, desc=f"Extracting {ticker}"):
+            parquet_file = day_dir / f"partition={partition_id}" / "0.parquet"
+            if not parquet_file.exists():
+                print(f"  WARNING: {parquet_file} missing, skipping {date_str}")
+                continue
+
+            df = pd.read_parquet(parquet_file, columns=TARGET_COLUMNS)
+            df = df[df["ticker"] == ticker]
+
+            if df.empty:
+                print(f"  WARNING: {ticker} not found in partition={partition_id} on {date_str}")
+                continue
+
+            df = df.sort_values("ts_interval")
+
+            # Convert ts_interval from nanoseconds to seconds
+            ts_sec = (df["ts_interval"].to_numpy() / 1e9).astype(np.int64)
+            assert ts_sec.max() <= np.iinfo(np.int32).max
+            ts_sec = ts_sec.astype(np.int32)
+
+            features = df[FEATURE_COLUMNS].to_numpy().astype(np.float32)
+
+            ts_open_sec, ts_close_sec = timeline_bounds_est(date_str)
+            result = sparse_to_dense_grid(
+                ts_sec=ts_sec,
+                features=features,
+                ts_open_sec=ts_open_sec,
+                ts_close_sec=ts_close_sec,
+                ffill_indices=_FFILL_INDICES,
+                zerofill_indices=_ZEROFILL_INDICES,
+                trim_leading_nan=False,  # Keep full grid for alignment
+            )
+
+            if result is None:
+                print(f"  WARNING: all-NaN for {ticker} on {date_str}")
+                continue
+
+            _, dense = result
+            assert dense.shape == (grid_size, len(FEATURE_COLUMNS)), (
+                f"Shape mismatch: {dense.shape} != ({grid_size}, {len(FEATURE_COLUMNS)}) "
+                f"for {ticker} on {date_str}"
+            )
+
+            n_nan = np.isnan(dense).any(axis=1).sum()
+            if n_nan > 0:
+                print(f"  WARNING: {n_nan} NaN rows remain for {ticker} on {date_str}")
+                np.nan_to_num(dense, copy=False, nan=0.0)
+
+            dates.append(date_str)
+            day_arrays.append(dense.astype(np.float32))
+
+        if not day_arrays:
+            raise ValueError(f"No valid data extracted for {ticker}")
+
+        # Stack to (n_dates, grid_size, n_features) and save
+        stacked = np.stack(day_arrays, axis=0)
+        npy_path = ticker_dir / "features.npy"
+        np.save(npy_path, stacked)
+
+        meta = {
+            "dates": dates,
+            "shape": list(stacked.shape),
+            "feature_columns": FEATURE_COLUMNS,
+        }
+        with open(ticker_dir / "meta.json", "w") as f:
+            json.dump(meta, f, indent=2)
+
+        print(f"  {ticker}: {stacked.shape} saved to {ticker_dir}")
+
+
+def main(argv=None, *, default_base_path=None, default_metadata_path=None,
+         default_output=None, default_risk_factor_dir=None):
+    parser = argparse.ArgumentParser(
+        description="Convert polygon snapshot data to MosaicML Streaming format."
+    )
+    parser.add_argument(
+        "--start",
+        required=True,
+        help="Start month inclusive (YYYY-MM), e.g. 2023-01",
+    )
+    parser.add_argument(
+        "--end",
+        required=True,
+        help="End month inclusive (YYYY-MM), e.g. 2023-04",
+    )
+    parser.add_argument(
+        "--base-path",
+        default=default_base_path or DEFAULT_RAW_DATA_DIR,
+        required=not (default_base_path or DEFAULT_RAW_DATA_DIR),
+        help="Base path to Polygon snapshot data",
+    )
+    parser.add_argument(
+        "--n-writers",
+        type=int,
+        default=os.cpu_count(),
+        help="Number of periods to process in parallel (default: all cores)",
+    )
+    parser.add_argument(
+        "--metadata",
+        nargs="?",
+        const=default_metadata_path or DEFAULT_METADATA_PATH,
+        default=None,
+        help="Path to metadata.parquet for filtering. Flag without value uses default. Omit to disable filtering.",
+    )
+    parser.add_argument(
+        "--cal-freq",
+        choices=["mnth", "qtr"],
+        default="mnth",
+        help="Output grouping frequency (default: mnth).",
+    )
+    parser.add_argument(
+        "--risk-factors",
+        nargs="+",
+        default=None,
+        metavar="TICKER",
+        help="Extract risk factor data instead of MDS conversion. "
+             "Provide one or more tickers (e.g. IWM SPY).",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Override output directory (default: derived from base-path).",
+    )
+    parser.add_argument(
+        "--holiday-csv",
+        default=os.environ.get("HOLIDAY_CSV"),
+        help="Path to market_holidays.csv ($HOLIDAY_CSV). Closed days will be excluded from MDS conversion.",
+    )
+    args = parser.parse_args(argv)
+
+    base_path = Path(args.base_path)
+
+    # Risk factor extraction mode
+    if args.risk_factors:
+        rf_out = Path(args.output) if args.output else (
+            Path(default_risk_factor_dir or DEFAULT_RISK_FACTOR_DIR)
+            if (default_risk_factor_dir or DEFAULT_RISK_FACTOR_DIR)
+            else base_path.parent / (base_path.name + "_risk_factors")
+        )
+        print("Risk factor extraction mode")
+        print(f"Input:  {base_path}")
+        print(f"Output: {rf_out}")
+        convert_risk_factors(base_path, rf_out, args.risk_factors, args.start, args.end)
+        print("\nRisk factor extraction done.")
+        return
+
+    out_base = Path(args.output) if args.output else (
+        Path(default_output or DEFAULT_MOSAIC_DIR)
+        if (default_output or DEFAULT_MOSAIC_DIR)
+        else base_path.parent / (base_path.name + "_mosaic_" + args.cal_freq)
+    )
+
+    schedule = MarketSchedule(args.holiday_csv) if args.holiday_csv else None
+
+    # Load metadata filter if requested
+    ticker_filter = None
+    if args.metadata is not None:
+        metadata_path = Path(args.metadata)
+        print(f"Loading metadata filter from {metadata_path}")
+        ticker_filter = load_metadata_filter(metadata_path, args.start, args.end)
+        print(f"  {len(ticker_filter)} (date, partition) pairs in filter")
+
+    # Enumerate periods (instant — pure date arithmetic, no I/O)
+    period_keys = enumerate_periods(args.start, args.end, args.cal_freq)
+
+    print(f"Converting {args.start} to {args.end} (freq={args.cal_freq})")
+    print(f"Input:  {base_path}")
+    print(f"Output: {out_base}")
+    print(f"Metadata filter: {'enabled' if ticker_filter is not None else 'disabled'}")
+    print(f"Periods: {len(period_keys)}")
+    print(f"Parallel writers: {args.n_writers}")
+    print(f"Buffer flush every {BUFFER_FLUSH_PARTITIONS} partitions (~20K observations)")
+    for year, mm in period_keys:
+        print(f"  {year}/{mm}")
+    print()
+
+    # Each worker discovers its own trading days, scans partitions, and converts.
+    if args.n_writers == 1:
+        for period_key in period_keys:
+            n_days, n_parts, n_obs = discover_and_convert_period(
+                base_path, out_base, period_key, args.cal_freq, ticker_filter,
+                pbar_position=0, schedule=schedule,
+            )
+            label = f"{period_key[0]}/{period_key[1]}"
+            tqdm.write(f"{label} complete: {n_days} days, {n_parts:,} partitions, {n_obs:,} observations")
+    else:
+        with ProcessPoolExecutor(max_workers=args.n_writers) as pool:
+            futures = {}
+            for i, period_key in enumerate(period_keys):
+                fut = pool.submit(
+                    discover_and_convert_period,
+                    base_path, out_base, period_key, args.cal_freq, ticker_filter, i,
+                    schedule,
+                )
+                futures[fut] = period_key
+
+            for fut in as_completed(futures):
+                period_key = futures[fut]
+                label = f"{period_key[0]}/{period_key[1]}"
+                try:
+                    n_days, n_parts, n_obs = fut.result()
+                    tqdm.write(f"{label} complete: {n_days} days, {n_parts:,} partitions, {n_obs:,} observations")
+                except Exception as e:
+                    tqdm.write(f"{label} FAILED: {e}")
+
+    print("\nAll done.")
+
+
+# ── monthly driver ───────────────────────────────────────────────────────────
+
+def discover_months(raw_root: Path, start: str | None, end: str | None) -> list[str]:
+    months = []
+    for year_dir in sorted(raw_root.glob("[0-9][0-9][0-9][0-9]")):
+        for month_dir in sorted(year_dir.glob("[0-9][0-9]")):
+            if not month_dir.is_dir():
+                continue
+            ym = f"{year_dir.name}-{month_dir.name}"
+            if start and ym < start:
+                continue
+            if end and ym > end:
+                continue
+            months.append(ym)
+    return months
+
+
+def already_sharded(mosaic_dir: Path, ym: str) -> bool:
+    out = mosaic_dir / ym[:4] / ym[5:7]
+    return out.is_dir() and any(out.iterdir())
+
+
+def shard_command(ym: str, raw_root: Path, mosaic_dir: Path, metadata: str | None,
+                  holiday_csv: str | None) -> list[str]:
+    cmd = [sys.executable, "-m", "stable_finance.dataset.datasets.market1t.ingest",
+           "--start", ym, "--end", ym, "--base-path", str(raw_root),
+           "--output", str(mosaic_dir), "--cal-freq", "mnth", "--n-writers", "1"]
+    if metadata:
+        cmd += ["--metadata", metadata]
+    if holiday_csv:
+        cmd += ["--holiday-csv", holiday_csv]
+    return cmd
+
+
+def run(months: list[str], *, raw_root: Path, mosaic_dir: Path, log_dir: Path,
+        metadata: str | None, holiday_csv: str | None, group_size: int,
+        force: bool, log=print) -> list[str]:
+    """Shard ``months`` in groups; returns the months that failed."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    mosaic_dir.mkdir(parents=True, exist_ok=True)
+    pending = [ym for ym in months if force or not already_sharded(mosaic_dir, ym)]
+    skipped = [ym for ym in months if ym not in pending]
+    if skipped:
+        log(f"Skipping {len(skipped)} already-sharded months: {' '.join(skipped)}")
+    if not pending:
+        log(f"Nothing to do -- all {len(months)} months already present in {mosaic_dir}.")
+        return []
+    log(f"Sharding {len(pending)} months in groups of {group_size}. Logs: {log_dir}")
+    failed: list[str] = []
+    for i in range(0, len(pending), group_size):
+        group = pending[i:i + group_size]
+        log(f"=== Group {i // group_size + 1}: {' '.join(group)} ===")
+        procs = []
+        for ym in group:
+            logf = open(log_dir / f"{ym}.log", "w")
+            procs.append((ym, logf, subprocess.Popen(
+                shard_command(ym, raw_root, mosaic_dir, metadata, holiday_csv),
+                stdout=logf, stderr=subprocess.STDOUT)))
+        for ym, logf, proc in procs:
+            rc = proc.wait()
+            logf.close()
+            if rc == 0:
+                log(f"  [{ym}] OK")
+            else:
+                log(f"  [{ym}] FAILED (exit {rc}, see {log_dir / (ym + '.log')})")
+                failed.append(ym)
+    if failed:
+        log(f"Completed with {len(failed)} failures: {' '.join(failed)}")
+    else:
+        log(f"All {len(pending)} months sharded successfully.")
+    return failed
+
+
+def shard_main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("months", nargs="*", help="YYYY-MM ...; default: discover under --raw-dir")
+    p.add_argument("--raw-dir", default=os.environ.get("RAW_DATA_DIR"),
+                   required=not os.environ.get("RAW_DATA_DIR"))
+    p.add_argument("--mosaic-dir", default=os.environ.get("MOSAIC_DIR"),
+                   required=not os.environ.get("MOSAIC_DIR"))
+    p.add_argument("--metadata", default=os.environ.get("METADATA_PATH"))
+    p.add_argument("--holiday-csv", default=os.environ.get("HOLIDAY_CSV"))
+    p.add_argument("--log-dir", default=None, help="default: <mosaic-dir>/.shard_logs")
+    p.add_argument("--start", default=None)
+    p.add_argument("--end", default=None)
+    p.add_argument("--group-size", type=int, default=int(os.environ.get("GROUP_SIZE", "8")))
+    p.add_argument("--force", action="store_true")
+    args = p.parse_args(argv)
+    raw_root, mosaic_dir = Path(args.raw_dir), Path(args.mosaic_dir)
+    months = list(args.months) or discover_months(raw_root, args.start, args.end)
+    if not months:
+        raise SystemExit(f"No months to shard under {raw_root}.")
+    failed = run(months, raw_root=raw_root, mosaic_dir=mosaic_dir,
+                 log_dir=Path(args.log_dir) if args.log_dir else mosaic_dir / ".shard_logs",
+                 metadata=args.metadata, holiday_csv=args.holiday_csv,
+                 group_size=args.group_size, force=args.force)
+    return 1 if failed else 0
+
+
+# ── industry map ─────────────────────────────────────────────────────────────
+
+FIRST_MONTH = "2007-01"
+LAST_MONTH = "2024-12"
+
+
+def load_ff49_ranges(siccodes: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Parse Siccodes49.txt -> (lo, hi, ff49) arrays of SIC ranges.
+
+    Industry headers look like ``" 1 Agric  Agriculture"``; range lines are
+    indented ``"    0100-0199 Agricultural production - crops"``.
+    """
+    lo, hi, ff = [], [], []
+    current = None
+    for line in Path(siccodes).read_text().splitlines():
+        rng = re.match(r"\s+(\d{4})-(\d{4})", line)
+        if rng:
+            if current is None:
+                raise ValueError(f"SIC range before any industry header: {line!r}")
+            lo.append(int(rng.group(1)))
+            hi.append(int(rng.group(2)))
+            ff.append(current)
+            continue
+        head = re.match(r"\s*(\d{1,2})\s+\S+\s+\S", line)
+        if head:
+            current = int(head.group(1))
+    return np.array(lo), np.array(hi), np.array(ff)
+
+
+def sic_to_ff49(sic: np.ndarray, lo, hi, ff) -> np.ndarray:
+    """Map 4-digit SIC codes to FF49; NaN where no range matches."""
+    out = np.full(len(sic), np.nan)
+    codes = np.asarray(sic).astype(int)
+    hits = (codes[:, None] >= lo[None, :]) & (codes[:, None] <= hi[None, :])
+    matched = hits.any(1)
+    out[matched] = ff[hits.argmax(1)][matched]
+    return out
+
+
+def month_range(first: str, last: str) -> list[str]:
+    import pandas as pd
+
+    idx = pd.period_range(first, last, freq="M")
+    return [f"{p.year}-{p.month:02d}" for p in idx]
+
+
+def build_industry_map(funda_path, siccodes_path, gvkey_link_path, *,
+                       first_month: str = FIRST_MONTH, last_month: str = LAST_MONTH,
+                       log=print):
+    """Return the (month, ticker, ff49) DataFrame."""
+    import pandas as pd
+
+    lo, hi, ff = load_ff49_ranges(siccodes_path)
+    log(f"FF49 definition: {len(lo)} SIC ranges over {len(set(ff))} industries")
+
+    funda = pd.read_csv(funda_path, dtype={"gvkey": str})
+    funda = funda.dropna(subset=["sich"])
+    funda["gvkey"] = funda.gvkey.astype(int)
+    funda["datadate"] = pd.to_datetime(funda.datadate)
+    funda["ff49"] = sic_to_ff49(funda.sich.values, lo, hi, ff)
+    unmatched = int(funda.ff49.isna().sum())
+    log(f"funda: {len(funda)} rows with sich, {funda.gvkey.nunique()} gvkeys; "
+        f"{unmatched} ({unmatched / max(1, len(funda)):.2%}) match no FF49 range -> dropped")
+    funda = funda.dropna(subset=["ff49"]).sort_values("datadate")
+
+    gv = funda.gvkey.values
+    ff49_v = funda.ff49.values.astype(np.int16)
+    dates = funda.datadate.values
+    # Earliest label per gvkey, used to back-fill months preceding a firm's
+    # first fiscal-year observation.
+    gv_first = dict(zip(funda.gvkey.values[::-1], ff49_v[::-1]))
+
+    link = pd.read_parquet(gvkey_link_path)
+    l_start = link.valid_start_date.values
+    l_end = link.valid_end_date.values
+    l_tick = link.ticker.values
+    l_gv = link.gvkey.values
+
+    months = month_range(first_month, last_month)
+    log(f"building {len(months)} months: {months[0]} .. {months[-1]}")
+
+    # Walk months forward, folding in each fiscal-year observation as its
+    # datadate is passed. gv_latest holds the point-in-time label.
+    gv_latest: dict[int, int] = {}
+    ptr = 0
+    frames = []
+    n_backfilled = 0
+    for ym in months:
+        m_start = np.datetime64(f"{ym}-01")
+        m_end = (pd.Timestamp(f"{ym}-01") + pd.DateOffset(months=1)
+                 - pd.Timedelta(days=1)).to_datetime64()
+        while ptr < len(dates) and dates[ptr] <= m_end:
+            gv_latest[int(gv[ptr])] = int(ff49_v[ptr])
+            ptr += 1
+        alive = (l_start <= m_end) & (l_end >= m_start)
+        df = pd.DataFrame({"ticker": l_tick[alive], "gvkey": l_gv[alive]})
+        # Longest-overlap wins for mid-month ticker handoffs.
+        df["overlap"] = np.minimum(l_end[alive], m_end) - np.maximum(l_start[alive], m_start)
+        df = df.sort_values("overlap", ascending=False).drop_duplicates("ticker")
+        lab = df.gvkey.map(gv_latest)
+        back = lab.isna() & df.gvkey.isin(gv_first)
+        n_backfilled += int(back.sum())
+        lab = lab.fillna(df.gvkey.map(gv_first))
+        df = df[lab.notna()]
+        df["ff49"] = lab[lab.notna()].astype(int)
+        df["month"] = ym
+        frames.append(df[["month", "ticker", "ff49"]])
+
+    out = pd.concat(frames, ignore_index=True)
+    out["ff49"] = out.ff49.astype("int16")
+    log(f"  back-filled rows (pre-first-observation): {n_backfilled}")
+    return out
+
+
+def industry_main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--funda", default=os.environ.get("COMPUSTAT_FUNDA"),
+                   required=not os.environ.get("COMPUSTAT_FUNDA"))
+    p.add_argument("--siccodes", default=os.environ.get("FF49_SICCODES"),
+                   required=not os.environ.get("FF49_SICCODES"))
+    p.add_argument("--gvkey-link", default=os.environ.get("GVKEY_LINK"),
+                   required=not os.environ.get("GVKEY_LINK"))
+    p.add_argument("--out", default=os.environ.get("INDUSTRY_MAP"),
+                   required=not os.environ.get("INDUSTRY_MAP"))
+    p.add_argument("--first-month", default=FIRST_MONTH)
+    p.add_argument("--last-month", default=LAST_MONTH)
+    args = p.parse_args(argv)
+    out = build_industry_map(args.funda, args.siccodes, args.gvkey_link,
+                             first_month=args.first_month, last_month=args.last_month)
+    path = Path(args.out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(path, index=False, compression="zstd")
+    per_month = out.groupby("month").size()
+    print(f"wrote {len(out)} rows over {out.month.nunique()} months -> {path}\n"
+          f"  tickers/month min/med/max = "
+          f"{per_month.min()}/{int(per_month.median())}/{per_month.max()}\n"
+          f"  file size = {path.stat().st_size / 1048576:.1f} MB")
+    return 0
+
+
+if __name__ == "__main__":
+    main()

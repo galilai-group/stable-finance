@@ -1,0 +1,410 @@
+"""Probes that turn model embeddings into return forecasts.
+
+:class:`RidgeProbe` and :class:`ColumnwiseRidge` fit in memory.
+:class:`StreamingRidge` fits the same ridge from accumulated moments,
+for a pool too big to hold.
+
+A ridge on d features needs only the second moments of the data, never the
+data: ``X'X`` is d x d whatever the row count, so a fit pool of millions of
+rows can be consumed one shard at a time in megabytes. That is the difference
+between subsampling a pool and using it.
+
+THE STREAMING FIT IS EXACT, NOT APPROXIMATE. It solves the same normal
+equations :class:`ColumnwiseRidge` solves and agrees with it to floating-point
+precision -- there is a test that asserts exactly that. The only thing it
+gives up is a second pass over the rows, which is why prediction
+requires the caller to hand the rows back.
+
+    probe = StreamingRidge(alpha=10.0)
+    for shard in shards:                       # never all in memory at once
+        probe.partial_fit(shard["X"], shard["y"])
+    probe.finalize()
+    forecast = probe.predict(eval_X)
+
+Numerically this is the textbook trade: forming ``X'X`` squares the condition
+number relative to a QR on the raw matrix. It is the right call here anyway --
+the features are standardized before the solve, the ridge penalty floors the
+spectrum, and float64 accumulation over a few million rows of order-one
+numbers leaves far more precision than the fourth decimal an IC is read at.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Hashable, Sequence
+from typing import Protocol
+
+import numpy as np
+from numpy.typing import ArrayLike, NDArray
+from sklearn.base import BaseEstimator
+from sklearn.exceptions import NotFittedError
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+
+from stable_finance.evaluation.embeddings.contract import (
+    Embeddings,
+    require_same_observations,
+)
+from stable_finance.evaluation.returns.contract import ForwardReturns
+
+
+class ProbeData(Protocol):
+    """Model-specific provider used by :meth:`RidgeProbe.fit_period`.
+
+    A period is whatever key the dataset splits on: a month, a fold, a date
+    range. The library never looks inside it.
+    """
+
+    def embeddings(self, period: Hashable) -> Embeddings: ...
+
+    def forward_returns(self, period: Hashable) -> ForwardReturns: ...
+
+
+#: The earlier name, from when every split was a Market-1T month.
+MonthlyProbeData = ProbeData
+
+
+class ColumnwiseRidge(BaseEstimator):
+    """Standardize a 2-D embedding matrix and fit one ridge per target.
+
+    This sklearn-style estimator is the low-level injection point for cached
+    or irregular panels. Missing labels are filtered independently per target;
+    missing embedding rows remain NaN at prediction time.
+    """
+
+    def __init__(self, alpha: float | Sequence[float] = 1.0, *,
+                 min_samples: int = 20) -> None:
+        self.alpha = alpha
+        self.min_samples = min_samples
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "ColumnwiseRidge":
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        if X.ndim != 2 or y.ndim != 2 or len(X) != len(y):
+            raise ValueError("X and y must be 2-D arrays with equal row counts")
+        if self.min_samples < 2:
+            raise ValueError("min_samples must be at least 2")
+        usable = np.isfinite(X).all(axis=1)
+        if usable.sum() < self.min_samples:
+            raise ValueError("not enough rows with finite embeddings")
+        alphas = RidgeProbe(self.alpha, min_samples=self.min_samples)._alphas(y.shape[1])
+        scaler = StandardScaler().fit(X[usable])
+        scaled = scaler.transform(X[usable])
+        usable_rows = np.flatnonzero(usable)
+        models = []
+        for column, alpha in enumerate(alphas):
+            labelled = np.isfinite(y[usable_rows, column])
+            if labelled.sum() < self.min_samples:
+                raise ValueError(
+                    f"target {column} has {int(labelled.sum())} usable rows; "
+                    f"need at least {self.min_samples}"
+                )
+            models.append(Ridge(alpha=float(alpha)).fit(scaled[labelled], y[usable_rows[labelled], column]))
+        self.scaler_ = scaler
+        self.models_ = tuple(models)
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if not hasattr(self, "models_"):
+            raise NotFittedError("fit the ColumnwiseRidge before calling predict")
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim != 2 or X.shape[1] != self.n_features_in_:
+            raise ValueError(f"X must have shape (n_rows, {self.n_features_in_})")
+        usable = np.isfinite(X).all(axis=1)
+        predictions = np.full((len(X), len(self.models_)), np.nan)
+        if usable.any():
+            scaled = self.scaler_.transform(X[usable])
+            predictions[usable] = np.column_stack([
+                model.predict(scaled) for model in self.models_
+            ])
+        return predictions
+
+
+class RidgeProbe(BaseEstimator):
+    """One standardized ridge regression per forward-return horizon.
+
+    This preserves the originating market-jepa recipe: fit one
+    :class:`StandardScaler` across embedding rows, then independently fit a
+    ridge for each target column after removing that column's missing labels.
+    A scalar ``alpha`` applies to every horizon; a sequence configures one
+    penalty per horizon.
+    """
+
+    def __init__(self, alpha: float | Sequence[float] = 1.0, *,
+                 min_samples: int = 20) -> None:
+        self.alpha = alpha
+        self.min_samples = min_samples
+
+    def _alphas(self, n_horizons: int) -> np.ndarray:
+        values = np.asarray(self.alpha, dtype=np.float64)
+        if values.ndim == 0:
+            values = np.repeat(values.item(), n_horizons)
+        if values.shape != (n_horizons,):
+            raise ValueError(
+                f"alpha must be a scalar or have length {n_horizons}, "
+                f"got shape {values.shape}"
+            )
+        if np.any(~np.isfinite(values)) or np.any(values < 0):
+            raise ValueError("alpha values must be finite and non-negative")
+        return values
+
+    def fit(self, embeddings: Embeddings, targets: ForwardReturns) -> "RidgeProbe":
+        """Fit the scaler and horizon-specific regressions."""
+        if self.min_samples < 2:
+            raise ValueError("min_samples must be at least 2")
+        require_same_observations(embeddings, targets)
+        n_features = embeddings.values.shape[2]
+        X = embeddings.values.reshape(-1, n_features)
+        y = targets.values.reshape(-1, len(targets.horizons))
+        usable_features = np.isfinite(X).all(axis=1)
+        if usable_features.sum() < self.min_samples:
+            raise ValueError(
+                "not enough rows with finite embeddings: "
+                f"need {self.min_samples}, got {usable_features.sum()}"
+            )
+
+        scaler = StandardScaler().fit(X[usable_features])
+        scaled = scaler.transform(X[usable_features])
+        usable_rows = np.flatnonzero(usable_features)
+        models: list[Ridge] = []
+        alphas = self._alphas(len(targets.horizons))
+        for horizon, alpha in enumerate(alphas):
+            finite_target = np.isfinite(y[usable_rows, horizon])
+            count = int(finite_target.sum())
+            if count < self.min_samples:
+                raise ValueError(
+                    f"horizon {targets.horizons[horizon]!r} has {count} usable "
+                    f"rows; need at least {self.min_samples}"
+                )
+            models.append(
+                Ridge(alpha=float(alpha)).fit(
+                    scaled[finite_target], y[usable_rows[finite_target], horizon]
+                )
+            )
+
+        self.scaler_ = scaler
+        self.models_ = tuple(models)
+        self.horizons_ = targets.horizons.copy()
+        self.n_features_in_ = n_features
+        return self
+
+    def fit_period(self, period: Hashable, source: ProbeData) -> "RidgeProbe":
+        """Load one fit period through a model-specific provider and fit.
+
+        Stable-finance owns what a return panel means; the provider owns how a
+        particular model produces embeddings, and what a period is. This keeps
+        checkpoint loading out of the evaluation library while giving
+        orchestration code a period-level API.
+        """
+        self.fit(source.embeddings(period), source.forward_returns(period))
+        self.fit_period_ = period
+        return self
+
+    #: The earlier name, from when every split was a Market-1T month.
+    fit_month = fit_period
+
+    def predict(self, embeddings: Embeddings) -> ForwardReturns:
+        """Predict every fitted horizon, preserving the input observation grid."""
+        if not hasattr(self, "models_"):
+            raise NotFittedError("fit the RidgeProbe before calling predict")
+        if embeddings.values.shape[2] != self.n_features_in_:
+            raise ValueError(
+                f"expected {self.n_features_in_} embedding features, "
+                f"got {embeddings.values.shape[2]}"
+            )
+
+        shape = embeddings.values.shape[:2]
+        X = embeddings.values.reshape(-1, self.n_features_in_)
+        usable = np.isfinite(X).all(axis=1)
+        predictions = np.full((len(X), len(self.models_)), np.nan)
+        if usable.any():
+            scaled = self.scaler_.transform(X[usable])
+            for horizon, model in enumerate(self.models_):
+                predictions[usable, horizon] = model.predict(scaled)
+        return ForwardReturns(
+            predictions.reshape(*shape, len(self.models_)),
+            embeddings.decisions,
+            embeddings.assets,
+            self.horizons_,
+        )
+
+
+def fit(
+    embeddings: Embeddings,
+    targets: ForwardReturns,
+    *,
+    alpha: float | Sequence[float] = 1.0,
+    min_samples: int = 20,
+) -> RidgeProbe:
+    """Fit the default embeddings-to-forecast adapter.
+
+    This is the concise entry point for users entering the pipeline with
+    embeddings. It intentionally performs no target transformation: raw
+    returns, cross-sectional z-scores, or another target are fit exactly as
+    supplied. Instantiate :class:`RidgeProbe` directly when composing through
+    scikit-learn estimator tooling.
+    """
+    return RidgeProbe(alpha=alpha, min_samples=min_samples).fit(embeddings, targets)
+
+#: The embedding-to-forecast stage reads no market columns; its target was
+#: formed from whatever price the dataset supports (``dataset.schema``).
+fit.requires = ()
+
+
+class StreamingRidge(BaseEstimator):
+    """Standardize and ridge-regress targets, accumulating moments only.
+
+    Mirrors :class:`~stable_finance.evaluation.returns.probes.ColumnwiseRidge`, including how it
+    handles missing values: the standardizer is estimated over every row with
+    a finite feature vector, and each regression over the subset of those
+    whose own label is also finite.
+
+    ``y`` may be a single target or a ``(n_rows, n_targets)`` block. The block
+    form exists because the costly moment is ``X'X`` and a pool streamed once
+    can fill several targets' moments on the way past -- fitting six forecast
+    horizons off one pass rather than six. Targets do NOT share a gram: a long
+    horizon runs off the end of the session and is missing on rows a short one
+    keeps, so each target accumulates over its own labelled subset and the
+    result is identical to fitting it alone. ``alpha`` is a scalar applied to
+    every target, or one value per target.
+    """
+
+    def __init__(self, alpha: float | ArrayLike = 1.0, *,
+                 min_samples: int = 20) -> None:
+        self.alpha = alpha
+        self.min_samples = min_samples
+
+    def _start(self, n_features: int, n_targets: int) -> None:
+        self.n_features_in_ = n_features
+        self.n_targets_in_ = n_targets
+        # Scaler moments: every row with a finite feature vector. Shared,
+        # because standardization does not depend on any label.
+        self._scaler_count = 0
+        self._scaler_sum = np.zeros(n_features)
+        self._scaler_square = np.zeros(n_features)
+        # Regression moments: each target's own labelled subset.
+        self._count = np.zeros(n_targets, dtype=np.int64)
+        self._gram = np.zeros((n_targets, n_features, n_features))
+        self._feature_sum = np.zeros((n_targets, n_features))
+        self._cross = np.zeros((n_targets, n_features))
+        self._label_sum = np.zeros(n_targets)
+
+    def partial_fit(self, X: ArrayLike, y: ArrayLike) -> "StreamingRidge":
+        """Fold one block of rows into the accumulated moments."""
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        single = y.ndim == 1
+        if single:
+            y = y[:, None]
+        if X.ndim != 2 or y.ndim != 2 or len(X) != len(y):
+            raise ValueError("X must be 2-D with one row of labels per row")
+        if not hasattr(self, "n_features_in_"):
+            self._start(X.shape[1], y.shape[1])
+            self._single_target = single
+        elif X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X must have {self.n_features_in_} features, got {X.shape[1]}"
+            )
+        elif y.shape[1] != self.n_targets_in_:
+            raise ValueError(
+                f"y must have {self.n_targets_in_} targets, got {y.shape[1]}"
+            )
+        if hasattr(self, "coefficients_"):
+            raise RuntimeError("this StreamingRidge is already finalized")
+
+        usable = np.isfinite(X).all(axis=1)
+        if usable.any():
+            block = X[usable]
+            self._scaler_count += len(block)
+            self._scaler_sum += block.sum(axis=0)
+            self._scaler_square += np.einsum("ij,ij->j", block, block)
+            rows = y[usable]
+            for target in range(self.n_targets_in_):
+                labelled = np.isfinite(rows[:, target])
+                if not labelled.any():
+                    continue
+                fit_block = block[labelled]
+                labels = rows[labelled, target]
+                self._count[target] += len(fit_block)
+                self._gram[target] += fit_block.T @ fit_block
+                self._feature_sum[target] += fit_block.sum(axis=0)
+                self._cross[target] += fit_block.T @ labels
+                self._label_sum[target] += float(labels.sum())
+        return self
+
+    def finalize(self) -> "StreamingRidge":
+        """Solve each target's ridge from the accumulated moments."""
+        if not hasattr(self, "n_features_in_"):
+            raise NotFittedError("call partial_fit before finalize")
+        short = np.flatnonzero(self._count < self.min_samples)
+        if len(short):
+            raise ValueError(
+                f"target {int(short[0])} has {int(self._count[short[0]])} "
+                f"labelled rows; need {self.min_samples}"
+            )
+        mean = self._scaler_sum / self._scaler_count
+        variance = self._scaler_square / self._scaler_count - mean ** 2
+        scale = np.sqrt(np.maximum(variance, 0.0))
+        # A constant feature has no scale; sklearn's StandardScaler leaves it
+        # at zero rather than dividing by zero, and so does this.
+        scale[scale <= 0] = 1.0
+
+        alphas = np.broadcast_to(
+            np.asarray(self.alpha, dtype=np.float64), (self.n_targets_in_,)
+        )
+        if not (np.isfinite(alphas).all() and (alphas >= 0).all()):
+            raise ValueError("alpha must be finite and non-negative")
+
+        coefficients = np.empty((self.n_targets_in_, self.n_features_in_))
+        intercepts = np.empty(self.n_targets_in_)
+        for target in range(self.n_targets_in_):
+            count = int(self._count[target])
+            # Second moments of the STANDARDIZED features on this target's
+            # labelled rows.
+            outer = np.outer(mean, self._feature_sum[target])
+            centred = (self._gram[target] - outer - outer.T
+                       + count * np.outer(mean, mean))
+            gram = centred / np.outer(scale, scale)
+            cross = (self._cross[target] - mean * self._label_sum[target]) / scale
+
+            # Ridge with an intercept centres both sides on the fitted rows, so
+            # the penalty never touches the intercept -- matching sklearn.
+            feature_mean = (self._feature_sum[target] / count - mean) / scale
+            label_mean = self._label_sum[target] / count
+            gram -= count * np.outer(feature_mean, feature_mean)
+            cross -= count * feature_mean * label_mean
+
+            gram.flat[:: self.n_features_in_ + 1] += float(alphas[target])
+            coefficients[target] = np.linalg.solve(gram, cross)
+            intercepts[target] = label_mean - float(feature_mean @ coefficients[target])
+
+        self.mean_, self.scale_ = mean, scale
+        self.n_samples_ = (int(self._count[0]) if self._single_target
+                           else self._count.astype(int).copy())
+        self.coefficients_ = (coefficients[0] if self._single_target
+                              else coefficients)
+        self.intercept_ = (float(intercepts[0]) if self._single_target
+                           else intercepts)
+        return self
+
+    def predict(self, X: ArrayLike) -> NDArray[np.float64]:
+        """Predict, leaving rows with a non-finite feature vector as NaN.
+
+        Shape follows what was fit: ``(n_rows,)`` for a single target,
+        ``(n_rows, n_targets)`` for a block.
+        """
+        if not hasattr(self, "coefficients_"):
+            raise NotFittedError("call finalize before predict")
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim != 2 or X.shape[1] != self.n_features_in_:
+            raise ValueError(f"X must have shape (n_rows, {self.n_features_in_})")
+        shape = (len(X),) if self._single_target else (len(X), self.n_targets_in_)
+        out = np.full(shape, np.nan)
+        usable = np.isfinite(X).all(axis=1)
+        if usable.any():
+            scaled = (X[usable] - self.mean_) / self.scale_
+            if self._single_target:
+                out[usable] = scaled @ self.coefficients_ + self.intercept_
+            else:
+                out[usable] = scaled @ self.coefficients_.T + self.intercept_
+        return out

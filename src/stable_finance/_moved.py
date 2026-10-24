@@ -1,0 +1,135 @@
+"""Old module paths, kept importable after the package was reorganized.
+
+Every module that moved is listed in :data:`MOVED` with where it went. An
+import of an old path returns the moved module itself, so existing code,
+pickles and ``mock.patch`` targets keep working, and ``python -m`` on an old
+path runs the moved module. A path whose module was split in two returns a
+merged view of both parts.
+
+New code should import from the new paths; this table is the whole cost of
+keeping the old ones, and nothing else in the package refers to them.
+"""
+
+from __future__ import annotations
+
+import importlib
+import importlib.abc
+import importlib.util
+import sys
+import types
+
+_EVAL = "stable_finance.evaluation"
+_DATA = "stable_finance.dataset"
+_M1T = "stable_finance.dataset.datasets.market1t"
+
+#: Every module path published before the reorganization, and where it went.
+MOVED: dict[str, tuple[str, ...]] = {
+    # The evaluation pipeline, now one package per stage.
+    "stable_finance.data": (f"{_EVAL}._grid", f"{_EVAL}.embeddings.contract",
+                            f"{_EVAL}.returns.contract", f"{_EVAL}.portfolio.contract",
+                            f"{_EVAL}.execution", f"{_DATA}.market"),
+    "stable_finance.metrics": (f"{_EVAL}.scoring.ic", f"{_EVAL}.scoring.pnl",
+                               f"{_EVAL}.scoring.sharpe", f"{_EVAL}.trades.rules",
+                               f"{_DATA}.market"),
+    "stable_finance.market": (f"{_DATA}.market", f"{_EVAL}.inputs", f"{_M1T}.views",
+                              f"{_M1T}.daystore"),
+    "stable_finance.probes": (f"{_EVAL}.returns.probes",),
+    "stable_finance.streaming": (f"{_EVAL}.returns.probes",),
+    "stable_finance.oracle": (f"{_EVAL}.returns.oracle",),
+    "stable_finance.portfolio": (f"{_EVAL}.scoring.pnl", f"{_EVAL}.scoring.sharpe"),
+    "stable_finance.universe": (f"{_EVAL}.portfolio.universe",),
+    "stable_finance.selection": (f"{_EVAL}.portfolio.construction", f"{_EVAL}.trades.rules"),
+    "stable_finance.risk": (f"{_EVAL}.portfolio.risk",),
+    "stable_finance.weighting": (f"{_EVAL}.portfolio.construction",),
+    "stable_finance.allocation": (f"{_EVAL}.trades.rebalance", f"{_EVAL}.portfolio.risk"),
+    "stable_finance.config": (f"{_EVAL}.config",),
+    "stable_finance.backtest": (f"{_EVAL}.backtest",),
+    "stable_finance.costs": (f"{_EVAL}.execution", f"{_EVAL}.scoring.sharpe"),
+    "stable_finance.execution": (f"{_EVAL}.execution", f"{_EVAL}.scoring.pnl"),
+    # Evaluation modules merged or renamed after the stage split.
+    f"{_EVAL}.accounting": (f"{_EVAL}.scoring",),
+    f"{_EVAL}.accounting.pnl": (f"{_EVAL}.scoring.pnl", f"{_EVAL}.scoring.sharpe"),
+    f"{_EVAL}.returns.scoring": (f"{_EVAL}.scoring.ic",),
+    f"{_EVAL}.returns.streaming": (f"{_EVAL}.returns.probes",),
+    f"{_EVAL}.market_data": (f"{_DATA}.market",),
+    f"{_EVAL}.portfolio.selection": (f"{_EVAL}.portfolio.construction",),
+    f"{_EVAL}.portfolio.weighting": (f"{_EVAL}.portfolio.construction",),
+    f"{_EVAL}.trades.contract": (f"{_EVAL}.execution",),
+    f"{_EVAL}.trades.costs": (f"{_EVAL}.execution",),
+    f"{_EVAL}.trades.fills": (f"{_EVAL}.execution",),
+    f"{_EVAL}.trades.orders": (f"{_EVAL}.execution",),
+    # The dataset: generic modules kept their paths; Market-1T's pipeline moved.
+    f"{_DATA}.grid": (f"{_M1T}.views",),
+    f"{_DATA}.transforms": (f"{_M1T}.views",),
+    f"{_DATA}.views": (f"{_M1T}.views",),
+    f"{_DATA}.panels": (f"{_M1T}.views",),
+    f"{_DATA}.panel_cache": (f"{_M1T}.views",),
+    f"{_DATA}.cells": (f"{_M1T}.views",),
+    f"{_DATA}.targets": (f"{_M1T}.tables",),
+    f"{_DATA}.build_targets": (f"{_M1T}.tables",),
+    f"{_DATA}.months": (f"{_M1T}.spec",),
+    f"{_DATA}.periods": (f"{_M1T}.spec",),
+    f"{_DATA}.source": (f"{_M1T}.spec",),
+    f"{_DATA}.calendar": (f"{_M1T}.spec",),
+    f"{_DATA}.mds": (f"{_M1T}.mosaic",),
+    f"{_DATA}.densify": (f"{_M1T}.mosaic",),
+    f"{_DATA}.reshard": (f"{_M1T}.mosaic",),
+    f"{_DATA}.daystore": (f"{_M1T}.daystore",),
+    f"{_DATA}.write_mds": (f"{_M1T}.ingest", f"{_M1T}.mosaic"),
+    f"{_DATA}.shard_months": (f"{_M1T}.ingest",),
+    f"{_DATA}.industry": (f"{_M1T}.ingest",),
+}
+
+#: What ``python -m <old path>`` runs, for the old command modules. Several
+#: now share a module, so each names its command function.
+MAIN: dict[str, str] = {
+    f"{_DATA}.build_targets": f"{_M1T}.tables:main",
+    f"{_DATA}.densify": f"{_M1T}.mosaic:densify_main",
+    f"{_DATA}.reshard": f"{_M1T}.mosaic:reshard_main",
+    f"{_DATA}.daystore": f"{_M1T}.daystore:main",
+    f"{_DATA}.write_mds": f"{_M1T}.ingest:main",
+    f"{_DATA}.shard_months": f"{_M1T}.ingest:shard_main",
+    f"{_DATA}.industry": f"{_M1T}.ingest:industry_main",
+}
+
+
+class _AliasLoader(importlib.abc.Loader):
+    def __init__(self, targets: tuple[str, ...]) -> None:
+        self.targets = targets
+
+    def create_module(self, spec):
+        if len(self.targets) == 1:
+            return importlib.import_module(self.targets[0])
+        merged = types.ModuleType(spec.name, f"Split into {', '.join(self.targets)}.")
+        for target in self.targets:
+            for name, value in vars(importlib.import_module(target)).items():
+                if not (name.startswith("__") and name.endswith("__")):
+                    merged.__dict__.setdefault(name, value)
+        return merged
+
+    def exec_module(self, module) -> None:
+        """The moved module has already run; there is nothing more to execute."""
+
+    def get_code(self, fullname):
+        """``python -m <old path>`` runs that old path's command."""
+        entry = MAIN.get(fullname)
+        if entry is None:
+            raise ImportError(f"{fullname} has no command to run; it moved to {self.targets}")
+        module, function = entry.split(":")
+        return compile(f"from {module} import {function} as _main\nraise SystemExit(_main())",
+                       f"<{fullname}>", "exec")
+
+
+class _MovedFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        targets = MOVED.get(fullname)
+        if targets is None:
+            return None
+        # The moved file's path as origin: ``python -m`` names the program from it.
+        origin = importlib.util.find_spec(targets[0]).origin
+        return importlib.util.spec_from_loader(fullname, _AliasLoader(targets), origin=origin)
+
+
+def install() -> None:
+    if not any(isinstance(finder, _MovedFinder) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _MovedFinder())
