@@ -81,10 +81,6 @@ ROLE_DEFAULTS: dict[str, tuple[str, str, str, bool]] = {
 }
 ROLES = tuple(ROLE_DEFAULTS)
 
-#: Column names read as a role when a schema states no roles of its own:
-#: every role's own name, plus Market-1T's two names that differ from it.
-ROLE_ALIASES: dict[str, str] = {**{role: role for role in ROLES},
-                                "vwap_all": "vwap", "n": "n_trades"}
 _GROUP_ORDER = ("price", "order_book_size", "trade_size", "trade_count", "market_cap")
 
 
@@ -97,9 +93,8 @@ class FeatureSchema:
     """Column semantics needed to reconstruct and transform market sessions.
 
     ``roles`` maps a role in :data:`ROLES` to the column that plays it. Left
-    empty, roles are inferred from column names (:data:`ROLE_ALIASES`), so a
-    schema written before roles existed keeps working; pass roles explicitly
-    whenever a column's name is not its role.
+    empty, every column named after a role plays that role; pass roles
+    explicitly whenever a column's name is not its role.
     """
 
     columns: tuple[str, ...]
@@ -122,9 +117,8 @@ class FeatureSchema:
         if not self.roles:
             inferred: dict[str, str] = {}
             for column in self.columns:
-                role = ROLE_ALIASES.get(column)
-                if role is not None and role not in inferred:
-                    inferred[role] = column
+                if column in ROLE_DEFAULTS and column not in inferred:
+                    inferred[column] = column
             object.__setattr__(self, "roles", tuple(inferred.items()))
         if not self.columns or len(set(self.columns)) != len(self.columns):
             raise ValueError("columns must be non-empty and unique")

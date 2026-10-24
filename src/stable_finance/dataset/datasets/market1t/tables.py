@@ -400,12 +400,6 @@ def _normal_ppf(u: float) -> float:
 
 # ── building tables ──────────────────────────────────────────────────────────
 
-# Market-1T's fill columns, kept for scripts that import them from here. The
-# builder itself reads the fill rules off each store's own schema.
-FFILL_IDX = MARKET_SCHEMA.forward_fill_indices
-ZEROFILL_IDX = MARKET_SCHEMA.zero_fill_indices
-
-
 def _shard_partial(month_dir: str, shard_meta: dict, timeline,
                    target_types: tuple[str, ...], horizons: tuple[int, ...],
                    keep_samples: bool, schema=None, spec=None,

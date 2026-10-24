@@ -59,9 +59,6 @@ class ProbeData(Protocol):
     def forward_returns(self, period: Hashable) -> ForwardReturns: ...
 
 
-#: The earlier name, from when every split was a Market-1T month.
-MonthlyProbeData = ProbeData
-
 
 class ColumnwiseRidge(BaseEstimator):
     """Standardize a 2-D embedding matrix and fit one ridge per target.
@@ -199,9 +196,6 @@ class RidgeProbe(BaseEstimator):
         self.fit(source.embeddings(period), source.forward_returns(period))
         self.fit_period_ = period
         return self
-
-    #: The earlier name, from when every split was a Market-1T month.
-    fit_month = fit_period
 
     def predict(self, embeddings: Embeddings) -> ForwardReturns:
         """Predict every fitted horizon, preserving the input observation grid."""

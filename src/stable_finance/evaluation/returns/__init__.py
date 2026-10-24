@@ -9,7 +9,6 @@ from stable_finance.evaluation.returns.oracle import (
 )
 from stable_finance.evaluation.returns.probes import (
     ColumnwiseRidge,
-    MonthlyProbeData,
     ProbeData,
     RidgeProbe,
     StreamingRidge,
@@ -19,7 +18,6 @@ from stable_finance.evaluation.returns.probes import (
 __all__ = [
     "ColumnwiseRidge",
     "ForwardReturns",
-    "MonthlyProbeData",
     "NOISE_MODES",
     "ProbeData",
     "RidgeProbe",

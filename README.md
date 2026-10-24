@@ -33,10 +33,12 @@ src/stable_finance/
     returns/               stage 2: forward returns; ridge probes (in memory or
                            streamed) and oracle forecasts
     portfolio/             stage 3: the target portfolio, as if trading were free;
-                           universe, risk, and construction (selection and weighting,
-                           or the mean-variance target)
+                           risk.py (risk management: universe screens and the risk
+                           model) and construction.py (selection and weighting, or
+                           the mean-variance target)
     trades/                stage 4: trading policies, how far to move given costs;
-                           rebalance and trade rules, where a learned policy would go
+                           rebalance and trade rules, and rl/ reserved for learned
+                           policies
     scoring/               stage 5: how good each output is; ic.py (forecast IC),
                            pnl.py (positions and P&L), sharpe.py (Sharpe, EFQ curves)
     config.py, backtest.py the harness: one named configuration, entered at any level
@@ -50,17 +52,17 @@ src/stable_finance/
     objective.py           one label definition, keyed, and its cross-sectional forms
     market.py              MarketData by level (mid, bars, quotes, book), and the
                            market requirements each stage declares
+    universe.py            which names the data can price at all: quoted, and
+                           present often enough to estimate
     datasets/market1t/     Market-1T's one pipeline, a module per step:
                            spec, ingest, mosaic, views, daystore, tables
-  _moved.py                old module paths, kept importable
 tests/                     mirrors the package: dataset/ and evaluation/<stage>/
 ```
 
 Each stage package holds its stage's contract (the object it produces), the
 code that produces it from the stage before, and the metrics that score it.
 Everything public is re-exported at the top level, so `import stable_finance
-as sf` reaches all of it. Modules that moved remain importable at their old
-paths through one table in `_moved.py`.
+as sf` reaches all of it.
 
 The package follows scikit-learn's estimator vocabulary: adapters expose
 `fit(X, y)` and `predict(X)`, constructor arguments are inspectable
@@ -670,9 +672,6 @@ encoding. It returns normalized views, labels and `ViewMetadata` separately,
 and `PanelCache` preserves that separation on disk. A model integration may
 implement `ProbeData`, so the probe can be fit on one of the dataset's own
 periods with `RidgeProbe().fit_period(period, source)`.
-
-Every module path published before this layout remains importable through the
-table in `_moved.py`, and `python -m` on an old path runs its command.
 
 ## Development
 

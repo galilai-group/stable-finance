@@ -34,8 +34,12 @@ from stable_finance.evaluation.portfolio.construction import (
     WEIGHTING_REQUIRES,
     WEIGHTING_RULES,
 )
-from stable_finance.evaluation.portfolio.risk import RISK_MODEL_REQUIRES, RISK_MODELS
-from stable_finance.evaluation.portfolio.universe import UNIVERSE_REQUIRES, UNIVERSE_SCREENS
+from stable_finance.evaluation.portfolio.risk import (
+    RISK_MODEL_REQUIRES,
+    RISK_MODELS,
+    UNIVERSE_REQUIRES,
+    UNIVERSE_SCREENS,
+)
 
 __all__ = [
     "ANNUALIZATIONS",

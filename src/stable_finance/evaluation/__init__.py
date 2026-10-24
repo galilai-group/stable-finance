@@ -1,10 +1,10 @@
 """The evaluation pipeline, one package per stage.
 
     embeddings  ->  returns  ->  portfolio  ->  trades     ->  scoring
-    (you bring)     probes,      universe,      policies:       IC, P&L,
+    (you bring)     probes,      risk mgmt,     policies:       IC, P&L,
                     oracle       selection,     rebalance,      Sharpe,
-                                 risk, sizing   trade rules     execution-
-                                 (no costs)                     quality curves
+                                 sizing         trade rules,    execution-
+                                 (no costs)     rl (later)      quality curves
 
              execution: orders filled at the mid, across the spread at an
              EFQ, or through the book, each needing its level of market data
@@ -18,9 +18,9 @@ scoring measures each stage's output: the IC of a forecast, and the P&L and
 Sharpe of what a portfolio actually held. config and backtest are the harness
 that runs any of them under one named configuration, starting from whichever
 level you bring. The observable market, by level from a bare price series to
-the book, is stable_finance.dataset.market; every stage declares what it
-needs of it. inputs turns your own table into realized returns and market
-data.
+the book, is stable_finance.dataset.market, and which names it can price at
+all is stable_finance.dataset.universe; every stage declares what it needs of
+it. inputs turns your own table into realized returns and market data.
 """
 
 from stable_finance.dataset.market import (
@@ -34,6 +34,10 @@ from stable_finance.dataset.market import (
     MarketData,
     bar_half_spread,
     requires,
+)
+from stable_finance.dataset.universe import (
+    presence_screen,
+    tradable,
 )
 from stable_finance.evaluation._grid import (
     require_aligned,
@@ -106,17 +110,14 @@ from stable_finance.evaluation.portfolio import (
     ledoit_wolf_covariance,
     liquidity_screen,
     mean_variance_target,
-    presence_screen,
     select_book,
     tail_selection,
-    tradable,
     weight_book,
 )
 from stable_finance.evaluation.returns import (
     NOISE_MODES,
     ColumnwiseRidge,
     ForwardReturns,
-    MonthlyProbeData,
     ProbeData,
     RidgeProbe,
     StreamingRidge,
@@ -183,7 +184,6 @@ __all__ = [
     "MARKET_QUANTITIES",
     "MarketData",
     "MeanVarianceAllocator",
-    "MonthlyProbeData",
     "NOISE_MODES",
     "OPTIONAL_SETTINGS",
     "Orders",

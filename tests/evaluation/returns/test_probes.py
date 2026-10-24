@@ -98,7 +98,6 @@ def test_ridge_probe_fits_from_a_period_provider_of_any_dataset():
     probe = RidgeProbe().fit_period(fold, Source())
     assert probe.fit_period_ == fold
     assert np.isfinite(probe.predict(embeddings).values).all()
-    assert RidgeProbe.fit_month is RidgeProbe.fit_period
 
 
 def test_ridge_probe_is_an_sklearn_estimator():

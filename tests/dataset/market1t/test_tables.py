@@ -58,7 +58,7 @@ def test_uniform_uses_open_interval_endpoints(tmp_path):
     assert score(16.0) == 20 / 21
 
 
-def test_uniform_refuses_approximate_legacy_tables(tmp_path):
+def test_uniform_refuses_a_table_without_exact_order_statistics(tmp_path):
     stats = _stats(tmp_path)
     stats.sorted_values = None
     with np.testing.assert_raises_regex(ValueError, "exact order statistics"):
@@ -99,7 +99,7 @@ def test_table_builder_can_skip_order_statistics():
 
 
 def test_target_builder_module_imports_and_exposes_cli():
-    from stable_finance.dataset import build_targets
+    from stable_finance.dataset.datasets.market1t import tables
 
-    assert callable(build_targets.build_month)
-    assert callable(build_targets.main)
+    assert callable(tables.build_month)
+    assert callable(tables.main)

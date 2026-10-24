@@ -456,7 +456,7 @@ class DayRecord:
     def record(self, i: int) -> dict:
         """The ticker-day as a dense-mosaic record (ticker/date/grid_start/features).
 
-        The compatibility surface: anything that consumes MDS dense records --
+        The one record format: anything that consumes MDS dense records --
         the panel builder, the target-table builder, ``SessionPreprocessor``
         -- reads this dict unchanged.
         """

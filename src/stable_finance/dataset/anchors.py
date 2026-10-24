@@ -106,12 +106,11 @@ class AnchorSpec:
 DEFAULT_ANCHOR_SPEC = AnchorSpec()
 
 
-# Named compatibility constants for concise numerical code and downstream
-# scripts. New APIs should accept an AnchorSpec where geometry is configurable.
+# The default geometry by name, for numerical code that reads better with
+# them. Anything configurable takes an AnchorSpec instead.
 SESSION_LEN = DEFAULT_ANCHOR_SPEC.session_seconds
 ANCHOR_STEP = DEFAULT_ANCHOR_SPEC.step_seconds
 RETURN_VWAP_WINDOW = DEFAULT_ANCHOR_SPEC.measurement_window_seconds
-ANCHORS_PER_DAY = DEFAULT_ANCHOR_SPEC.anchors_per_session
 DEFAULT_TARGET_HORIZONS = (300, 600, 900, 1800, 3600, 7200)
 
 #: Horizon sentinel meaning "measure to the closing auction" rather than to a

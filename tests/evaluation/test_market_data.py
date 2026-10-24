@@ -281,8 +281,9 @@ def test_a_panel_cache_without_quotes_says_so(tmp_path):
     from stable_finance import MarketPanel
     from stable_finance.dataset import (
         FeatureSchema, MarketSession, PanelCache, ViewSpec, build_session_panel,
-        panel_cache_key, standard_open_est,
+        standard_open_est,
     )
+    from stable_finance.dataset.datasets.market1t.views import cache_key
 
     start = standard_open_est("2023-01-03")
     sessions = [MarketSession(f"S{k}", "2023-01-03", np.arange(start, start + 400),
@@ -292,7 +293,7 @@ def test_a_panel_cache_without_quotes_says_so(tmp_path):
         s, [150, 200], _IdentityStats(), target_types=("return",), horizons=(10,),
         view_spec=ViewSpec(sequence_length=4, aggregation_seconds=(1, 1)))]
     assert rows and all(r.quote is None for r in rows)
-    key = panel_cache_key(anchors_per_day=2)
+    key = cache_key(anchors_per_day=2)
     cache = PanelCache(tmp_path)
     cache.build("2023-01", key, [(np.stack([r.view for r in rows]), rows)])
     assert cache.load("2023-01", key).quotes is None

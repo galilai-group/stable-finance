@@ -78,7 +78,6 @@ from stable_finance.dataset.anchors import (
     AnchorSpec,
 )
 from stable_finance.dataset.datasets.market1t.spec import (
-    MarketSchedule,
     Timeline,
     as_timeline,
 )
@@ -178,33 +177,24 @@ class SessionPreprocessor:
     backend only needs to produce the same raw mapping keys.
 
     ``timeline`` is the dataset's clock: when the market is open and how
-    long a row is. ``schedule`` is the older way to name one -- a Market-1T
-    holiday schedule (or None) for the Market-1T timeline, or any calendar or
-    timeline -- and is used when ``timeline`` is not given.
+    long a row is. Left out, it is Market-1T's regular session.
     """
 
     def __init__(
         self,
         *,
         schema: FeatureSchema | None = None,
-        schedule: MarketSchedule | None = None,
-        extended_hours: bool = False,
         zero_features: tuple[str, ...] = (),
         cache_bytes: int = 0,
         bounds: Callable[[str], tuple[int, int]] | None = None,
         timeline: Timeline | None = None,
     ) -> None:
         schema = default_schema(schema)
-        if timeline is not None and (schedule is not None or extended_hours):
-            raise ValueError("pass a timeline or a Market-1T schedule, not both")
         unknown = set(zero_features) - set(schema.columns)
         if unknown:
             raise ValueError(f"zero_features contains unknown columns: {sorted(unknown)}")
         self.schema = schema
-        self.schedule = schedule
-        self.extended_hours = extended_hours
-        self.timeline = (timeline if timeline is not None
-                         else as_timeline(schedule, extended_hours=extended_hours))
+        self.timeline = as_timeline(timeline)
         self.bar_seconds = self.timeline.bar_seconds
         self.zero_indices = [schema.index(name) for name in zero_features]
         self.cache_bytes = max(0, int(cache_bytes))
@@ -299,7 +289,8 @@ class SessionPreprocessor:
         second copy of data the page cache already has would only take memory
         from the reader.
         """
-        if self.extended_hours or self.bounds is not None:
+        extended = getattr(self.timeline.calendar, "extended_hours", False)
+        if extended or self.bounds is not None:
             # A DENSE RECORD CARRIES ONE GRID, and it is the regular session.
             # Silently handing it back to a caller that asked for extended
             # hours (or for custom bounds) would return a 6.5-hour view where a

@@ -150,15 +150,6 @@ def test_session_preprocessor_owns_bounded_cache_and_telemetry():
     assert 0 < info.bytes <= info.max_bytes
 
 
-def test_preprocessor_refuses_a_timeline_and_a_schedule_together(tmp_path):
-    csv = tmp_path / "h.csv"
-    csv.write_text("date,status,start_time,end_time\n")
-    from stable_finance.dataset import MarketSchedule, market1t_timeline
-
-    with pytest.raises(ValueError):
-        SessionPreprocessor(timeline=market1t_timeline(), schedule=MarketSchedule(csv))
-
-
 def test_view_geometry_is_validated_as_a_hyperparameter():
     assert ViewSpec().scale_range == (0.5, 1.0)
     with pytest.raises(ValueError, match="scale_range"):

@@ -1,4 +1,4 @@
-"""Covariance forecasts: the risk half of a portfolio decision.
+"""Risk management: which names a portfolio may hold, and how they co-move.
 
 A forecast says which names to prefer. A risk model says how much of each to
 hold, and it is a genuinely separate choice: the same ranking allocated under
@@ -12,22 +12,37 @@ of the history it was given, and every one is projected to the positive
 semidefinite cone so the allocation objective stays convex. Estimation uses
 only the decisions in the supplied history, so a caller that passes a prior
 period gets a strictly out-of-sample risk model.
+
+THE UNIVERSE SCREENS are the other half of risk management. Spread costs are
+heavy-tailed across a cross-section, so how tight a tradable universe to hold
+is one of the decisions that moves a Sharpe ratio most and is dictated by the
+model least. A screen is a boolean mask on the ``(decision, asset)`` grid,
+applied before selection, so it composes with any selection rule and any
+allocator. Which names the data can price at all -- quoted, and present often
+enough to estimate -- is the dataset's to say, in
+:mod:`stable_finance.dataset.universe`; the screens here start from that.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
+
+from stable_finance.dataset.universe import tradable
 
 from stable_finance.evaluation.embeddings.contract import Embeddings
 from stable_finance.evaluation.returns.contract import ForwardReturns
 
 __all__ = [
     "RISK_MODELS",
+    "UNIVERSE_REQUIRES",
+    "UNIVERSE_SCREENS",
+    "apply_screen",
     "diagonal_covariance",
     "embedding_covariance",
     "estimate_risk",
     "ledoit_wolf_covariance",
+    "liquidity_screen",
 ]
 
 
@@ -103,7 +118,7 @@ def ledoit_wolf_covariance(
 
     MISSING OBSERVATIONS ARE ZERO-FILLED AFTER CENTERING, which biases a
     sparsely observed asset's covariance toward zero. The presence screen in
-    :mod:`stable_finance.evaluation.portfolio.universe` is what keeps that bias small; without one,
+    :func:`stable_finance.dataset.universe.presence_screen` is what keeps that bias small; without one,
     a name quoted on a handful of decisions would look riskless.
     """
     from sklearn.covariance import LedoitWolf
@@ -258,3 +273,78 @@ def estimate_covariance(
         eigenvalues = np.maximum(eigenvalues, 1e-8 * eigenvalues.max())
         covariances[horizon] = (eigenvectors * eigenvalues) @ eigenvectors.T
     return covariances
+
+
+# ── universe screens ──────────────────────────────────────────────────────────
+
+def liquidity_screen(
+    half_spread: ArrayLike, *, keep: float
+) -> NDArray[np.bool_]:
+    """Keep the tightest ``keep`` fraction of each decision's cross-section.
+
+    The cut is a CROSS-SECTIONAL FRACTION rather than an absolute spread in
+    basis points, because the level of spreads moves by an order of magnitude
+    across a long history -- an absolute threshold would screen out almost
+    everything in a 2008 and almost nothing in a 2019, making the universe a
+    proxy for the calendar. A fraction keeps the screen's meaning fixed.
+    """
+    if not 0.0 < keep <= 1.0:
+        raise ValueError("keep must lie in (0, 1]")
+    spread = np.asarray(half_spread, dtype=np.float64)
+    usable = tradable(spread)
+    if keep == 1.0:
+        return usable
+    mask = np.zeros_like(usable)
+    for decision in range(spread.shape[0]):
+        row = np.flatnonzero(usable[decision])
+        if len(row) == 0:
+            continue
+        # At least one name survives any non-empty cross-section: a screen
+        # that can empty a decision would silently turn into a missing period
+        # rather than a tighter universe.
+        count = max(int(np.floor(len(row) * keep)), 1)
+        tightest = row[np.argsort(spread[decision, row], kind="stable")[:count]]
+        mask[decision, tightest] = True
+    return mask
+
+
+def apply_screen(name: str, half_spread: ArrayLike | None,
+                 *, shape: tuple[int, int] | None = None) -> NDArray[np.bool_]:
+    """Dispatch to one named universe screen; see :data:`UNIVERSE_SCREENS`.
+
+    ``half_spread=None`` means the market has no quotes at all, which is not
+    the same as every name being unquoted. Only ``all`` is defined then, and it
+    admits every name on a ``shape`` grid: with no quote to say a name could
+    not trade, the frictionless backtest that is the only one possible trades
+    whatever has a forecast and an outcome.
+    """
+    if half_spread is None:
+        if UNIVERSE_REQUIRES.get(name):
+            from stable_finance.dataset.schema import MissingRolesError
+
+            raise MissingRolesError(
+                f"universe={name!r} screens on the quoted half-spread, and the "
+                "market data has none")
+        if name != "all":
+            raise ValueError(f"unknown universe {name!r}; choose from {UNIVERSE_SCREENS}")
+        if shape is None:
+            raise ValueError("pass shape when there is no half_spread")
+        return np.ones(shape, dtype=bool)
+    if name == "all":
+        return tradable(half_spread)
+    if name == "tight_50pct":
+        return liquidity_screen(half_spread, keep=0.5)
+    if name == "tight_25pct":
+        return liquidity_screen(half_spread, keep=0.25)
+    raise ValueError(f"unknown universe {name!r}; choose from {UNIVERSE_SCREENS}")
+
+
+#: The universe screens a backtest configuration may name.
+UNIVERSE_SCREENS = ("all", "tight_50pct", "tight_25pct")
+
+#: What each screen needs of the market. ``all`` keeps the quoted names when
+#: there are quotes and every name when there are none; the liquidity screens
+#: rank on the quoted half-spread and cannot be formed without it.
+UNIVERSE_REQUIRES: dict[str, tuple[str, ...]] = {
+    "all": (), "tight_50pct": ("half_spread",), "tight_25pct": ("half_spread",),
+}

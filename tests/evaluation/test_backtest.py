@@ -12,8 +12,6 @@ from stable_finance import (
     enumerate_configs,
     estimate_risk,
     ledoit_wolf_covariance,
-    liquidity_screen,
-    presence_screen,
     run_backtest,
     select_book,
     tail_selection,
@@ -81,31 +79,6 @@ def test_enumerate_accepts_a_scalar_or_a_list_for_an_axis():
 def test_enumerate_rejects_an_unknown_keyword():
     with pytest.raises(ValueError, match="not a configuration axis"):
         enumerate_configs(nonsense=("a",))
-
-
-# ── universe ────────────────────────────────────────────────────────────────
-
-def test_liquidity_screen_keeps_the_tightest_fraction_of_each_decision():
-    spread = np.array([[1.0, 2.0, 3.0, 4.0]]) * 1e-4
-    kept = liquidity_screen(spread, keep=0.5)
-    np.testing.assert_array_equal(kept, [[True, True, False, False]])
-
-
-def test_liquidity_screen_never_empties_a_non_empty_cross_section():
-    spread = np.array([[1e-4, 2e-4]])
-    assert liquidity_screen(spread, keep=0.01).sum() == 1
-
-
-def test_screens_exclude_names_without_a_two_sided_market():
-    spread = np.array([[1e-4, np.nan, 2e-4]])
-    np.testing.assert_array_equal(
-        liquidity_screen(spread, keep=1.0), [[True, False, True]]
-    )
-
-
-def test_presence_screen_is_an_asset_mask():
-    observed = np.array([[True, True], [True, False], [True, False]])
-    np.testing.assert_array_equal(presence_screen(observed, minimum=0.6), [True, False])
 
 
 # ── selection ───────────────────────────────────────────────────────────────

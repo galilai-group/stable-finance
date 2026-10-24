@@ -70,12 +70,13 @@ def test_schema_round_trips_through_its_description():
 
 def test_a_schema_without_roles_reads_them_off_its_column_names():
     schema = FeatureSchema(
-        columns=("n", "vwap_all", "volume"), forward_fill=frozenset({"vwap_all"}),
-        zero_fill=frozenset({"n", "volume"}),
-        aggregation=(("n", "sum"), ("vwap_all", "vwap"), ("volume", "sum")),
+        columns=("n_trades", "vwap", "volume", "extra"), forward_fill=frozenset({"vwap"}),
+        zero_fill=frozenset({"n_trades", "volume"}),
+        aggregation=(("n_trades", "sum"), ("vwap", "vwap"), ("volume", "sum"),
+                     ("extra", "last")),
         normalization=(),
     )
-    assert schema.role_map == {"n_trades": "n", "vwap": "vwap_all", "volume": "volume"}
+    assert schema.role_map == {"n_trades": "n_trades", "vwap": "vwap", "volume": "volume"}
 
 
 def test_market1t_roles_cover_every_quantity():
@@ -87,8 +88,3 @@ def test_session_default_schema_is_market1t():
     s = MarketSession("A", DATE, np.arange(3), np.zeros((3, 9)))
     assert s.schema is MARKET_SCHEMA
 
-
-def test_schema_module_still_exports_the_market1t_preset():
-    from stable_finance.dataset.datasets.market1t.spec import MARKET_SCHEMA as legacy
-
-    assert legacy is MARKET_SCHEMA

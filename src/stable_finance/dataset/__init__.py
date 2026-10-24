@@ -6,6 +6,7 @@ Generic, for any dataset:
 ``anchors``    where decisions fall and how long a label measures (``AnchorSpec``)
 ``outcomes``   the target families: returns, spread and volatility changes, by role
 ``objective``  one label definition with a cache key, and its cross-sectional forms
+``universe``   which names the data can price at all: quoted, and present often enough
 
 A dataset with no machinery of its own needs nothing more: pass its table to
 :func:`stable_finance.evaluation.inputs.evaluation_inputs` for evaluation.
@@ -62,6 +63,10 @@ from stable_finance.dataset.schema import (
     default_schema,
     mid_series,
 )
+from stable_finance.dataset.universe import (
+    presence_screen,
+    tradable,
+)
 from stable_finance.dataset.datasets.market1t.daystore import (
     ChronologyError,
     DayRecord,
@@ -116,10 +121,7 @@ from stable_finance.dataset.datasets.market1t.views import (
     sparse_to_dense_grid,
 )
 
-from stable_finance.dataset.datasets.market1t.views import cache_key as panel_cache_key
-
 __all__ = [
-    "panel_cache_key",
     "ADV",
     "ANCHOR_TARGET_TYPES",
     "BOOK_QUANTITIES",
@@ -191,6 +193,7 @@ __all__ = [
     "normalize",
     "period_directories",
     "prepare_view",
+    "presence_screen",
     "prior_vwap",
     "requires",
     "resample_session",
@@ -198,6 +201,7 @@ __all__ = [
     "standard_open_est",
     "supported_targets",
     "timeline_bounds_est",
+    "tradable",
     "validate_period_alignment",
     "window_realized_volatility",
     "window_spread",

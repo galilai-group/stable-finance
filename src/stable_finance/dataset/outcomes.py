@@ -224,8 +224,6 @@ def _vwap_cumsums(features: np.ndarray, schema: FeatureSchema | None = None):
     return price_cumsums(features, _schema(schema), "vwap")
 
 
-_windowed_vwap = windowed_price
-
 
 def resolve_future(
     indices: np.ndarray, horizons: np.ndarray, close_index: int | None

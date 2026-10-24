@@ -64,8 +64,7 @@ from stable_finance.evaluation.portfolio.contract import PortfolioWeights
 from stable_finance.evaluation.portfolio.construction import (
     mean_variance_target, select_book, weight_book,
 )
-from stable_finance.evaluation.portfolio.risk import estimate_risk
-from stable_finance.evaluation.portfolio.universe import apply_screen
+from stable_finance.evaluation.portfolio.risk import apply_screen, estimate_risk
 from stable_finance.evaluation.returns.contract import ForwardReturns
 from stable_finance.evaluation.returns.probes import RidgeProbe
 from stable_finance.evaluation.scoring.ic import grouped_rank_ic
