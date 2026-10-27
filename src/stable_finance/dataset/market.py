@@ -174,7 +174,10 @@ class MarketData:
             columns[name] = array
         for name in ("half_spread", ADV, "book_bid_size", "book_ask_size"):
             if name in columns and np.any(np.isfinite(columns[name]) & (columns[name] < 0)):
-                raise ValueError(f"{name} cannot be negative")
+                hint = ("; a crossed quote gives one -- supply bid_price and ask_price instead and "
+                        "MarketData derives mid and half_spread, treating a crossed, one-sided or "
+                        "zero-bid book as unquoted (NaN)") if name == "half_spread" else ""
+                raise ValueError(f"{name} cannot be negative{hint}")
         estimated = frozenset(self.estimated)
         if not estimated <= set(columns):
             raise ValueError("estimated names a quantity the market does not hold")

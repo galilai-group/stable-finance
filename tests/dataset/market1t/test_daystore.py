@@ -5,6 +5,8 @@ import json
 
 import numpy as np
 import pytest
+
+pytest.importorskip("streaming")   # the MDS extra (`uv sync --extra mds`)
 from helpers import IdentityStats as _IdentityStats, market1t_store
 
 from stable_finance import forward_returns_from_days, market_from_days

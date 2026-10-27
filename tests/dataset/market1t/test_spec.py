@@ -10,6 +10,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
+pytest.importorskip("streaming")   # the MDS extra (`uv sync --extra mds`)
 from helpers import market1t_store
 from test_daystore import DATES, mosaic, store  # noqa: F401  (fixtures)
 

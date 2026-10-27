@@ -53,6 +53,7 @@ from stable_finance.evaluation.config import (
 from stable_finance.evaluation.embeddings.contract import Embeddings
 from stable_finance.evaluation.execution import (
     Orders,
+    _efq_array,
     execute,
     fill_path,
     impact_cost,
@@ -290,7 +291,8 @@ def _cost(config: BacktestConfig, spread, shape, *, context=None,
     if spread is None:
         # check_config has already refused every other model without a spread.
         return np.zeros(shape, dtype=np.float64)
-    return trading_cost(config.cost_model, spread, multiple=config.efq)
+    efq = config.efq if context is None else context.get("efq", config.efq)
+    return trading_cost(config.cost_model, spread, multiple=efq)
 
 
 def _hold_within_day(weights, day):
@@ -333,7 +335,8 @@ def _fills_toward(context: dict, values: NDArray[np.float64], config: BacktestCo
                        impact=config.impact)
     # Otherwise chase the target from what is really held: a name that is
     # not priced at a decision is held, not moved for free.
-    return fill_path(target, context["market"], model=config.cost_model, efq=config.efq,
+    return fill_path(target, context["market"], model=config.cost_model,
+                     efq=context.get("efq", config.efq),
                      equity=config.equity)
 
 
@@ -461,6 +464,7 @@ def run_backtest(
     with_series: bool = False,
     train: tuple[Embeddings, ForwardReturns] | None = None,
     probe: RidgeProbe | None = None,
+    efq: ArrayLike | None = None,
 ) -> BacktestReport:
     """Score one input, at any level, under one harness configuration.
 
@@ -488,6 +492,12 @@ def run_backtest(
     :class:`~stable_finance.dataset.schema.MissingRolesError` before anything
     runs. With neither given only frictionless configurations run, such as
     ``config=DEFAULT_BACKTEST.replace(cost_model="mid")``.
+
+    ``efq`` is a per-name (or per-decision) execution quality, an array that
+    broadcasts to ``(decision, asset)``, used in place of ``config.efq`` for
+    both the allocator's charge and the fills. The config keeps a scalar so a
+    configuration stays one hashable point of the sweep; this is for a
+    caller who has measured execution quality by name.
     """
     source = forecast
     if isinstance(source, Embeddings):
@@ -499,6 +509,8 @@ def run_backtest(
     market = _market(source, market, half_spread)
     _check_axes(config, market, source)
     context = _prepare(source, realized, market, days, horizon_index)
+    if efq is not None:
+        context["efq"] = np.broadcast_to(_efq_array(efq), (context["n_decisions"], context["n_assets"]))
     if isinstance(source, ForwardReturns):
         sigma = _risk(context, config, history, realized, embeddings, horizon_index)
         return _score(context, _weights(context, config, sigma), config,
@@ -510,7 +522,7 @@ def run_backtest(
     orders = Orders(source.values[:, :, one], source.decisions, source.assets,
                     source.horizons[one],
                     limit=None if source.limit is None else source.limit[:, :, one])
-    fills = execute(orders, market, model=config.cost_model, efq=config.efq,
+    fills = execute(orders, market, model=config.cost_model, efq=context.get("efq", config.efq),
                     equity=config.equity, impact=config.impact,
                     schedule=(_schedule(context, config)
                               if config.cost_model in ("impact", "impact_stock") else 0))

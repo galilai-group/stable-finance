@@ -510,3 +510,24 @@ def test_annualization_is_pinned_to_daily_and_out_of_the_sweep():
     assert "annualization" not in CONFIG_SPACE
     assert {c.annualization for c in enumerate_configs()} == {"daily"}
     assert run_backtest(**world()).periods_per_year == pytest.approx(252.0)
+
+
+def test_a_per_name_efq_charges_each_name_its_own_execution_quality():
+    from stable_finance import MarketData, Orders
+
+    decisions, assets = np.arange(2), np.array(["A", "B"])
+    orders = Orders(np.array([[[0.5], [0.5]], [[0.0], [0.0]]]), decisions, assets, AXIS)
+    realized = ForwardReturns(np.zeros((2, 2, 1)), decisions, assets, AXIS)
+    market = MarketData({"bid_price": np.full((2, 2), 99.0), "ask_price": np.full((2, 2), 101.0)},
+                        decisions, assets)
+    config = DEFAULT_BACKTEST.replace(cost_model="cross", efq=1.0, annualization="decisions")
+    both = run_backtest(orders, realized, market=market, config=config)
+    only_b = run_backtest(orders, realized, market=market, config=config, efq=[0.0, 1.0])
+    assert only_b.mean_cost_bps == pytest.approx(both.mean_cost_bps / 2)
+
+
+def test_a_crossed_spread_supplied_directly_is_refused_with_the_way_out():
+    from stable_finance import MarketData
+
+    with pytest.raises(ValueError, match="supply bid_price and ask_price"):
+        MarketData({"half_spread": np.array([[-0.01]])}, [0], ["A"])
