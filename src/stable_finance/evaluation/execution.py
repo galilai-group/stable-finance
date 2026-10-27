@@ -741,13 +741,23 @@ def _impact_fills(orders: Orders, market: MarketData, equity, schedule: int,
 
 def fill_path(weights: PortfolioWeights, market: MarketData | None = None, *,
               model: str = "cross", efq: ArrayLike = 1.0, equity: float | None = None,
-              initial: ArrayLike | None = None, limit: ArrayLike | None = None) -> Fills:
+              initial: ArrayLike | None = None, limit: ArrayLike | None = None,
+              drift: ArrayLike | None = None) -> Fills:
     """Trade toward each target from the position actually held, decision by decision.
 
     Unlike :func:`orders_from_weights`, an order that only partly fills is
     not forgotten: the next decision's order is the next target minus what is
     really held. This is the path to use whenever fills can fall short --
     the book, limit orders, or names that stop quoting.
+
+    ``drift`` is the ``holding="drift"`` accounting (see
+    :data:`~stable_finance.evaluation.config.HOLDING_RULES`): the realized
+    return of each name from each decision to the next, shape
+    ``(decision, asset, horizon)``. A position then grows or shrinks with it
+    between decisions, and an order goes out only where the target changed
+    or an earlier order is still unfilled, trading from the drifted holding
+    to the target -- so closing a position sells exactly what it has become.
+    Supported for the ``mid`` and ``cross`` models without limits.
     """
     if market is not None:
         require_market_aligned(market, weights)
@@ -755,6 +765,10 @@ def fill_path(weights: PortfolioWeights, market: MarketData | None = None, *,
     n_decisions, n_assets, n_horizons = target.shape
     held = _initial_positions(initial, (n_assets, n_horizons))
     efq = np.broadcast_to(_efq_array(efq if model == "cross" else 0.0), (n_decisions, n_assets))
+    if drift is not None:
+        if model not in ("mid", "cross") or limit is not None:
+            raise ValueError("drift holding is supported for the mid and cross models without limits")
+        return _drift_path(weights, market, efq, held, np.asarray(drift, dtype=np.float64))
     if model in ("mid", "cross") and limit is None:
         return _chase_at_touch(weights, market, efq, held)
     columns = {} if market is None else market.columns
@@ -795,6 +809,37 @@ def _chase_at_touch(weights: PortfolioWeights, market: MarketData | None, efq, h
     previous = np.concatenate([held[None], path[:-1]], axis=0)
     orders = Orders(path - previous, weights.decisions, weights.assets, weights.horizons)
     return simulate_fills(orders, market, efq=efq)
+
+
+def _drift_path(weights: PortfolioWeights, market: MarketData | None, efq, held,
+                drift: NDArray[np.float64]) -> Fills:
+    """:func:`fill_path` under drift holding, for all-or-nothing fills.
+
+    A fill's price does not depend on its size at the mid or the touch, so
+    one probe each way prices every possible buy and sale; the walk along
+    the decisions then only decides quantities.
+    """
+    target = np.nan_to_num(weights.values, nan=0.0)
+    if drift.shape != target.shape:
+        raise ValueError(f"drift must have shape {target.shape}, got {drift.shape}")
+    axes = (weights.decisions, weights.assets, weights.horizons)
+    buy = simulate_fills(Orders(np.ones(target.shape), *axes), market, efq=efq)
+    sell = simulate_fills(Orders(-np.ones(target.shape), *axes), market, efq=efq)
+    fillable = buy.quantity != 0
+    growth = 1.0 + np.nan_to_num(drift, nan=0.0)
+    quantity = np.zeros(target.shape)
+    previous, pending = held.copy(), np.zeros(held.shape, dtype=bool)
+    for t in range(target.shape[0]):
+        if t:
+            held = held * growth[t - 1]
+        wanted = (target[t] != previous) | pending
+        q = np.where(wanted & fillable[t], target[t] - held, 0.0)
+        quantity[t] = q
+        held = held + q
+        pending = wanted & ~fillable[t]
+        previous = target[t]
+    price = np.where(quantity > 0, buy.price, np.where(quantity < 0, sell.price, np.nan))
+    return Fills(quantity, price, np.where(quantity != 0, buy.mid_price, np.nan), *axes)
 
 
 def trading_cost(

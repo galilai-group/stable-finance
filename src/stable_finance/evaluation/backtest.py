@@ -208,6 +208,8 @@ def _prepare(like, realized, market: MarketData, days, horizon_index) -> dict:
         "spread": spread, "axis": axis, "horizon": horizon,
         "decisions": like.decisions, "assets": like.assets,
         "day": _day_index(days, n_decisions),
+        # what the caller called each decision's day (else the decision itself), for the P&L series
+        "day_labels": np.asarray(days).ravel() if days is not None else np.asarray(like.decisions),
         "days_given": days is not None,
         "n_decisions": n_decisions, "n_assets": n_assets,
     }
@@ -337,7 +339,12 @@ def _fills_toward(context: dict, values: NDArray[np.float64], config: BacktestCo
     # not priced at a decision is held, not moved for free.
     return fill_path(target, context["market"], model=config.cost_model,
                      efq=context.get("efq", config.efq),
-                     equity=config.equity)
+                     equity=config.equity, drift=_drift(context, config))
+
+
+def _drift(context: dict, config: BacktestConfig):
+    """The decision-to-decision returns positions move with, under drift holding; else None."""
+    return context["outcome"].values if config.holding == "drift" else None
 
 
 def _schedule(context: dict, config: BacktestConfig) -> int:
@@ -359,7 +366,7 @@ def _schedule(context: dict, config: BacktestConfig) -> int:
 def _score_fills(context: dict, fills, config: BacktestConfig, *,
                  with_series: bool = False) -> BacktestReport:
     """Mark the positions fills produced, and charge each fill's own cost."""
-    positions = positions_from_fills(fills).values[:, :, 0]
+    positions = positions_from_fills(fills, drift=_drift(context, config)).values[:, :, 0]
     outcome_values = context["outcome_values"]
     valid = np.isfinite(positions) & np.isfinite(outcome_values)
     gross = np.where(valid, positions * outcome_values, 0.0).sum(axis=1)
@@ -387,11 +394,11 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         )
         gross, net, costs_series = fold(gross), fold(net), fold(costs)
         # One label per folded period, in the same order as the folded series.
-        period_labels = np.asarray(day)[order][edges[:-1]]
+        period_labels = context["day_labels"][order][edges[:-1]]
         periods_per_year = 252.0
     else:
         costs_series = costs
-        period_labels = np.asarray(day)
+        period_labels = np.asarray(context["decisions"])
         periods_per_year = (context["n_decisions"]
                             / max(len(np.unique(day)), 1)) * 252.0
 
@@ -465,6 +472,7 @@ def run_backtest(
     train: tuple[Embeddings, ForwardReturns] | None = None,
     probe: RidgeProbe | None = None,
     efq: ArrayLike | None = None,
+    unfilled: str = "retry",
 ) -> BacktestReport:
     """Score one input, at any level, under one harness configuration.
 
@@ -498,6 +506,21 @@ def run_backtest(
     both the allocator's charge and the fills. The config keeps a scalar so a
     configuration stays one hashable point of the sweep; this is for a
     caller who has measured execution quality by name.
+
+    ``unfilled`` says what becomes of an ORDER (input at the orders level)
+    that cannot fill where it is sent, e.g. a name with no quote then.
+    ``"retry"`` (default) keeps it working: the orders are read as the
+    position path they imply, and that path is chased from what is really
+    held (:func:`fill_path`), so a missed exit goes out again at the next
+    decision the name quotes instead of leaving the position open for good.
+    ``"cancel"`` drops it, as the orders were literally sent. When every
+    order fills the two are identical. The impact models complete every
+    order, so it does not apply to them.
+
+    ``config.holding="drift"`` carries positions with their own returns
+    between decisions (see :data:`~stable_finance.evaluation.config.HOLDING_RULES`);
+    ``realized`` must then hold each name's return from each decision to the
+    next. It is supported for the ``mid`` and ``cross`` cost models.
     """
     source = forecast
     if isinstance(source, Embeddings):
@@ -507,6 +530,10 @@ def run_backtest(
         raise TypeError(f"run_backtest takes one of {[c.__name__ for c in LEVELS]}, "
                         f"not {type(source).__name__}")
     market = _market(source, market, half_spread)
+    if unfilled not in ("retry", "cancel"):
+        raise ValueError(f"unfilled must be 'retry' or 'cancel', not {unfilled!r}")
+    if config.holding == "drift" and config.cost_model not in ("mid", "cross"):
+        raise ValueError("holding='drift' is supported for the mid and cross cost models")
     _check_axes(config, market, source)
     context = _prepare(source, realized, market, days, horizon_index)
     if efq is not None:
@@ -522,10 +549,17 @@ def run_backtest(
     orders = Orders(source.values[:, :, one], source.decisions, source.assets,
                     source.horizons[one],
                     limit=None if source.limit is None else source.limit[:, :, one])
-    fills = execute(orders, market, model=config.cost_model, efq=context.get("efq", config.efq),
-                    equity=config.equity, impact=config.impact,
-                    schedule=(_schedule(context, config)
-                              if config.cost_model in ("impact", "impact_stock") else 0))
+    if unfilled == "retry" and config.cost_model not in ("impact", "impact_stock"):
+        # The path the orders imply, chased from what is really held.
+        path = PortfolioWeights(np.cumsum(np.nan_to_num(orders.values, nan=0.0), axis=0),
+                                orders.decisions, orders.assets, orders.horizons)
+        fills = fill_path(path, market, model=config.cost_model, efq=context.get("efq", config.efq),
+                          equity=config.equity, limit=orders.limit, drift=_drift(context, config))
+    else:
+        fills = execute(orders, market, model=config.cost_model, efq=context.get("efq", config.efq),
+                        equity=config.equity, impact=config.impact,
+                        schedule=(_schedule(context, config)
+                                  if config.cost_model in ("impact", "impact_stock") else 0))
     return _score_fills(context, fills, config, with_series=with_series)
 
 

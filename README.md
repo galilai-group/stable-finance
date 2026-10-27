@@ -567,6 +567,47 @@ A custom rule that reads other roles, say one sized off the bar range, declares
 a market without those columns refuses it the same way. `half_spread=` remains accepted wherever it was, as market data holding
 that quantity alone.
 
+## Trading events, not a lattice
+
+An event strategy trades when something happens -- buy on a news story at
+10:41:07, sell in the closing auction -- so it has no decision lattice.
+`event_backtest` takes the trades as round trips and a tape of quotes, builds
+the grid they imply, and scores it with the same harness:
+
+```python
+from stable_finance import DEFAULT_BACKTEST, Trades, event_backtest
+
+trades = Trades(assets, entry, exit, size,             # epoch seconds; size signed, of equity
+                exit_price=closing_cross)              # NaN: exit at the touch instead
+result = event_backtest(trades, tape,                  # tape: ticker, timestamp, bid_price, ask_price
+                        config=DEFAULT_BACKTEST.replace(efq=0.70))
+result.report.sharpe_net                               # daily, from the harness
+result.ledger.gross, result.ledger.cost                # per trade
+```
+
+Decisions are every entry and exit; each trade gets its own column, reused
+only once its trade has closed, so two trades on one name at once are two
+positions. Prices are the last quote at or before each time; an order meets
+the touch `delay_seconds` later; an `exit_price` fills there with no spread.
+A per-trade `efq` replaces the configuration's.
+
+Two harness settings make this exact, and are available to any input:
+
+- `holding="drift"` (in `BacktestConfig`) carries a position with its own
+  return between decisions, so a trade held across several decisions earns
+  exactly its price change, and an order goes out only when the target
+  changes -- an unchanged target is held, not rebalanced back. The default,
+  `holding="rebalanced"`, holds each name at its weight, right for a book
+  retraded every decision. Drift needs returns from each decision to the
+  next.
+- `run_backtest(orders, ..., unfilled="retry")` (the default) keeps an order
+  that could not fill working, so an exit sent when the name has no quote
+  goes out again at its next quote rather than leaving the position open.
+  `unfilled="cancel"` drops it.
+
+`run_backtest(..., efq=array)` likewise takes a per-name execution quality,
+broadcasting to `(decision, asset)`, in place of the configuration's scalar.
+
 ## Bringing your own data
 
 A dataset needs no machinery of its own. Map its columns to roles, say when

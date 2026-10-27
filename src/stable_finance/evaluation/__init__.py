@@ -58,6 +58,7 @@ from stable_finance.evaluation.config import (
     DEFAULT_BACKTEST,
     EFQ_GRID,
     OPTIONAL_SETTINGS,
+    HOLDING_RULES,
     REBALANCE_RULES,
     BacktestConfig,
     check_config,
@@ -66,6 +67,13 @@ from stable_finance.evaluation.config import (
 from stable_finance.evaluation.embeddings import (
     Embeddings,
     require_same_observations,
+)
+from stable_finance.evaluation.events import (
+    EventLedger,
+    EventResult,
+    Trades,
+    event_backtest,
+    event_inputs,
 )
 from stable_finance.evaluation.execution import (
     COST_MODEL_REQUIRES,
@@ -192,6 +200,7 @@ __all__ = [
     "PnLSeries",
     "PortfolioWeights",
     "ProbeData",
+    "HOLDING_RULES",
     "REBALANCE_RULES",
     "RISK_MODELS",
     "RISK_MODEL_REQUIRES",
@@ -224,6 +233,11 @@ __all__ = [
     "execute",
     "execution_requires",
     "fill_path",
+    "EventLedger",
+    "EventResult",
+    "Trades",
+    "event_backtest",
+    "event_inputs",
     "fill_requires",
     "fit",
     "grouped_rank_ic",

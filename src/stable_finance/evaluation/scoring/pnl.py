@@ -93,12 +93,29 @@ def evaluate_weights(
 
 
 def positions_from_fills(
-    fills: Fills, *, initial: ArrayLike | None = None
+    fills: Fills, *, initial: ArrayLike | None = None, drift: ArrayLike | None = None
 ) -> PortfolioWeights:
-    """Weights actually held after each decision's fills."""
+    """Weights actually held after each decision's fills.
+
+    Without ``drift`` a position is the running sum of its fills
+    (``holding="rebalanced"``). With ``drift`` -- each name's realized return
+    from each decision to the next, ``(decision, asset, horizon)`` -- what is
+    held moves with that return between decisions before the next fills land
+    (``holding="drift"``).
+    """
     n_decisions, n_assets, n_horizons = fills.quantity.shape
     start = _initial_positions(initial, (n_assets, n_horizons))
-    positions = start[None] + np.cumsum(fills.quantity, axis=0)
+    if drift is None:
+        positions = start[None] + np.cumsum(fills.quantity, axis=0)
+    else:
+        growth = 1.0 + np.nan_to_num(np.asarray(drift, dtype=np.float64), nan=0.0)
+        if growth.shape != fills.quantity.shape:
+            raise ValueError(f"drift must have shape {fills.quantity.shape}, got {growth.shape}")
+        positions = np.empty(fills.quantity.shape)
+        held = start
+        for t in range(n_decisions):
+            held = (held * growth[t - 1] if t else held) + fills.quantity[t]
+            positions[t] = held
     return PortfolioWeights(positions, fills.decisions, fills.assets, fills.horizons)
 
 
@@ -108,8 +125,12 @@ def evaluate_fills(
     *,
     initial: ArrayLike | None = None,
     periods_per_year: float = 252.0,
+    drift: bool = False,
 ) -> tuple[BacktestResult, ...]:
     """Mark the realized position path at mid and charge each fill's cost.
+
+    ``drift=True`` carries positions with their returns between decisions
+    (``holding="drift"``); the returns must then run decision to decision.
 
     Gross return is the position held after the decision's fills times the
     mid-to-mid forward return. Execution cost is the filled quantity times the
@@ -117,7 +138,8 @@ def evaluate_fills(
     cost money. One result is returned per horizon.
     """
     require_aligned(fills, realized_mid_returns)
-    positions = positions_from_fills(fills, initial=initial).values
+    positions = positions_from_fills(
+        fills, initial=initial, drift=realized_mid_returns.values if drift else None).values
     traded = fills.quantity != 0
     slippage = np.where(
         traded, (fills.price - fills.mid_price) / fills.mid_price, 0.0

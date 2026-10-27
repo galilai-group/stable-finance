@@ -48,6 +48,7 @@ __all__ = [
     "BacktestConfig",
     "CONFIG_SPACE",
     "DEFAULT_BACKTEST",
+    "HOLDING_RULES",
     "REBALANCE_RULES",
     "check_config",
     "enumerate_configs",
@@ -76,6 +77,19 @@ ANNUALIZATIONS = ("decisions", "daily")
 #: which cuts turnover by roughly the number of anchors in a day and is the
 #: difference between a signal that pays for its spread and one that does not.
 REBALANCE_RULES = ("every_decision", "daily")
+
+#: How a position is carried from one decision to the next. ``rebalanced``
+#: holds each name at its weight: every decision's book is a fresh bet that
+#: earns weight x return, as if trimmed back to weight for free -- right for a
+#: cross-sectional book retraded every decision, and how every earlier result
+#: was scored. ``drift`` holds what was bought: a position moves with its own
+#: return between decisions (h -> h (1 + r)), so a trade held across several
+#: decisions earns exactly its price change, and an order goes out only when
+#: the target CHANGES (or an earlier order is still unfilled) -- an unchanged
+#: target is held, not rebalanced back. ``drift`` needs the realized returns
+#: to run from each decision to the NEXT one; horizons that overlap the next
+#: decision would count the same move twice.
+HOLDING_RULES = ("rebalanced", "drift")
 
 #: ``mean_variance`` is the cost-aware, path-dependent allocator; the rest are
 #: the path-independent rules that size a selected book directly.
@@ -142,13 +156,16 @@ class BacktestConfig:
     #: 1000-iteration solution to floating point on panels of a few hundred
     #: names while costing a fifth of the time.
     max_iter: int = 400
+    #: How positions are carried between decisions (:data:`HOLDING_RULES`).
+    #: Accounting rather than a modelling axis, so it is not swept.
+    holding: str = "rebalanced"
 
     def __post_init__(self) -> None:
         for field, allowed in (
             ("universe", UNIVERSE_SCREENS), ("selection", SELECTION_RULES),
             ("weighting", ALLOCATORS), ("risk_model", RISK_MODELS),
             ("cost_model", COST_MODELS), ("rebalance", REBALANCE_RULES),
-            ("annualization", ANNUALIZATIONS),
+            ("annualization", ANNUALIZATIONS), ("holding", HOLDING_RULES),
         ):
             value = getattr(self, field)
             if value not in allowed:
@@ -198,6 +215,7 @@ class BacktestConfig:
         return "|".join(
             f"{field.name}={getattr(self, field.name)}" for field in fields(self)
             if not (field.name in OPTIONAL_SETTINGS and getattr(self, field.name) is None)
+            and not (field.name == "holding" and self.holding == "rebalanced")
         )
 
     @property
