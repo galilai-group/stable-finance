@@ -350,12 +350,16 @@ DEFAULT_BACKTEST = BacktestConfig()
 #: absent because ``efq`` is now the cost axis.
 #: ``rebalance`` sweeps the two schedules that are modelling choices;
 #: ``horizon`` is the accounting for a horizon longer than the decision
-#: spacing and is asked for by name.
+#: spacing and is asked for by name. ``risk_model`` lists its options
+#: explicitly rather than taking :data:`RISK_MODELS`, so the ``factor`` model
+#: added later is asked for by name and the space every published result was
+#: drawn from is unchanged.
 CONFIG_SPACE = {
     "universe": UNIVERSE_SCREENS,
     "selection": SELECTION_RULES,
     "weighting": ALLOCATORS,
-    "risk_model": RISK_MODELS,
+    "risk_model": ("diagonal", "shrunk_sample", "ledoit_wolf", "nonlinear_shrinkage",
+                   "embedding"),
     "efq": EFQ_GRID,
     "rebalance": ("every_decision", "daily"),
 }

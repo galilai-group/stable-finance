@@ -282,12 +282,27 @@ def _history_panel(context, history, realized) -> ForwardReturns:
 
 
 def _risk(context, config, history, realized, embeddings, horizon_index):
-    """The covariance for one risk model, on the horizon being scored."""
+    """The covariance for one risk model, on the horizon being scored.
+
+    The ``factor`` model adds industry factors when the market carries an
+    ``industry`` code, taking each name's FIRST known code: classifications
+    are static data, and the earliest code in the period is the one in force
+    when the model is fitted, so a reclassification later in the period
+    cannot leak into it.
+    """
     panel = _history_panel(context, history, realized)
     if embeddings is not None and not np.array_equal(embeddings.assets, context["assets"]):
         raise ValueError("assets of the embeddings and the input are not aligned")
+    industry = None
+    if config.risk_model == "factor" and context["market"].has("industry"):
+        codes = context["market"].get("industry")
+        known = np.isfinite(codes)
+        first = np.argmax(known, axis=0)
+        industry = np.where(known.any(axis=0),
+                            codes[first, np.arange(codes.shape[1])], np.nan)
     return estimate_risk(config.risk_model, panel, embeddings=embeddings,
-                         shrinkage=config.shrinkage, min_samples=2)[0]
+                         shrinkage=config.shrinkage, min_samples=2,
+                         industry=industry)[0]
 
 
 def _beta(context, history, realized) -> NDArray[np.float64]:

@@ -7,7 +7,10 @@ import pytest
 from stable_finance import ForwardReturns, estimate_covariance, liquidity_screen
 from stable_finance.evaluation.portfolio.risk import (
     RISK_MODELS,
+    diagonal_covariance,
     estimate_risk,
+    factor_covariance,
+    ledoit_wolf_covariance,
     nonlinear_shrinkage_covariance,
 )
 
@@ -129,6 +132,144 @@ def test_every_return_only_risk_model_is_symmetric_positive_definite(name):
     assert sigma.shape == (1, 8, 8)
     np.testing.assert_allclose(sigma[0], sigma[0].T, atol=1e-15)
     assert np.linalg.eigvalsh(sigma[0]).min() > 0
+
+
+# ── factor model ────────────────────────────────────────────────────────────
+
+def planted_factors(seed=0, n_decisions=2000, n_assets=40, n_factors=3):
+    """Returns with a known factor structure, unequal volatilities and specific risk."""
+    rng = np.random.default_rng(seed)
+    loadings = rng.normal(size=(n_assets, n_factors)) * np.linspace(1.0, 0.4, n_factors)
+    loadings[:, 0] += 1.0  # a market factor every name loads on
+    vols = rng.uniform(0.5, 2.0, size=n_assets) * 1e-3
+    specific = rng.uniform(0.5, 1.5, size=n_assets) ** 2
+    factors = rng.normal(size=(n_decisions, n_factors))
+    noise = rng.normal(size=(n_decisions, n_assets)) * np.sqrt(specific)
+    values = ((factors @ loadings.T + noise) * vols)[:, :, None]
+    true = (loadings @ loadings.T + np.diag(specific)) * np.outer(vols, vols)
+    returns = ForwardReturns(
+        values, np.arange(n_decisions), [f"A{i}" for i in range(n_assets)], [300]
+    )
+    return returns, true, loadings * vols[:, None]
+
+
+def minimum_variance(sigma, true):
+    """The true variance of the fully invested minimum-variance portfolio under ``sigma``."""
+    weights = np.linalg.solve(sigma, np.ones(len(sigma)))
+    weights /= weights.sum()
+    return float(weights @ true @ weights)
+
+
+def test_factor_model_is_symmetric_positive_definite():
+    for returns in (correlated_history(), correlated_history(n_decisions=30, n_assets=60)):
+        sigma = factor_covariance(returns, n_factors=3)
+        np.testing.assert_allclose(sigma[0], sigma[0].T, atol=1e-15)
+        assert np.linalg.eigvalsh(sigma[0]).min() > 0
+
+
+def test_factor_model_recovers_a_planted_factor_structure():
+    returns, true, exposures = planted_factors()
+    sigma = factor_covariance(returns, n_factors=3)[0]
+    assert np.linalg.norm(sigma - true) < 0.08 * np.linalg.norm(true)
+    # The leading eigenvectors of the fitted correlation span the planted
+    # exposures (in correlation units): every principal angle is small.
+    scale = np.sqrt(np.diag(sigma))
+    _, eigenvectors = np.linalg.eigh(sigma / np.outer(scale, scale))
+    planted, _ = np.linalg.qr(exposures / np.sqrt(np.diag(true))[:, None])
+    cosines = np.linalg.svd(planted.T @ eigenvectors[:, -3:], compute_uv=False)
+    assert cosines.min() > 0.95
+    # Too few factors leaves real covariance out.
+    one = factor_covariance(returns, n_factors=1)[0]
+    assert np.linalg.norm(one - true) > 2 * np.linalg.norm(sigma - true)
+
+
+def test_factor_model_beats_shrinkage_on_a_short_factor_history():
+    # 120 decisions for 80 names: the sample covariance is nearly singular,
+    # and the factor structure is what lets the minimum-variance book hedge.
+    for seed in range(3):
+        returns, true, _ = planted_factors(seed, n_decisions=120, n_assets=80)
+        best = minimum_variance(true, true)
+        factor = minimum_variance(factor_covariance(returns, n_factors=3)[0], true)
+        shrunk = minimum_variance(ledoit_wolf_covariance(returns)[0], true)
+        assert factor < 1.15 * best
+        assert factor < 0.75 * shrunk
+
+
+def test_factor_model_with_no_factors_is_the_diagonal_model():
+    returns = correlated_history()
+    values = returns.values.copy()
+    values[:40, 3, 0] = np.nan
+    values[70:75, 7, 0] = np.nan
+    gappy = ForwardReturns(values, returns.decisions, returns.assets, returns.horizons)
+    for panel in (returns, gappy):
+        np.testing.assert_allclose(
+            factor_covariance(panel, n_factors=0), diagonal_covariance(panel),
+            rtol=1e-12, atol=0.0,
+        )
+
+
+def test_factor_model_keeps_every_variance_and_adds_only_covariances():
+    returns, _, _ = planted_factors(n_decisions=300)
+    values = returns.values.copy()
+    values[:50, 0, 0] = np.nan
+    gappy = ForwardReturns(values, returns.decisions, returns.assets, returns.horizons)
+    np.testing.assert_allclose(
+        np.diag(factor_covariance(gappy, n_factors=4)[0]),
+        np.diag(diagonal_covariance(gappy)[0]), rtol=1e-10,
+    )
+
+
+def test_industry_factors_capture_a_planted_industry_structure():
+    rng = np.random.default_rng(3)
+    n_decisions, members = 4000, 30
+    codes = np.repeat([10.0, 20.0, 30.0], members)
+    strength = np.array([1.0, 0.7, 0.5])
+    industry = rng.normal(size=(n_decisions, 3)) * strength
+    group = np.repeat(np.arange(3), members)
+    values = industry[:, group] + rng.normal(size=(n_decisions, len(codes)))
+    returns = ForwardReturns(values[:, :, None] * 1e-3, np.arange(n_decisions),
+                             [f"A{i}" for i in range(len(codes))], [300])
+    sigma = factor_covariance(returns, n_factors=0, industry=codes)[0]
+    scale = np.sqrt(np.diag(sigma))
+    correlation = sigma / np.outer(scale, scale)
+    share = strength**2 / (strength**2 + 1)
+    expected = np.where(group[:, None] == group[None, :], share[group][:, None], 0.0)
+    np.fill_diagonal(expected, 1.0)
+    # An industry's factor is its members' average, which carries 1/30 of
+    # their specific variance: within-industry correlations sit that much high.
+    np.testing.assert_allclose(correlation, expected, atol=0.05)
+
+
+def test_unclassified_and_single_name_industries_get_no_industry_factor():
+    returns = correlated_history(n_assets=6)
+    codes = np.array([np.nan, 1.0, 1.0, 2.0, 2.0, 3.0])
+    sigma = factor_covariance(returns, n_factors=0, industry=codes)[0]
+    for name in (0, 5):
+        others = np.delete(np.arange(6), name)
+        assert np.abs(sigma[name, others]).max() < 1e-12 * sigma[name, name]
+    # The two real industries are factors: their members co-move, and so do
+    # the industries, whose factor covariance is estimated in full.
+    assert sigma[1, 2] != 0.0 and sigma[3, 4] != 0.0 and sigma[1, 3] != 0.0
+
+
+def test_factor_model_rejects_bad_arguments():
+    returns = correlated_history(n_assets=6)
+    for bad in (-1, 6, 2.5, True):
+        with pytest.raises(ValueError, match="n_factors"):
+            factor_covariance(returns, n_factors=bad)
+    with pytest.raises(ValueError, match="one code per asset"):
+        factor_covariance(returns, industry=np.ones((3, 6)))
+
+
+def test_factor_model_is_dispatched_by_name():
+    returns = correlated_history()
+    codes = np.repeat([1.0, 2.0], 10)
+    np.testing.assert_array_equal(estimate_risk("factor", returns),
+                                  factor_covariance(returns))
+    np.testing.assert_array_equal(
+        estimate_risk("factor", returns, n_factors=2, industry=codes),
+        factor_covariance(returns, n_factors=2, industry=codes),
+    )
 
 
 # ── universe screens ────────────────────────────────────────────────────────

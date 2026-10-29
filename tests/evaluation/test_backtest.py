@@ -4,6 +4,7 @@ import pytest
 from stable_finance import (
     CONFIG_SPACE,
     DEFAULT_BACKTEST,
+    RISK_MODELS,
     BacktestConfig,
     Embeddings,
     ForwardReturns,
@@ -14,6 +15,7 @@ from stable_finance import (
     embedding_covariance,
     enumerate_configs,
     estimate_risk,
+    factor_covariance,
     ledoit_wolf_covariance,
     run_backtest,
     select_book,
@@ -217,6 +219,36 @@ def test_identical_embeddings_forecast_a_perfect_correlation():
 def test_embedding_risk_model_requires_embeddings():
     with pytest.raises(ValueError, match="needs embeddings"):
         estimate_risk("embedding", world()["history"])
+
+
+def test_the_factor_model_is_selectable_but_not_swept():
+    assert "factor" in RISK_MODELS
+    assert "factor" not in CONFIG_SPACE["risk_model"]
+    assert {c.risk_model for c in enumerate_configs()} == set(CONFIG_SPACE["risk_model"])
+    asked = enumerate_configs(risk_model=("factor",), weighting="min_var", efq=0.0,
+                              universe="all", selection="all", rebalance="every_decision")
+    assert [c.risk_model for c in asked] == ["factor"]
+    w = world()
+    report = run_backtest(w["forecast"], w["realized"], history=w["history"],
+                          config=FRICTIONLESS.replace(weighting="min_var", risk_model="factor"))
+    assert np.isfinite(report.sharpe_mid)
+
+
+def test_the_factor_model_reads_the_market_industry_codes_when_there_are_some():
+    w = world()
+    codes = np.tile([1.0, 1.0, 1.0, 2.0, 2.0, 2.0], (80, 1))
+    codes[:5, 0] = np.nan  # a name first classified at decision 5
+    codes[40:, 5] = 1.0    # a reclassification later in the period is not read
+    market = MarketData({"industry": codes}, w["forecast"].decisions, ASSETS)
+    config = FRICTIONLESS.replace(weighting="min_var", risk_model="factor")
+    plain = bt._prepare(w["forecast"], w["realized"], MarketData.empty(
+        w["forecast"].decisions, ASSETS), None, 0)
+    coded = bt._prepare(w["forecast"], w["realized"], market, None, 0)
+    np.testing.assert_array_equal(bt._risk(plain, config, w["history"], w["realized"], None, 0),
+                                  factor_covariance(w["history"])[0])
+    np.testing.assert_array_equal(
+        bt._risk(coded, config, w["history"], w["realized"], None, 0),
+        factor_covariance(w["history"], industry=[1.0, 1.0, 1.0, 2.0, 2.0, 2.0])[0])
 
 
 def test_unknown_risk_model_is_rejected():
