@@ -38,6 +38,7 @@ reading it, so a month needs about 1.6 GB of download plus one unpacked day
 | `e3_horizon_overlap` | How much do overlapping forward returns inflate the booked P&L at each horizon, and how much less do persistent (by-name) errors trade? Uses `copula_forecast` at half-lives of none, 3 and 12 decisions |
 | `e4_harness_sensitivity` | For a fixed forecast, how far do the risk model, neutralization, Grinold scaling and the liquidity screen move net Sharpe? |
 | `e5_real_signals` | Where do cheap real forecasts land on the oracle's map? |
+| `e6_sanity_checks` | Do the controls behave? IC-0 placebos under ten seeds must centre on zero, the seed-to-seed spread at IC 0.03 says how much one draw can mislead, and at IC 1 the three oracles must coincide |
 
 A spec names the evaluation month, the risk-history month, the horizons, the
 forecasts and a grid of `BacktestConfig` settings. `"rebalance": "horizon"`
@@ -49,6 +50,18 @@ rows are written in task order, and the manifest records the commit, the spec
 and a hash of every input array. Each (forecast, horizon) task is
 checkpointed under `results/<name>/tasks/` as it finishes, so a run that is
 killed resumes where it stopped when started again.
+
+`forecasts` is one grid or a list of grids of different kinds. In a grid,
+`seed` may be a list, running the same forecast under each seed, and `scale`
+sets the oracle's shrinkage (an IC-0 forecast needs one).
+
+Besides the report's own fields, every row carries the Sharpe ratio of the
+P&L summed over each day (`sharpe_daily_mid`, `sharpe_daily_net`), the
+honest unit for an intraday book, with a 95% interval from a bootstrap that
+resamples whole days (`..._low`, `..._high`). The resampling is seeded and
+depends only on the number of days, so intervals are reproducible and paired
+across rows. A month has about twenty days: the intervals give the scale of
+the uncertainty rather than exact coverage.
 
 ## On a cluster
 

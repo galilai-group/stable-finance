@@ -103,22 +103,40 @@ def _hash(array) -> str:
 
 # ── forecasts ───────────────────────────────────────────────────────────────
 
+def _grid(f: dict, keys: tuple[str, ...]) -> list[dict]:
+    """Every combination of a forecast grid's options; a scalar is one option.
+
+    ``seed`` may be a list too, running the same forecast under each seed, so
+    a result can be told apart from a lucky draw. ``scale`` is passed on only
+    when the grid sets it, so a spec that does not name it keeps its
+    forecasts and its row ids.
+    """
+    keys = (*keys, "seed", *(("scale",) if "scale" in f else ()))
+    defaults = {"seed": 0}
+    options = [f[k] if isinstance(f.get(k), list) else [f.get(k, defaults.get(k))]
+               for k in keys]
+    return [{"kind": f["kind"], **dict(zip(keys, combo))}
+            for combo in itertools.product(*options)]
+
+
 def forecast_specs(spec: dict) -> list[dict]:
-    """One dict per forecast, in a fixed order."""
-    f = spec["forecasts"]
-    if f["kind"] == "oracle":
-        keys = ("ic", "noise", "scatter", "persistence")
-        grid = [f.get(k, [None]) if isinstance(f.get(k), list) else [f.get(k)] for k in keys]
-        return [{"kind": "oracle", **dict(zip(keys, combo)), "seed": f.get("seed", 0)}
-                for combo in itertools.product(*grid)]
-    if f["kind"] == "copula":
-        keys = ("ic", "half_life")
-        grid = [f.get(k, [None]) if isinstance(f.get(k), list) else [f.get(k)] for k in keys]
-        return [{"kind": "copula", **dict(zip(keys, combo)), "seed": f.get("seed", 0)}
-                for combo in itertools.product(*grid)]
-    if f["kind"] == "file":
-        return [{"kind": "file", "path": p, "name": Path(p).stem} for p in f["paths"]]
-    raise ValueError(f"unknown forecast kind {f['kind']!r}")
+    """One dict per forecast, in a fixed order.
+
+    ``forecasts`` is one grid or a list of grids of different kinds, run in
+    the order given.
+    """
+    grids = spec["forecasts"] if isinstance(spec["forecasts"], list) else [spec["forecasts"]]
+    out = []
+    for f in grids:
+        if f["kind"] == "oracle":
+            out += _grid(f, ("ic", "noise", "scatter", "persistence"))
+        elif f["kind"] == "copula":
+            out += _grid(f, ("ic", "half_life"))
+        elif f["kind"] == "file":
+            out += [{"kind": "file", "path": p, "name": Path(p).stem} for p in f["paths"]]
+        else:
+            raise ValueError(f"unknown forecast kind {f['kind']!r}")
+    return out
 
 
 def restrict_decisions(inputs: dict, decisions) -> dict:
@@ -153,10 +171,13 @@ def make_forecast(fspec: dict, inputs: dict) -> sf.ForwardReturns:
         if fspec.get("persistence") not in (None, 1):
             kwargs["persistence"] = fspec["persistence"]
             kwargs["days"] = inputs["days"]
+        if fspec.get("scale") is not None:
+            kwargs["scale"] = fspec["scale"]
         return sf.oracle_forecast(realized, fspec["ic"], **kwargs)
     if fspec["kind"] == "copula":
         return sf.copula_forecast(realized, fspec["ic"], half_life=fspec["half_life"],
-                                  days=inputs["days"], seed=fspec["seed"])
+                                  days=inputs["days"], scale=fspec.get("scale"),
+                                  seed=fspec["seed"])
     data = np.load(fspec["path"], allow_pickle=False)
     values = data["forecast"]
     index = {a: i for i, a in enumerate(data["assets"].astype(str))}
@@ -218,6 +239,47 @@ def _breakeven(series, efq: float) -> float:
     return float(sf.breakeven_efq(series.gross, series.cost / efq))
 
 
+#: Resamples behind each bootstrap interval. The generator is seeded and
+#: depends only on the number of days, so every row of a run resamples the
+#: same days: intervals are reproducible and paired across configurations.
+BOOTSTRAP_DRAWS = 2000
+
+
+def _sharpe(daily: np.ndarray) -> np.ndarray:
+    """Annualized Sharpe of daily P&L along the last axis; NaN when flat."""
+    sd = daily.std(axis=-1, ddof=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(sd > 0, daily.mean(axis=-1) / sd * np.sqrt(252.0), np.nan)
+
+
+def _inference(series) -> dict:
+    """Daily Sharpe ratios and 95% day-block bootstrap intervals for them.
+
+    The day is the honest unit for an intraday book. A Sharpe ratio computed
+    per decision and annualized by the decisions in a year treats some
+    twenty thousand overlapping, intraday-seasonal periods as independent,
+    which inflates it; the P&L summed over each day is close to independent
+    across days. The intervals resample whole days with replacement -- days
+    are the natural blocks, since P&L is correlated within one -- with a
+    seeded generator. One month gives about twenty days, so the intervals are
+    wide and themselves approximate: read them as the scale of the
+    uncertainty, not as exact coverage.
+    """
+    days = np.char.partition(np.asarray(series.periods).astype(str), "|")[:, 0]
+    _, index = np.unique(days, return_inverse=True)
+    n = int(index.max()) + 1
+    draws = np.random.default_rng(0).integers(0, n, size=(BOOTSTRAP_DRAWS, n))
+    out = {"n_days": n}
+    for name, values in (("mid", series.gross), ("net", series.net)):
+        daily = np.bincount(index, weights=np.nan_to_num(values), minlength=n)
+        out[f"sharpe_daily_{name}"] = float(_sharpe(daily))
+        boot = _sharpe(daily[draws])
+        boot = boot[np.isfinite(boot)]
+        low, high = np.percentile(boot, [2.5, 97.5]) if len(boot) else (np.nan, np.nan)
+        out[f"sharpe_daily_{name}_low"], out[f"sharpe_daily_{name}_high"] = float(low), float(high)
+    return out
+
+
 def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0) -> tuple[list[dict], dict]:
     inputs = _INPUTS if _INPUTS is not None else load_inputs(spec)
     if fspec["kind"] == "file":
@@ -240,6 +302,7 @@ def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0) -> tuple[lis
                "eval_horizon": horizon, **report.as_dict()}
         if report.config.cost_model != "mid":
             row["breakeven_efq"] = _breakeven(report.series, report.config.efq)
+        row.update(_inference(report.series))
         row["row_id"] = hashlib.sha256(json.dumps(
             {k: row[k] for k in sorted(row) if k.startswith("f_") or k in
              ("eval_horizon",)} | {"label": report.config.label},
