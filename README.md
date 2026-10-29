@@ -308,6 +308,24 @@ from stable_finance import copula_forecast
 forecast = copula_forecast(realized, [0.03, 0.02, 0.01], half_life=12, days=days, seed=0)
 ```
 
+`factor_forecast` is the copula with three properties of real forecasts
+added, each by a parameter. Its errors are factor bets: they load on the
+principal components of past returns (`n_factors`, `factor_share`), so a
+forecast is wrong about many names at once and neutralization or a risk
+model has something to remove. Its IC drifts: the per-decision target is an
+AR(1) around `ic` (`ic_dispersion`, `ic_persistence`). And its accuracy can
+rise with a name's spread or volatility (`quality="spread"` or `"vol"`). On
+August 2020, `factor_share=0.3` widens the per-decision IC's spread from the
+copula's 0.04 to 0.15, about what real signals show there. With all three
+off it is `copula_forecast`, draw for draw.
+
+```python
+from stable_finance import factor_forecast
+
+forecast = factor_forecast(realized, 0.03, history=prior, factor_share=0.3, half_life=12,
+                           quality="spread", market=market, days=days, seed=0)
+```
+
 ## The harness is a configuration, not a constant
 
 A Sharpe ratio is not a property of a forecast. It is a property of a forecast

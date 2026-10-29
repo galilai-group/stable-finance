@@ -2,7 +2,8 @@
 
 An experiment is a JSON spec naming a month to evaluate on, a month of risk
 history before it, a set of forecasts (noised oracles at chosen ICs and noise
-modes, copula oracles at chosen half-lives, or a saved forecast file), the
+modes, copula oracles at chosen half-lives, factor-structured oracles whose
+errors are factor bets and whose IC drifts, or a saved forecast file), the
 horizons to score, and a grid of
 :class:`~stable_finance.BacktestConfig` settings. Every (forecast, horizon)
 pair is one :func:`~stable_finance.sweep_configs` call, so a grid shares its
@@ -103,20 +104,31 @@ def _hash(array) -> str:
 
 # ── forecasts ───────────────────────────────────────────────────────────────
 
-def _grid(f: dict, keys: tuple[str, ...]) -> list[dict]:
+def _grid(f: dict, keys: tuple[str, ...], defaults: dict | None = None,
+          optional: tuple[str, ...] = ()) -> list[dict]:
     """Every combination of a forecast grid's options; a scalar is one option.
 
     ``seed`` may be a list too, running the same forecast under each seed, so
-    a result can be told apart from a lucky draw. ``scale`` is passed on only
-    when the grid sets it, so a spec that does not name it keeps its
-    forecasts and its row ids.
+    a result can be told apart from a lucky draw. ``scale`` and the keys in
+    ``optional`` are passed on only when the grid sets them, so a spec that
+    does not name them keeps its forecasts and its row ids. ``defaults`` fills
+    keys the grid leaves out, so a row records the value the forecast used
+    rather than a blank.
     """
-    keys = (*keys, "seed", *(("scale",) if "scale" in f else ()))
-    defaults = {"seed": 0}
+    keys = (*keys, "seed", *(k for k in (*optional, "scale") if k in f))
+    defaults = {"seed": 0, **(defaults or {})}
     options = [f[k] if isinstance(f.get(k), list) else [f.get(k, defaults.get(k))]
                for k in keys]
     return [{"kind": f["kind"], **dict(zip(keys, combo))}
             for combo in itertools.product(*options)]
+
+
+#: A factor oracle's grid keys, named as :func:`~stable_finance.factor_forecast`
+#: names them, and the library's defaults for the ones a spec leaves out.
+#: ``quality_strength`` enters a row only when the grid names it.
+FACTOR_KEYS = ("ic", "n_factors", "factor_share", "ic_persistence", "ic_dispersion",
+               "quality", "half_life")
+FACTOR_DEFAULTS = {"n_factors": 3, "factor_share": 0.3, "ic_dispersion": 0.0}
 
 
 def forecast_specs(spec: dict) -> list[dict]:
@@ -132,6 +144,8 @@ def forecast_specs(spec: dict) -> list[dict]:
             out += _grid(f, ("ic", "noise", "scatter", "persistence"))
         elif f["kind"] == "copula":
             out += _grid(f, ("ic", "half_life"))
+        elif f["kind"] == "factor":
+            out += _grid(f, FACTOR_KEYS, FACTOR_DEFAULTS, optional=("quality_strength",))
         elif f["kind"] == "file":
             out += [{"kind": "file", "path": p, "name": Path(p).stem} for p in f["paths"]]
         else:
@@ -178,6 +192,14 @@ def make_forecast(fspec: dict, inputs: dict) -> sf.ForwardReturns:
         return sf.copula_forecast(realized, fspec["ic"], half_life=fspec["half_life"],
                                   days=inputs["days"], scale=fspec.get("scale"),
                                   seed=fspec["seed"])
+    if fspec["kind"] == "factor":
+        # The loadings (and "vol" quality) come from the history's first
+        # horizon, the spec's shortest; "spread" quality reads the market.
+        options = {k: fspec[k] for k in (*FACTOR_KEYS[1:], "quality_strength", "scale")
+                   if fspec.get(k) is not None}
+        return sf.factor_forecast(realized, fspec["ic"], history=inputs["history"],
+                                  market=inputs["market"], days=inputs["days"],
+                                  seed=fspec["seed"], **options)
     data = np.load(fspec["path"], allow_pickle=False)
     values = data["forecast"]
     index = {a: i for i, a in enumerate(data["assets"].astype(str))}

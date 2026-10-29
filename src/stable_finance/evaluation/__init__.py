@@ -135,12 +135,14 @@ from stable_finance.evaluation.portfolio import (
 )
 from stable_finance.evaluation.returns import (
     NOISE_MODES,
+    QUALITY_VARIABLES,
     ColumnwiseRidge,
     ForwardReturns,
     ProbeData,
     RidgeProbe,
     StreamingRidge,
     copula_forecast,
+    factor_forecast,
     fit,
     oracle_forecast,
 )
@@ -230,6 +232,7 @@ __all__ = [
     "PnLSeries",
     "PortfolioWeights",
     "ProbeData",
+    "QUALITY_VARIABLES",
     "HOLDING_RULES",
     "REBALANCE_RULES",
     "REBALANCE_SOLVERS",
@@ -274,6 +277,7 @@ __all__ = [
     "execute",
     "execution_requires",
     "expected_max_sharpe",
+    "factor_forecast",
     "fill_path",
     "EventLedger",
     "EventResult",

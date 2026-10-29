@@ -56,6 +56,18 @@ killed resumes where it stopped when started again.
 `seed` may be a list, running the same forecast under each seed, and `scale`
 sets the oracle's shrinkage (an IC-0 forecast needs one).
 
+Kind `"factor"` runs `factor_forecast`, with keys named as its arguments:
+`ic`, `n_factors` (default 3), `factor_share` (default 0.3),
+`ic_persistence`, `ic_dispersion` (default 0), `quality` (`"spread"` or
+`"vol"`), `quality_strength` (only when given) and `half_life`. Its loadings
+come from the risk-history month's first horizon (so list the shortest
+horizon first), and `"spread"` quality reads the evaluation month's quotes.
+
+```json
+"forecasts": {"kind": "factor", "ic": [0.02, 0.05], "factor_share": [0.0, 0.3],
+              "half_life": 12, "quality": [null, "spread"], "seed": [0, 1, 2]}
+```
+
 Besides the report's own fields, every row carries the Sharpe ratio of the
 P&L summed over each day (`sharpe_daily_mid`, `sharpe_daily_net`), the
 honest unit for an intraday book, with a 95% interval from a bootstrap that
