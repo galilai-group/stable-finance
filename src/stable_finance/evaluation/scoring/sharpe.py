@@ -162,6 +162,7 @@ def sharpe_vs_execution_quality(
     *,
     efq_grid: ArrayLike | None = None,
     periods_per_year: float = 252.0,
+    fees: ArrayLike | None = None,
 ) -> ExecutionQualityCurve:
     """Sweep net Sharpe across execution quality, from one backtest.
 
@@ -181,12 +182,25 @@ def sharpe_vs_execution_quality(
     own length, so a reader can see directly that a result of this size cannot
     be distinguished from zero at this sample length -- which is a property of
     the horizon available, not a flaw in the estimate.
+
+    ``fees`` is a per-period charge that does NOT scale with execution quality
+    -- commissions, access and regulatory fees -- paid at every EFQ, so the
+    curve is ``gross - fees - efq * cost`` and ``gross_sharpe`` stays the
+    frictionless one. ``cost_at_unit_efq`` must then exclude them.
     """
     gross = np.asarray(gross, dtype=np.float64).ravel()
     cost = np.asarray(cost_at_unit_efq, dtype=np.float64).ravel()
     if gross.shape != cost.shape:
         raise ValueError("gross and cost_at_unit_efq must have the same shape")
+    fee = None if fees is None else np.asarray(fees, dtype=np.float64).ravel()
+    if fee is not None and fee.shape != gross.shape:
+        raise ValueError("fees must have the same shape as gross")
     keep = np.isfinite(gross) & np.isfinite(cost)
+    if fee is not None:
+        keep &= np.isfinite(fee)
+        fee = fee[keep]
+        if np.any(fee < 0):
+            raise ValueError("fees cannot be negative")
     gross, cost = gross[keep], cost[keep]
     if len(gross) < 2:
         raise ValueError("need at least two periods")
@@ -196,7 +210,8 @@ def sharpe_vs_execution_quality(
     grid = (np.linspace(0.0, 1.5, 61) if efq_grid is None
             else np.asarray(efq_grid, dtype=np.float64).ravel())
     years = len(gross) / periods_per_year
-    sharpe = np.array([sharpe_ratio(gross - ratio * cost,
+    charged = gross if fee is None else gross - fee
+    sharpe = np.array([sharpe_ratio(charged - ratio * cost,
                                     periods_per_year=periods_per_year)
                        for ratio in grid])
     # Lo (2002): the SE of an annualized Sharpe grows with the ratio itself,
@@ -207,12 +222,13 @@ def sharpe_vs_execution_quality(
         sharpe=sharpe,
         standard_error=standard_error,
         gross_sharpe=sharpe_ratio(gross, periods_per_year=periods_per_year),
-        breakeven=breakeven_efq(gross, cost),
+        breakeven=breakeven_efq(gross, cost, fees=fee),
         periods=int(len(gross)),
     )
 
 
-def breakeven_efq(gross: ArrayLike, cost_at_unit_efq: ArrayLike) -> float:
+def breakeven_efq(gross: ArrayLike, cost_at_unit_efq: ArrayLike, *,
+                  fees: ArrayLike | None = None) -> float:
     """The EFQ at which the expected net return reaches zero.
 
     Costs are linear in EFQ, so a strategy's whole sensitivity to execution
@@ -229,11 +245,22 @@ def breakeven_efq(gross: ArrayLike, cost_at_unit_efq: ArrayLike) -> float:
 
     Returns ``inf`` when nothing is ever charged and ``nan`` when the gross
     return is not positive, since no execution quality rescues that.
+
+    ``fees`` are per-period charges paid at every EFQ (commissions, access and
+    regulatory fees, as in :attr:`~stable_finance.evaluation.backtest.PnLSeries.fee`).
+    They come off the gross before the division -- the break-even is
+    ``mean(gross - fees) / mean(cost at EFQ = 1)``, with the fees left out of
+    that cost -- and a strategy whose fees alone eat its gross has none.
     """
     gross = np.asarray(gross, dtype=np.float64)
     cost = np.asarray(cost_at_unit_efq, dtype=np.float64)
     if gross.shape != cost.shape:
         raise ValueError("gross and cost must have the same shape")
+    if fees is not None:
+        fee = np.asarray(fees, dtype=np.float64)
+        if fee.shape != gross.shape:
+            raise ValueError("fees must have the same shape as gross")
+        gross = gross - fee
     mean_gross, mean_cost = float(np.mean(gross)), float(np.mean(cost))
     if mean_gross <= 0:
         return float("nan")

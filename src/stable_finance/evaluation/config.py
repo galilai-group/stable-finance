@@ -27,7 +27,13 @@ from dataclasses import dataclass, fields, replace
 import numpy as np
 
 from stable_finance.dataset.schema import MissingRolesError
-from stable_finance.evaluation.execution import COST_MODEL_REQUIRES, COST_MODELS
+from stable_finance.evaluation.execution import (
+    COST_MODEL_REQUIRES,
+    COST_MODELS,
+    FEE_REQUIRES,
+    FEE_SETTINGS,
+    _fee_setting,
+)
 from stable_finance.evaluation.portfolio.construction import (
     SELECTION_REQUIRES,
     SELECTION_RULES,
@@ -123,7 +129,7 @@ AXIS_REQUIRES: dict[str, dict[str, tuple[str, ...]]] = {
 #: Settings that are ``None`` unless a model needs them, and that labels and
 #: result rows leave out while unset.
 OPTIONAL_SETTINGS = ("equity", "execution_days", "impact", "alpha", "alpha_ic",
-                     "neutralize", "mv_solver")
+                     "neutralize", "mv_solver", *FEE_SETTINGS)
 
 
 @dataclass(frozen=True)
@@ -196,6 +202,28 @@ class BacktestConfig:
     #: iterations: the converged book, so that a result about the allocator is
     #: not a result about where its solver was stopped.
     mv_solver: str | None = None
+    #: FEES, charged per unit of weight traded ON TOP of the cost model, and,
+    #: like ``efq``, to the cost-aware allocator and in the scoring alike, so
+    #: a book is planned against the fees it then pays. All three are refused
+    #: with ``cost_model='mid'``, the frictionless benchmark (``cross`` at
+    #: ``efq=0`` is a midpoint fill that still pays them). ``fee_bps`` is a
+    #: commission in basis points of the notional traded, on either side.
+    fee_bps: float | None = None
+    #: Dollars per share traded, on either side, such as an exchange's take
+    #: fee. It needs each name's share price (a ``mid``, or the bid and ask),
+    #: and :func:`check_config` refuses it on a market without one.
+    fee_per_share: float | None = None
+    #: A fraction of the notional SOLD, the SEC's Section 31 fee. The
+    #: allocator's cost is one rate for either side of a trade, so it is
+    #: charged half of this on every unit, which is exact per round trip (see
+    #: :func:`~stable_finance.evaluation.execution.fee_per_unit`); the scoring
+    #: bills each sale in full. For a sample from 2020::
+    #:
+    #:     BacktestConfig(fee_per_share=0.003,    # Reg NMS Rule 610 access-fee cap
+    #:                    sec_fee_rate=22.10e-6)  # SEC Section 31, fiscal 2020
+    #:
+    #: which is about 1.5 bp per side on a $20 stock, plus 0.22 bp on each sale.
+    sec_fee_rate: float | None = None
 
     def __post_init__(self) -> None:
         for field, allowed in (
@@ -253,6 +281,12 @@ class BacktestConfig:
         if self.mv_solver is not None and self.mv_solver not in REBALANCE_SOLVERS:
             raise ValueError(f"mv_solver={self.mv_solver!r} is not None or one of "
                              f"{REBALANCE_SOLVERS}")
+        for name in FEE_SETTINGS:
+            object.__setattr__(self, name, _fee_setting(name, getattr(self, name)))
+        if self.cost_model == "mid" and self.fees:
+            raise ValueError("cost_model='mid' is the frictionless benchmark and charges no fees; "
+                             "charge them on top of 'cross' (efq=0 for midpoint fills that still "
+                             "pay them), 'book' or an impact model")
         if self.rebalance == "horizon" and self.holding == "drift":
             raise ValueError("rebalance='horizon' books each held book's forward return once; "
                              "holding='drift' already carries positions step by step on "
@@ -272,13 +306,26 @@ class BacktestConfig:
         )
 
     @property
+    def fees(self) -> dict[str, float]:
+        """The fee settings this configuration charges, by name; empty when it charges none."""
+        return {name: getattr(self, name) for name in FEE_SETTINGS
+                if getattr(self, name) is not None}
+
+    @property
     def requires(self) -> dict[str, tuple[str, ...]]:
-        """Market quantities this configuration needs, by the axis needing them."""
+        """Market quantities this configuration needs, by the axis needing them.
+
+        A fee that needs the market is listed under its own name, as an axis
+        option is: ``fee_per_share`` needs the share price.
+        """
         out = {}
         for axis, table in AXIS_REQUIRES.items():
             needed = table.get(getattr(self, axis), ())
             if needed:
                 out[axis] = tuple(needed)
+        for name in self.fees:
+            if FEE_REQUIRES[name]:
+                out[name] = tuple(FEE_REQUIRES[name])
         return out
 
     def supported_by(self, market) -> bool:
@@ -354,7 +401,10 @@ def check_config(config: BacktestConfig, market) -> None:
              "universe": "universe='all' runs without quotes",
              "neutralize": "neutralize='beta' runs on any market data, estimating beta "
                            "from the risk history; 'industry' needs an industry code "
-                           "for each name"}
+                           "for each name",
+             "fee_per_share": "fee_per_share is dollars per share, so it needs each name's "
+                              "share price (mid, or bid_price and ask_price); fee_bps and "
+                              "sec_fee_rate are charged on notional and need none"}
     for axis, needed in config.requires.items():
         try:
             market.require(*needed, purpose=f"{axis}={getattr(config, axis)!r}")

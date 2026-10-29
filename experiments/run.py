@@ -400,10 +400,18 @@ def _breakeven(series, efq: float) -> float:
     approximately linear in EFQ. The Sharpe at each EFQ is therefore taken
     from its own run (EFQ is a grid axis), and only the break-even is read
     off one path.
+
+    A configuration that charges fees (``fee_bps``, ``fee_per_share``,
+    ``sec_fee_rate``) pays them at every EFQ, so they come off the gross
+    rather than scaling with the spread: the break-even is then
+    ``mean(gross - fee) / mean((cost - fee) / efq)``.
     """
     if efq <= 0:
         return float("nan")
-    return float(sf.breakeven_efq(series.gross, series.cost / efq))
+    if series.fee is None:
+        return float(sf.breakeven_efq(series.gross, series.cost / efq))
+    return float(sf.breakeven_efq(series.gross, (series.cost - series.fee) / efq,
+                                  fees=series.fee))
 
 
 #: Resamples behind each bootstrap interval. The generator is seeded and

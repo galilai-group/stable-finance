@@ -52,9 +52,12 @@ from stable_finance.evaluation.config import (
 )
 from stable_finance.evaluation.embeddings.contract import Embeddings
 from stable_finance.evaluation.execution import (
+    FEE_SETTINGS,
     Orders,
     _efq_array,
     execute,
+    fee_cost,
+    fee_per_unit,
     fill_path,
     impact_cost,
     impact_stock_cost,
@@ -85,13 +88,14 @@ __all__ = ["LEVELS", "BacktestReport", "run_backtest", "sweep_configs"]
 #: remaining axes -- which act only on an existing book -- are evaluated on top.
 _BOOK_AXES = ("universe", "selection", "weighting", "risk_model", "cost_model",
               "efq", "gross_exposure", "shrinkage", "max_iter", "equity", "impact",
-              "alpha", "alpha_ic", "neutralize", "mv_solver")
+              "alpha", "alpha_ic", "neutralize", "mv_solver", *FEE_SETTINGS)
 
 
 #: The book axes only the cost-aware allocator reads. A path-independent rule
 #: sizes a book from the forecast and the risk model alone, so configurations
 #: differing only in what trading costs hold the same book and share it.
-_COST_AXES = ("cost_model", "efq", "equity", "impact", "max_iter", "mv_solver")
+_COST_AXES = ("cost_model", "efq", "equity", "impact", "max_iter", "mv_solver",
+              *FEE_SETTINGS)
 
 
 def _book_key(config: BacktestConfig) -> tuple:
@@ -113,12 +117,18 @@ class PnLSeries:
 
     ``periods`` are the labels the series is indexed by: one per decision, or
     one per day when the configuration annualizes daily.
+
+    ``fee`` is the part of ``cost`` that is fees, when the configuration
+    charges any (else None), so ``cost - fee`` is what the cost model itself
+    charged -- the part that scales with execution quality, which a
+    break-even EFQ is read from.
     """
 
     periods: NDArray[np.str_]
     gross: NDArray[np.float64]
     net: NDArray[np.float64]
     cost: NDArray[np.float64]
+    fee: NDArray[np.float64] | None = None
 
 
 @dataclass(frozen=True)
@@ -162,15 +172,21 @@ class BacktestReport:
     #: and four thousand embedded arrays would turn a 3 MB result file into a
     #: gigabyte one.
     series: PnLSeries | None = None
+    #: The mean fee per period, in basis points of equity, when the
+    #: configuration charges fees; it is part of ``mean_cost_bps``, not on top
+    #: of it. None otherwise, and then absent from :meth:`as_dict`.
+    mean_fee_bps: float | None = None
 
     def as_dict(self) -> dict:
         """A flat, JSON-serializable row: config axes beside the scores.
 
         ``equity`` is left out when unset, as in the config's label, so rows
-        written before it existed keep the same columns.
+        written before it existed keep the same columns; so is
+        ``mean_fee_bps`` for a configuration that charges no fees.
         """
         row = {k: v for k, v in asdict(self).items()
-               if k not in ("config", "series")}
+               if k not in ("config", "series")
+               and not (k == "mean_fee_bps" and v is None)}
         config = {k: v for k, v in asdict(self.config).items()
                   if not (k in OPTIONAL_SETTINGS and v is None)}
         return {**config, **row}
@@ -366,6 +382,27 @@ def _book(context: dict, config: BacktestConfig, sigma: NDArray[np.float64]
 
 def _cost(config: BacktestConfig, spread, shape, *, context=None,
           target=None) -> NDArray[np.float64]:
+    """Per-unit trading cost the allocator is charged: the cost model's, plus fees.
+
+    Fees are added on top of whatever the model charges, at
+    :func:`~stable_finance.evaluation.execution.fee_per_unit`, so the book is
+    planned against the same fees :func:`_score_fills` bills. A name the model
+    cannot trade stays at infinite cost, and so does one without the price a
+    per-share fee needs.
+    """
+    cost = _model_cost(config, spread, shape, context=context, target=target)
+    if not config.fees:
+        return cost
+    return cost + fee_per_unit(_share_price(context, config), **config.fees)
+
+
+def _share_price(context: dict, config: BacktestConfig) -> NDArray[np.float64] | None:
+    """The share price a per-share fee is converted at: the mid, else not needed."""
+    return context["market"].get("mid") if config.fee_per_share is not None else None
+
+
+def _model_cost(config: BacktestConfig, spread, shape, *, context=None,
+                target=None) -> NDArray[np.float64]:
     """Per-unit trading cost; zero for ``mid`` whether or not there are quotes.
 
     The impact model's cost depends on the order, so the allocator plans
@@ -571,14 +608,25 @@ def _score_fills(context: dict, fills, config: BacktestConfig, *,
         slippage = np.where(traded, (fills.price[:, :, 0] - fills.mid_price[:, :, 0])
                             / fills.mid_price[:, :, 0], 0.0)
     costs = (quantity * slippage).sum(axis=1)
+    fees = None
+    if config.fees:
+        # Fees are billed on the quantity each fill actually traded, beside
+        # its slippage rather than inside its price (see the execution
+        # module), so cost is still exactly slippage plus fees.
+        fees = fee_cost(quantity, _share_price(context, config), **config.fees).sum(axis=1)
+        costs = costs + fees
     return _report(context, config, gross, costs, np.abs(quantity), positions,
-                   with_series=with_series, alpha=alpha, sigma=sigma)
+                   with_series=with_series, alpha=alpha, sigma=sigma, fees=fees)
 
 
 def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_asset,
             values, *, with_series: bool, alpha: NDArray[np.float64] | None = None,
-            sigma: NDArray[np.float64] | None = None) -> BacktestReport:
-    """Annualize a profit path and summarize it, with the IC where there is a forecast."""
+            sigma: NDArray[np.float64] | None = None, fees=None) -> BacktestReport:
+    """Annualize a profit path and summarize it, with the IC where there is a forecast.
+
+    ``fees`` is the per-decision part of ``costs`` that is fees, folded into
+    periods the same way, or None when the configuration charges none.
+    """
     mu, spread, day = context["mu"], context["spread"], context["day"]
     net = gross - costs
 
@@ -589,6 +637,7 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
             [series[order][a:b].sum() for a, b in zip(edges[:-1], edges[1:])]
         )
         gross, net, costs_series = fold(gross), fold(net), fold(costs)
+        fee_series = None if fees is None else fold(fees)
         # One label per folded period, in the same order as the folded series.
         period_labels = context["day_labels"][order][edges[:-1]]
         periods_per_year = 252.0
@@ -599,10 +648,12 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         edges = np.flatnonzero(np.r_[True, block[1:] != block[:-1], True])
         fold = lambda series: np.add.reduceat(series, edges[:-1])
         gross, net, costs_series = fold(gross), fold(net), fold(costs)
+        fee_series = None if fees is None else fold(fees)
         period_labels = np.asarray(context["decisions"])[edges[:-1]]
         periods_per_year = (len(edges) - 1) / max(len(np.unique(day)), 1) * 252.0
     else:
         costs_series = costs
+        fee_series = fees
         period_labels = np.asarray(context["decisions"])
         periods_per_year = (context["n_decisions"]
                             / max(len(np.unique(day)), 1)) * 252.0
@@ -648,7 +699,9 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         series=PnLSeries(
             periods=period_labels.astype(str),
             gross=gross.copy(), net=net.copy(), cost=costs_series.copy(),
+            fee=None if fee_series is None else fee_series.copy(),
         ) if with_series else None,
+        mean_fee_bps=None if fee_series is None else float(np.nanmean(fee_series) * 1e4),
     )
 
 
@@ -700,8 +753,8 @@ def run_backtest(
     ``train``, the embeddings and realized returns to fit ``probe`` on (a
     default :class:`RidgeProbe` if not given), and also serve the
     ``embedding`` risk model. Below the forecast only the trading axes apply:
-    ``cost_model``, ``efq``, ``equity``, ``rebalance`` (weights only) and
-    ``annualization``.
+    ``cost_model``, ``efq``, ``equity``, the fees, ``rebalance`` (weights
+    only) and ``annualization``.
 
     A forecast must already be in the units the realized returns are in; a
     rank-unit forecast traded against a return-unit spread would make the cost

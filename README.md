@@ -223,7 +223,9 @@ without a positive quote is left unfilled and the realized position lags the
 target. When every order fills, `evaluate_fills` reproduces
 `cross_spread_sharpe` exactly. Depth, partial fills, impact, and commissions
 remain outside the simulator; bring your own `Fills` to evaluate a richer
-execution model.
+execution model. Fees are billed beside the fills, not in their prices:
+`evaluate_fills(fills, realized, fees=fee_cost(fills.quantity, ...))` (see
+[Fees on top of the spread](#fees-on-top-of-the-spread)).
 
 In the originating market-jepa setup, the default for supervised training,
 ridge fitting, and evaluation is the empirical-uniform target within each
@@ -448,6 +450,47 @@ report = run_backtest(forecast, realized, market=market, days=days,
 The mean-variance allocator sizes its book with one risk aversion per
 decision, from the forecasts up to that decision. A forecast made later never
 resizes a book already held.
+
+### Fees on top of the spread
+
+The spread is not the whole bill. A marketable order also pays the venue's
+access fee per share, and every sale pays the SEC's Section 31 fee; at
+five-minute holding periods the per-share fee is the same order as the
+half-spread of a liquid name. Three optional settings charge them on top of
+any cost model except `mid`, which stays the frictionless benchmark (use
+`cross` at `efq=0` for midpoint fills that still pay fees):
+
+| Setting | Charged |
+|---|---|
+| `fee_bps` | basis points of the notional traded, on either side (a commission) |
+| `fee_per_share` | dollars per share traded, on either side, converted at each name's mid; needs a `mid` (or the bid and ask), and `check_config` refuses it without one |
+| `sec_fee_rate` | a fraction of the notional sold, on sales only |
+
+With the values in force in 2020 -- the Regulation NMS Rule 610 access-fee
+cap and the fiscal-2020 Section 31 rate, both exported:
+
+```python
+from stable_finance import ACCESS_FEE_CAP_2020, SEC_FEE_RATE_FY2020, BacktestConfig
+
+config = BacktestConfig(fee_per_share=ACCESS_FEE_CAP_2020,   # $0.003 per share
+                        sec_fee_rate=SEC_FEE_RATE_FY2020)    # $22.10 per $1M sold
+report = run_backtest(forecast, realized, market=market, config=config)
+report.mean_fee_bps          # the part of mean_cost_bps that is fees
+```
+
+Like `efq`, the fees reach both places a cost does: the cost-aware allocator
+is charged them (`fee_per_unit`), so it trades less when trading costs more,
+and the scoring bills each fill exactly `|dw| (fee_bps / 1e4 + fee_per_share
+/ mid) + max(-dw, 0) sec_fee_rate` (`fee_cost`), beside its slippage rather
+than inside its price, so a limit still refers to the execution price. The
+allocator's cost is one rate for either side of a trade, so it is charged
+half the SEC rate on every unit -- exact per round trip, since every position
+is opened by one side and closed by the other. `PnLSeries.fee` keeps the fees
+apart from the rest of the cost, and the break-even EFQ after fees is
+`breakeven_efq(gross, (cost - fee) / efq, fees=fee)`: fees are paid at every
+execution quality and come off the gross. Unset, as by default, no fee code
+runs: labels, rows and numbers are what they were. FINRA's trading activity
+fee and maker rebates are not modelled.
 
 ### How much of the forecast reached the book
 
