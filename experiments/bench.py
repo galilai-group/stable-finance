@@ -54,13 +54,15 @@ def measure(work):
 
 def mean_variance_book(forecast, sigma, half_spread):
     """The harness's mean-variance book: a causal risk aversion, then the
-    cost-aware rebalance toward the target at EFQ times the half-spread."""
+    cost-aware rebalance toward the target at EFQ times the half-spread, with
+    the harness's iteration cap."""
     mu = np.nan_to_num(forecast.values[:, :, 0], nan=0.0)
     gross = np.abs(np.linalg.solve(sigma, mu.T).T).sum(axis=1)
     aversion = np.maximum(np.cumsum(gross) / np.arange(1, len(gross) + 1) / GROSS, 1e-12)
     target = sf.mean_variance_target(forecast, sigma[None], risk_aversion=aversion)
     cost = np.where(np.isfinite(half_spread), EFQ * half_spread, np.inf)
-    return sf.rebalance(target, sigma[None], risk_aversion=aversion, cost=cost).values[:, :, 0]
+    return sf.rebalance(target, sigma[None], risk_aversion=aversion, cost=cost,
+                        max_iter=sf.DEFAULT_BACKTEST.max_iter).values[:, :, 0]
 
 
 def main() -> int:
