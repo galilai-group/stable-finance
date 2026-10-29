@@ -34,6 +34,9 @@ long-short book is dollar neutral at the requested gross exposure.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import lru_cache, partial
+
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
@@ -213,7 +216,8 @@ def _erc(sigma: NDArray[np.float64], score: NDArray[np.float64],
 _MAX_CONDITION = 1e12
 
 
-def _min_var_qp(sigma: NDArray[np.float64], score: NDArray[np.float64]) -> NDArray[np.float64]:
+def _min_var_qp(sigma: NDArray[np.float64], score: NDArray[np.float64],
+                *, vetted: bool = False) -> NDArray[np.float64]:
     """The long-only minimum-variance portfolio within the leg, solved exactly.
 
     ``min w' Sigma w`` subject to ``w >= 0`` and ``sum w = 1``: the optimum
@@ -262,6 +266,21 @@ def _min_var_qp(sigma: NDArray[np.float64], score: NDArray[np.float64]) -> NDArr
     answer, since a name dropped early may belong in the book once the names
     it was hedging are gone; the rounds readmit it.
 
+    The warm start's first system is the whole leg, the largest this function
+    solves. Its systems are positive definite, so they are solved by Cholesky
+    factorization (LAPACK's ``dposv``), half the arithmetic of the LU
+    factorization :func:`numpy.linalg.solve` performs; should one break down
+    -- possible only for a leg near the conditioning limit -- that step falls
+    back to LU. The rounds keep :func:`numpy.linalg.solve`, and that is what
+    keeps the book unchanged to the last bit. The warm start decides only
+    where the rounds begin, and the book returned is the last round's solve
+    on the final working set: the optimum's support, which, barring exact
+    ties, is the same wherever they began. The two factorizations' solutions
+    agree only to rounding, so moving the rounds to Cholesky as well would
+    move every book already published in its last digits, to save a few
+    percent: the rounds are two or three per leg, on systems a sixth of its
+    size.
+
     The leg's covariance must be positive definite, to within
     :data:`_MAX_CONDITION`: then every working set's system is a principal
     submatrix of it, also positive definite, and no solve is singular. A
@@ -271,30 +290,46 @@ def _min_var_qp(sigma: NDArray[np.float64], score: NDArray[np.float64]) -> NDArr
     models never produce one. A one-name leg is the whole leg, whatever its
     variance. No randomness and stable tie-breaks: the same leg always gets
     the same book.
+
+    ``vetted=True`` skips that check and the symmetrization before it. It is
+    for :func:`weight_book`, which can answer the check for every leg of a
+    book at once (:func:`_min_var_qp_book`) and then hands over legs cut from
+    a covariance it has already symmetrized.
     """
+    # scipy ships with scikit-learn; imported here, as in _hrp, so importing
+    # the package does not pay for scipy.linalg.
+    from scipy.linalg.lapack import dposv
+
     n = len(score)
     if n == 1:
         return np.ones(1, dtype=np.float64)
-    sigma = np.asarray(sigma, dtype=np.float64)
-    if not np.isfinite(sigma).all():
-        raise ValueError(f"min_var_qp: the {n}-name leg's covariance is not finite")
-    sigma = (sigma + sigma.T) / 2.0
-    eigenvalues = np.linalg.eigvalsh(sigma)
-    smallest, largest = float(eigenvalues[0]), float(eigenvalues[-1])
-    if not smallest > largest / _MAX_CONDITION:
-        raise ValueError(
-            f"min_var_qp needs a positive definite leg covariance; the {n}-name "
-            f"leg's eigenvalues span [{smallest:.3g}, {largest:.3g}], singular or "
-            f"conditioned worse than {_MAX_CONDITION:.0e}")
+    if not vetted:
+        sigma = np.asarray(sigma, dtype=np.float64)
+        if not np.isfinite(sigma).all():
+            raise ValueError(f"min_var_qp: the {n}-name leg's covariance is not finite")
+        sigma = (sigma + sigma.T) / 2.0
+        eigenvalues = np.linalg.eigvalsh(sigma)
+        smallest, largest = float(eigenvalues[0]), float(eigenvalues[-1])
+        if not smallest > largest / _MAX_CONDITION:
+            raise ValueError(
+                f"min_var_qp needs a positive definite leg covariance; the {n}-name "
+                f"leg's eigenvalues span [{smallest:.3g}, {largest:.3g}], singular or "
+                f"conditioned worse than {_MAX_CONDITION:.0e}")
 
-    active = np.ones(n, dtype=bool)
+    index = np.arange(n)
+    block = sigma
     while True:
-        index = np.flatnonzero(active)
-        raw = np.linalg.solve(sigma[np.ix_(index, index)], np.ones(len(index)))
+        _, raw, info = dposv(block, np.ones(len(index)), lower=1)
+        if info:
+            raw = np.linalg.solve(block, np.ones(len(index)))
         shorted = raw < 0
         if not shorted.any():
             break
-        active[index[shorted]] = False
+        kept = np.flatnonzero(~shorted)
+        index = index[kept]
+        block = block[kept][:, kept]
+    active = np.zeros(n, dtype=bool)
+    active[index] = True
     weights = np.zeros(n)
     weights[index] = raw / raw.sum()
     for _ in range(2 * n):
@@ -327,11 +362,210 @@ def _min_var_qp(sigma: NDArray[np.float64], score: NDArray[np.float64]) -> NDArr
         f"{n}-name leg; the leg's covariance is degenerate")
 
 
-def _cluster_variance(sigma: NDArray[np.float64], members: NDArray[np.intp],
-                      variance: NDArray[np.float64]) -> float:
-    inverse = 1.0 / variance[members]
-    weights = inverse / inverse.sum()
-    return float(weights @ sigma[np.ix_(members, members)] @ weights)
+@lru_cache(maxsize=64)
+def _bisection_plan(n: int) -> tuple[tuple[NDArray[np.intp], ...], ...]:
+    """The clusters HRP's recursive bisection visits on an ``n``-name leg.
+
+    The bisection splits by position alone -- a cluster of ``m`` names
+    becomes its first ``m // 2`` and the rest -- so the clusters it visits
+    depend on ``n`` and nothing else, and each is a contiguous range of the
+    leaf order. Level ``k`` holds the ranges ``k`` halvings deep, each named
+    by the position of its first name; a one-name range is carried down
+    unchanged, as the recursion leaves it alone, so every level partitions
+    the leaf order. Entry ``k`` describes the splits of level ``k`` into
+    level ``k + 1`` as ``(left, right, starts, owner, singles)``:
+
+    ``left``, ``right``
+        the starts of the two halves of every level-``k`` range that splits;
+    ``starts``
+        the starts of all level-``k + 1`` ranges, in order;
+    ``owner``
+        for each position, the start of the level-``k + 1`` range holding it;
+    ``singles``
+        the starts of the level-``k + 1`` ranges that are a single name.
+
+    Cached, because a backtest sizes thousands of legs whose lengths repeat,
+    and read-only, so no caller can corrupt the cache.
+    """
+    starts = np.zeros(1, dtype=np.intp)
+    lengths = np.array([n], dtype=np.intp)
+    plan = []
+    while lengths.max() > 1:
+        split = lengths > 1
+        left = starts[split]
+        right = left + lengths[split] // 2
+        # Each right half starts strictly inside its parent, so sorting the
+        # union places it straight after its left half.
+        starts = np.sort(np.concatenate([starts, right]))
+        lengths = np.diff(np.append(starts, n))
+        level = (left, right, starts, np.repeat(starts, lengths), starts[lengths == 1])
+        for array in level:
+            array.flags.writeable = False
+        plan.append(level)
+    return tuple(plan)
+
+
+def _bisection_weights(sigma: NDArray[np.float64], variance: NDArray[np.float64],
+                       order: NDArray[np.intp]) -> NDArray[np.float64]:
+    """HRP's recursive bisection over the leaf ``order``, a level at a time.
+
+    A cluster ``C`` held at inverse-variance weights ``w = v_C / sum(v_C)``,
+    ``v = 1 / variance``, has variance ``v_C' Sigma_CC v_C / sum(v_C)^2``.
+    Evaluated one cluster at a time, as a loop over the ``2 (n - 1)`` halves
+    the recursion visits, that is a few hundred multiply-adds wrapped in a
+    gather and a handful of numpy calls, and the wrapping is what costs: on a
+    300-name leg the loop spent about 11 ms, four fifths of the rule's time.
+    Every cluster is a contiguous range of the leaf order (see
+    :func:`_bisection_plan`) and each level's clusters partition it, so a
+    level's variances are computed together instead.
+
+    The numerators are built bottom-up. Row ``q`` of ``rows`` starts as
+    ``v_q Sigma[q, :]``, rows in leaf order, and a cluster is kept in the row
+    of its first name: adding a cluster's right half into its left half, the
+    reverse of the split, leaves that row holding ``sum_{q in C} v_q
+    Sigma[q, :]``. The numerator is then that row's entries in ``C``'s own
+    columns, weighted by ``v`` and summed, for all of a level's clusters in
+    one ``reduceat``. Every partial sum adds entries of the cluster itself,
+    so the result keeps the accuracy of the direct quadratic form: within
+    ``1e-15`` of the exact variance on real 300-name legs, as the loop was.
+    A summed-area table of ``v_i v_j Sigma_ij`` would make each cluster O(1)
+    but differences prefix sums that grow with ``n^2`` against a cluster sum
+    that does not, and on the same legs it was off by up to ``6e-12``.
+
+    The weights then go top-down, a cluster's weight kept, like its row, at
+    its first name: each split hands the right half ``1 - share`` of the
+    parent's weight and keeps ``share`` for the left. That is the loop's
+    arithmetic in the loop's order -- every name's weight is the same
+    product of shares, taken root first -- and a one-name cluster's variance
+    is its diagonal entry exactly, as the loop's weight of exactly one made
+    it, so a two-name leg still splits by ``Sigma_00`` and ``Sigma_11`` bit
+    for bit. The book differs from the loop's only through summation order
+    inside the cluster variances. ``v`` is rescaled by a power of two so its
+    largest entry is below one: exact, so it moves no bit of the result, but
+    it keeps ``v' Sigma v`` finite for any variance the floor in :func:`_hrp`
+    can produce, as the loop's normalized weights were.
+    """
+    n = len(order)
+    plan = _bisection_plan(n)
+    inverse = 1.0 / variance[order]
+    inverse = np.ldexp(inverse, -np.frexp(inverse.max())[1])
+    diagonal = sigma[order, order]
+    rows = sigma.take(order, axis=0)
+    rows *= inverse[:, None]
+    mass = inverse.copy()
+
+    # cluster_variance[k] holds, at each level-(k + 1) range's start, that
+    # range's variance; the deepest level is all single names.
+    cluster_variance = [diagonal] * len(plan)
+    for depth in range(len(plan) - 1, 0, -1):
+        left, right = plan[depth][:2]
+        rows[left] += rows[right]
+        mass[left] += mass[right]
+        _, _, starts, owner, singles = plan[depth - 1]
+        quadratic = np.add.reduceat(rows[owner, order] * inverse, starts)
+        level = np.empty(n)
+        level[starts] = quadratic / mass[starts] ** 2
+        level[singles] = diagonal[singles]
+        cluster_variance[depth - 1] = level
+
+    weights = np.ones(n, dtype=np.float64)
+    for (left, right, *_), level in zip(plan, cluster_variance, strict=True):
+        left_var, right_var = level[left], level[right]
+        total = left_var + right_var
+        share = np.full(len(left), 0.5)
+        np.divide(right_var, total, out=share, where=(total > 0) & np.isfinite(total))
+        parent = weights[left]
+        weights[right] = parent * (1.0 - share)
+        weights[left] = parent * share
+    book = np.empty(n, dtype=np.float64)
+    book[order] = weights
+    return book
+
+
+def _hrp_distance(sigma: NDArray[np.float64],
+                  volatility: NDArray[np.float64]) -> NDArray[np.float64]:
+    """HRP's condensed correlation distance, ``sqrt((1 - rho) / 2)``.
+
+    The condensed vector :func:`scipy.cluster.hierarchy.linkage` reads: the
+    strict upper triangle, row by row, of the symmetrized distance. ``rho``
+    is the covariance over the product of the volatilities, clipped to
+    ``[-1, 1]``, with an undefined (NaN) entry read as uncorrelated, and each
+    pair's distance is the mean of ``d_ij`` and ``d_ji``, for a covariance
+    that is symmetric only to rounding. Every step is one elementwise pass
+    over ``n^2`` numbers, so the steps run in place: a fresh temporary per
+    step cost about as much as the arithmetic. The result is the same, bit
+    for bit, as clipping, ``np.nan_to_num`` and flooring at zero on fresh
+    arrays -- which matters, because it decides the tree.
+    """
+    from scipy.spatial.distance import squareform
+
+    distance = np.outer(volatility, volatility)
+    np.divide(sigma, distance, out=distance)
+    np.clip(distance, -1.0, 1.0, out=distance)
+    # clip has already sent +-inf to +-1, so zeroing NaN is all
+    # np.nan_to_num(nan=0.0) would add.
+    np.copyto(distance, 0.0, where=np.isnan(distance))
+    # rho in [-1, 1] puts (1 - rho) / 2 in [0, 1] exactly, so neither square
+    # root nor mean needs a floor at zero; halving is exact either way.
+    np.subtract(1.0, distance, out=distance)
+    distance *= 0.5
+    np.sqrt(distance, out=distance)
+    # With checks off, squareform reads only the strict upper triangle, so
+    # the diagonal needs no zeroing.
+    condensed = squareform(distance + distance.T, checks=False)
+    condensed *= 0.5
+    return condensed
+#: How far inside :data:`_MAX_CONDITION` the covariance of every name a book
+#: holds must sit for :func:`_min_var_qp_book` to vouch for each leg cut from
+#: it. The eigenvalues a leg's own check computes carry a rounding error of
+#: order ``n`` machine epsilons of the largest, about ``1e-13`` of it at a few
+#: hundred names; a hundredfold margin keeps that error from turning a leg the
+#: union vouches for into one its own check would refuse.
+_VOUCH_MARGIN = 1e2
+
+
+def _min_var_qp_book(sigma: NDArray[np.float64], side: NDArray[np.int8]
+                     ) -> tuple[Callable[..., NDArray[np.float64]], NDArray[np.float64]]:
+    """:func:`_min_var_qp` for one :func:`weight_book` call, checked once.
+
+    Returns the rule to size each leg with and the covariance to cut the legs
+    from. :func:`_min_var_qp` checks every leg's covariance before solving it
+    -- finite, and positive definite to within :data:`_MAX_CONDITION` -- and
+    the eigenvalue decomposition behind the check costs several times the
+    solve it guards: on a month of 320-name legs it was two thirds of the
+    time. But every leg of a book is a principal submatrix of one covariance,
+    and by Cauchy's interlacing theorem a principal submatrix's eigenvalues
+    lie inside the range of the matrix it is cut from, so no leg is worse
+    conditioned than the covariance of all the names the book holds at any
+    decision. One check of that union answers the question for every leg.
+
+    The union vouches for the legs only when it passes with
+    :data:`_VOUCH_MARGIN` to spare, so that no verdict hangs on rounding. The
+    legs are then cut from the covariance symmetrized once -- elementwise the
+    matrix each leg's own symmetrization would make -- and sized without
+    their checks. When the union does not pass -- a non-finite entry among
+    the names held, or an ill-conditioning that no single leg need share,
+    such as one name held long and its duplicate short -- every leg is
+    checked on its own exactly as before. Either way a book is refused if and
+    only if one of its legs would be, and the message names that leg's
+    eigenvalues.
+
+    A decomposition costs the cube of its size, so the union is checked only
+    when that is cheaper than checking the legs: a book of one decision, two
+    legs of half the names at an eighth of the union's cost each, is left to
+    the per-leg checks.
+    """
+    held = np.flatnonzero((side != 0).any(axis=0))
+    sizes = np.concatenate([(side == 1).sum(axis=1), (side == -1).sum(axis=1)])
+    if np.sum(sizes.astype(np.float64) ** 3) <= float(len(held)) ** 3:
+        return _min_var_qp, sigma
+    if not np.isfinite(sigma[np.ix_(held, held)]).all():
+        return _min_var_qp, sigma
+    symmetric = (sigma + sigma.T) / 2.0
+    eigenvalues = np.linalg.eigvalsh(symmetric[np.ix_(held, held)])
+    if not eigenvalues[0] > eigenvalues[-1] * _VOUCH_MARGIN / _MAX_CONDITION:
+        return _min_var_qp, sigma
+    return partial(_min_var_qp, vetted=True), symmetric
 
 
 def _hrp(sigma: NDArray[np.float64], score: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -343,7 +577,8 @@ def _hrp(sigma: NDArray[np.float64], score: NDArray[np.float64]) -> NDArray[np.f
     which names compete for the same risk budget, and never inverts:
 
     1. correlation ``rho`` from the leg's covariance, and the distance
-       ``d_ij = sqrt((1 - rho_ij) / 2)``, zero for perfectly correlated names;
+       ``d_ij = sqrt((1 - rho_ij) / 2)``, zero for perfectly correlated names
+       (:func:`_hrp_distance`);
     2. single-linkage clustering of ``d``, by
        :func:`scipy.cluster.hierarchy.linkage` on the condensed distances;
     3. quasi-diagonalization: order the names as the dendrogram's leaves
@@ -352,7 +587,8 @@ def _hrp(sigma: NDArray[np.float64], score: NDArray[np.float64]) -> NDArray[np.f
     4. recursive bisection: split the ordered list in halves, give each half
        a share of its parent's weight inversely proportional to its cluster
        variance -- the variance of the half held at inverse-variance weights
-       -- and recurse until every name stands alone.
+       -- and recurse until every name stands alone
+       (:func:`_bisection_weights`, which evaluates it a level at a time).
 
     Under a diagonal covariance every split is by summed inverse variance, so
     the book is exactly inverse-variance, the minimum-variance answer for
@@ -364,43 +600,18 @@ def _hrp(sigma: NDArray[np.float64], score: NDArray[np.float64]) -> NDArray[np.f
     # scipy ships with scikit-learn; imported here, as risk.py imports
     # sklearn, so importing the package does not pay for clustering.
     from scipy.cluster.hierarchy import leaves_list, linkage
-    from scipy.spatial.distance import squareform
 
     n = len(score)
     if n == 1:
         return np.ones(1, dtype=np.float64)
-    variance = np.diag(sigma).astype(np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    variance = np.diag(sigma).copy()
     positive = variance[np.isfinite(variance) & (variance > 0)]
     floor = positive.min() * 1e-12 if len(positive) else 1.0
     variance = np.where(np.isfinite(variance) & (variance > 0), variance, floor)
-    volatility = np.sqrt(variance)
-    correlation = np.clip(sigma / np.outer(volatility, volatility), -1.0, 1.0)
-    correlation = np.nan_to_num(correlation, nan=0.0)
-    np.fill_diagonal(correlation, 1.0)
-    distance = np.sqrt(np.maximum((1.0 - correlation) / 2.0, 0.0))
-    # squareform reads one triangle, so make the matrix the exact symmetric,
-    # zero-diagonal, non-negative distance it assumes.
-    distance = np.maximum((distance + distance.T) / 2.0, 0.0)
-    np.fill_diagonal(distance, 0.0)
-
-    link = linkage(squareform(distance, checks=False), method="single")
-    order = leaves_list(link)
-    weights = np.ones(n, dtype=np.float64)
-    pending = [order]
-    while pending:
-        members = pending.pop(0)
-        if len(members) < 2:
-            continue
-        half = len(members) // 2
-        left, right = members[:half], members[half:]
-        left_var = _cluster_variance(sigma, left, variance)
-        right_var = _cluster_variance(sigma, right, variance)
-        total = left_var + right_var
-        share = right_var / total if total > 0 and np.isfinite(total) else 0.5
-        weights[left] *= share
-        weights[right] *= 1.0 - share
-        pending.extend((left, right))
-    return weights
+    condensed = _hrp_distance(sigma, np.sqrt(variance))
+    order = leaves_list(linkage(condensed, method="single"))
+    return _bisection_weights(sigma, variance, order)
 
 
 def _rank(sigma: NDArray[np.float64], score: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -478,6 +689,8 @@ def weight_book(
             f"covariance must have shape {(side.shape[1], side.shape[1])}, "
             f"got {sigma.shape}"
         )
+    if rule is _min_var_qp:
+        rule, sigma = _min_var_qp_book(sigma, side)
 
     weights = np.zeros(side.shape, dtype=np.float64)
     for decision in range(side.shape[0]):
@@ -495,7 +708,9 @@ def weight_book(
             # signal-weighted leg sizes by distance from the centre, not from
             # whatever zero the forecast's scale happens to have.
             score = (values[decision, members] - centre) * leg
-            raw = rule(sigma[np.ix_(members, members)], score)
+            # The block sigma[np.ix_(members, members)] would cut, in the
+            # same memory order, at about half the cost of the broadcast index.
+            raw = rule(sigma.take(members, axis=0).take(members, axis=1), score)
             total = float(np.sum(np.abs(raw)))
             if total <= 0 or not np.isfinite(total):
                 raw, total = np.ones(len(members)), float(len(members))
