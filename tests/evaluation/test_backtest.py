@@ -23,14 +23,18 @@ from stable_finance import (
     weight_book,
 )
 from stable_finance.evaluation import backtest as bt
+from stable_finance.evaluation.backtest import causal_risk_aversion
 
 ASSETS = [f"A{i}" for i in range(6)]
 AXIS = np.array([900])
 
 
-def panel(values):
+def panel(values, *, decisions=None, assets=ASSETS, horizons=AXIS):
     values = np.asarray(values, dtype=float)
-    return ForwardReturns(values[:, :, None], np.arange(len(values)), ASSETS, AXIS)
+    if values.ndim == 2:
+        values = values[:, :, None]
+    decisions = np.arange(len(values)) if decisions is None else decisions
+    return ForwardReturns(values, decisions, assets, horizons)
 
 
 def world(seed=0, n_decisions=80, n_assets=6):
@@ -539,6 +543,138 @@ def test_a_crossed_spread_supplied_directly_is_refused_with_the_way_out():
 
 
 FRICTIONLESS = DEFAULT_BACKTEST.replace(cost_model="mid")
+
+
+# ── the history is matched by label ─────────────────────────────────────────
+
+def test_a_history_with_its_assets_in_another_order_is_refused():
+    w = world()
+    shuffled = panel(w["history"].values, assets=ASSETS[::-1])
+    with pytest.raises(ValueError, match="assets of the history"):
+        run_backtest(w["forecast"], w["realized"], history=shuffled, config=FRICTIONLESS)
+
+
+def test_a_history_without_the_scored_horizon_is_refused():
+    w = world()
+    other = panel(w["history"].values, horizons=np.array([300]))
+    with pytest.raises(ValueError, match="no horizon 900"):
+        run_backtest(w["forecast"], w["realized"], history=other, config=FRICTIONLESS)
+
+
+def test_the_history_horizon_is_found_by_value_not_position():
+    w = world()
+    noise = np.random.default_rng(9).normal(scale=0.05, size=w["history"].values.shape[:2])
+    stacked = np.stack([noise, w["history"].values[:, :, 0]], axis=2)
+    two = ForwardReturns(stacked, w["history"].decisions, ASSETS, np.array([300, 900]))
+    expected = run_backtest(w["forecast"], w["realized"], history=w["history"],
+                            config=FRICTIONLESS)
+    got = run_backtest(w["forecast"], w["realized"], history=two, config=FRICTIONLESS)
+    assert got.as_dict() == expected.as_dict()
+
+
+# ── the risk aversion is causal ─────────────────────────────────────────────
+
+def test_the_risk_aversion_at_a_decision_reads_no_later_forecast():
+    rng = np.random.default_rng(1)
+    mu = rng.normal(size=(20, 4))
+    sigma = np.diag([1.0, 2.0, 3.0, 4.0])
+    later = mu.copy()
+    later[10:] *= 50
+    assert np.array_equal(causal_risk_aversion(mu, sigma, 2.0)[:10],
+                          causal_risk_aversion(later, sigma, 2.0)[:10])
+
+
+def test_future_forecasts_do_not_move_the_mean_variance_book_held_today():
+    w = world()
+    louder = w["forecast"].values.copy()
+    louder[40:] *= 25
+    base = run_backtest(w["forecast"], w["realized"], history=w["history"],
+                        config=FRICTIONLESS, with_series=True, days=w["days"])
+    loud = run_backtest(panel(louder), w["realized"], history=w["history"],
+                        config=FRICTIONLESS, with_series=True, days=w["days"])
+    # The first five days are decided before the louder forecasts arrive.
+    np.testing.assert_allclose(base.series.gross[:5], loud.series.gross[:5], atol=1e-12)
+
+
+# ── a book held for the horizon books its forward return once ───────────────
+
+def overlapping(seed=0, n_decisions=64, n_assets=6, steps=4):
+    """Forward returns spanning ``steps`` decisions, and the one-step returns inside.
+
+    Decisions are epoch seconds 900 / ``steps`` apart, so the 900-second
+    horizon covers exactly ``steps`` of them.
+    """
+    rng = np.random.default_rng(seed)
+    one = rng.normal(scale=0.01, size=(n_decisions + steps, n_assets))
+    forward = np.stack([one[t + 1:t + 1 + steps].sum(0) for t in range(n_decisions)])
+    signal = forward + rng.normal(scale=0.01, size=forward.shape)
+    stamps = 1_600_000_000 + np.arange(n_decisions) * (900 // steps)
+    return one, panel(forward, decisions=stamps), panel(signal, decisions=stamps)
+
+
+def test_holding_for_the_horizon_books_the_non_overlapping_return():
+    steps = 4
+    one, realized, forecast = overlapping(steps=steps)
+    config = FRICTIONLESS.replace(weighting="equal", risk_model="diagonal",
+                                  annualization="decisions", rebalance="horizon")
+    report = run_backtest(forecast, realized, history=realized, config=config,
+                          with_series=True)
+    signs = select_book("all", forecast.values[:, :, 0], np.ones((64, 6), bool))
+    weights = weight_book("equal", signs, forecast.values[:, :, 0], np.eye(6))
+    held = weights[(np.arange(64) // steps) * steps]
+    earned = np.array([(held[t] * one[t + 1]).sum() for t in range(64)])
+    np.testing.assert_allclose(report.series.gross, earned.reshape(-1, steps).sum(axis=1),
+                               atol=1e-12)
+    assert report.n_periods == 64 // steps
+
+
+def test_a_horizon_equal_to_the_spacing_rebalances_every_decision():
+    _, realized, forecast = overlapping(steps=1)
+    base = FRICTIONLESS.replace(weighting="equal", risk_model="diagonal")
+    every = run_backtest(forecast, realized, history=realized, config=base).as_dict()
+    held = run_backtest(forecast, realized, history=realized,
+                        config=base.replace(rebalance="horizon")).as_dict()
+    assert held.pop("rebalance") == "horizon" and every.pop("rebalance") == "every_decision"
+    assert held == every
+
+
+def test_overlapping_accounting_counts_a_long_return_several_times():
+    steps = 4
+    _, realized, forecast = overlapping(steps=steps)
+    base = FRICTIONLESS.replace(weighting="equal", risk_model="diagonal",
+                                annualization="decisions")
+    legacy = run_backtest(forecast, realized, history=realized, config=base)
+    held = run_backtest(forecast, realized, history=realized,
+                        config=base.replace(rebalance="horizon"))
+    assert legacy.mean_gross_return_bps > 2.5 * held.mean_gross_return_bps / steps
+
+
+def test_a_held_book_restarts_at_each_day_and_reads_date_anchor_labels():
+    w = world()
+    # Market-1T's labels: the anchor is seconds past the session's origin,
+    # 300 apart, so the 900-second horizon is three decisions.
+    labels = np.array([f"2020-08-{3 + d:02d}|{1800 + 300 * k}"
+                       for d in range(10) for k in range(8)])
+    forecast = panel(w["forecast"].values, decisions=labels)
+    realized = panel(w["realized"].values, decisions=labels)
+    history = panel(w["history"].values, decisions=labels)
+    config = FRICTIONLESS.replace(weighting="equal", risk_model="diagonal",
+                                  annualization="decisions", rebalance="horizon")
+    report = run_backtest(forecast, realized, history=history, days=w["days"], config=config)
+    assert report.n_periods == 10 * 3          # decisions 0, 3 and 6 of each day
+
+
+def test_horizon_rebalancing_needs_decision_times_and_one_step_drift_is_refused():
+    w = world()
+    named = np.array([f"d{i}" for i in range(80)])
+    config = FRICTIONLESS.replace(weighting="equal", risk_model="diagonal",
+                                  rebalance="horizon")
+    with pytest.raises(ValueError, match="decisions' times"):
+        run_backtest(panel(w["forecast"].values, decisions=named),
+                     panel(w["realized"].values, decisions=named),
+                     history=panel(w["history"].values, decisions=named), config=config)
+    with pytest.raises(ValueError, match="rebalance='horizon'"):
+        BacktestConfig(rebalance="horizon", holding="drift")
 
 
 # ── signal transforms as configuration ──────────────────────────────────────

@@ -300,7 +300,7 @@ predictors.
 | `weighting` | `mean_variance` (cost-aware, path-dependent), `equal`, `inverse_vol`, `min_var`, `erc`, `rank`, `signal` (proportional to the forecast's distance from the median), `min_var_qp` (the long-only minimum-variance optimum `min_var` approximates), `hrp` (hierarchical risk parity) |
 | `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `nonlinear_shrinkage` (Ledoit and Wolf, 2020), `embedding` — the last forecasts correlations from the encoder's own representation |
 | `cost_model` | `mid`, `cross` — free, or the name's own quoted half-spread times `efq` |
-| `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it |
+| `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it; `horizon` is outside the default space (see below) |
 | `annualization` | `decisions`, `daily` — whether every decision is an independent period |
 
 `efq` is the continuous cost axis, and `trading_cost` takes it as `multiple`.
@@ -324,7 +324,7 @@ option.
 `enumerate_configs` sweeps any `BacktestConfig` field given a list or tuple
 of options and pins any field given one value, so a setting outside the
 default space is swept the same way, as in
-`enumerate_configs(neutralize=(None, "beta"))`.
+`enumerate_configs(neutralize=(None, "beta"), rebalance=("every_decision", "horizon"))`.
 Two such settings are unset by default, so the default space and every label
 in it are unchanged:
 
@@ -357,6 +357,31 @@ from stable_finance import BacktestConfig, refine_alpha, neutralize
 config = BacktestConfig(alpha="grinold", alpha_ic=0.05, neutralize="beta_industry")
 alpha = refine_alpha(scores, volatility, ic=0.05, score="gauss_rank")
 ```
+
+### Scoring a long-horizon forecast
+
+Every decision books its forward return, `w_t . r(t, t + h)`. That is right
+when the horizon equals the spacing between decisions. When it is longer,
+consecutive returns overlap and each move is counted about `h / spacing`
+times. A 3600-second forecast on a 300-second grid would be counted twelve
+times over, while its turnover is charged once. `rebalance="horizon"` scores
+such a forecast without the overlap: each book is set once per horizon
+(restarting each day), carried until the next, and its forward return is
+booked once. The harness reads the horizon from the forecast and the spacing
+from the decisions, which must say when they are: epoch seconds, as
+`evaluation_inputs` writes them, or Market-1T's `"date|anchor"` labels. It is
+not the default, so existing results do not move; use it whenever the horizon
+is longer than the decision spacing. It is refused with `holding="drift"`,
+which already carries each position on one-step returns.
+
+```python
+report = run_backtest(forecast, realized, market=market, days=days,
+                      config=config.replace(rebalance="horizon"))
+```
+
+The mean-variance allocator sizes its book with one risk aversion per
+decision, from the forecasts up to that decision. A forecast made later never
+resizes a book already held.
 
 ## Is the forecast worth its spread?
 

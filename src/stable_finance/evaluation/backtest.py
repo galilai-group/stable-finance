@@ -254,11 +254,9 @@ def _history_panel(context, history, realized) -> ForwardReturns:
 
 def _risk(context, config, history, realized, embeddings, horizon_index):
     """The covariance for one risk model, on the horizon being scored."""
-    source = history if history is not None else realized
-    panel = ForwardReturns(
-        source.values[:, :, horizon_index][:, :, None],
-        source.decisions, source.assets, context["axis"],
-    )
+    panel = _history_panel(context, history, realized)
+    if embeddings is not None and not np.array_equal(embeddings.assets, context["assets"]):
+        raise ValueError("assets of the embeddings and the input are not aligned")
     return estimate_risk(config.risk_model, panel, embeddings=embeddings,
                          shrinkage=config.shrinkage, min_samples=2)[0]
 
@@ -323,9 +321,10 @@ def _weights(context: dict, config: BacktestConfig,
     # lambda is set so the COST-FREE target averages the requested gross
     # exposure. mu is in return units and Sigma in squared ones, so their ratio
     # has no natural scale; fixing the exposure is what makes one forecast's
-    # spread bill comparable with another's.
-    raw = np.linalg.solve(sigma, np.nan_to_num(masked, nan=0.0).T).T
-    risk_aversion = max(float(np.abs(raw).sum(axis=1).mean()) / config.gross_exposure, 1e-12)
+    # spread bill comparable with another's. The average runs over the
+    # decisions UP TO each one, never past it: a lambda fit on the whole window
+    # let a forecast made next month resize the book held today.
+    risk_aversion = causal_risk_aversion(masked, sigma, config.gross_exposure)
     # The portfolio stage says what to hold; the trades stage how far to move
     # there, given what trading costs.
     target = mean_variance_target(forecast, sigma[None], risk_aversion=risk_aversion)
@@ -378,6 +377,95 @@ def _hold_within_day(weights, day):
 
 # ── scoring ─────────────────────────────────────────────────────────────────
 
+def causal_risk_aversion(mu: ArrayLike, sigma: ArrayLike,
+                         gross_exposure: float) -> NDArray[np.float64]:
+    """One lambda per decision, from the decisions up to and including it.
+
+    ``lambda_t = mean_{s <= t} |Sigma^-1 mu_s|_1 / gross_exposure``: the
+    cost-free mean-variance book averages the requested gross exposure over
+    the forecasts seen so far. Only the past and the present enter, so a run
+    cut short gives the same weights on the decisions it kept.
+    """
+    raw = np.linalg.solve(np.asarray(sigma, dtype=np.float64),
+                          np.nan_to_num(np.asarray(mu, dtype=np.float64), nan=0.0).T).T
+    gross = np.abs(raw).sum(axis=1)
+    expanding = np.cumsum(gross) / np.arange(1, len(gross) + 1)
+    return np.maximum(expanding / gross_exposure, 1e-12)
+
+
+def _decision_seconds(context: dict) -> float:
+    """The spacing between consecutive decisions on one day, in seconds.
+
+    Read from the decisions themselves: epoch seconds, as
+    :func:`~stable_finance.evaluation.inputs.evaluation_inputs` takes them, or
+    the ``"date|anchor"`` labels the Market-1T readers write, whose anchor is
+    seconds past the session's origin. The median gap within a day is used,
+    so overnight gaps and an occasional missing decision do not count.
+    """
+    decisions = np.asarray(context["decisions"])
+    try:
+        stamps = decisions.astype(np.float64)
+    except (TypeError, ValueError):
+        parts = np.char.partition(decisions.astype(str), "|")
+        if not np.all(parts[:, 1] == "|"):
+            raise ValueError("this needs the decisions' times: pass decisions as epoch "
+                             "seconds or 'date|anchor' labels") from None
+        stamps = parts[:, 2].astype(np.float64)
+    gaps = np.diff(stamps)
+    if context["days_given"]:
+        day = context["day"]
+        gaps = gaps[day[1:] == day[:-1]]
+    gaps = gaps[gaps > 0]
+    if len(gaps) == 0:
+        raise ValueError("need two decisions on one day to measure their spacing; "
+                         "pass days labelling each decision's trading day")
+    return float(np.median(gaps))
+
+
+def _decisions_spanning(context: dict, *, seconds: float | None = None,
+                        days: float | None = None) -> int:
+    """How many decisions a span of time covers: the one time-to-decisions rule.
+
+    A span in ``days`` is that many times the decisions the data has in a
+    day, read from the ``days`` labels (the impact model's schedule). A span
+    in ``seconds`` is that over the spacing of the decisions (a held book's
+    horizon). Both round to the nearest whole decision.
+    """
+    if days is not None:
+        if not context["days_given"]:
+            raise ValueError("a span in days needs days labelling each decision's trading day")
+        per_day = float(np.median(np.bincount(context["day"])))
+        return int(round(days * per_day))
+    return max(round(float(seconds) / _decision_seconds(context)), 1)
+
+
+def _formations(context: dict) -> NDArray[np.bool_]:
+    """The decisions where a horizon-held book is set: every k-th of each day.
+
+    k is the forecast horizon in decisions. Blocks restart at each day, since
+    a forward return does not run across the close; without ``days`` the
+    decisions are one run.
+    """
+    if "formed" not in context:
+        if context["horizon"] <= 0:
+            raise ValueError("rebalance='horizon' needs a horizon of fixed length; a book "
+                             "held to the close is already set once a day (rebalance='daily')")
+        every = _decisions_spanning(context, seconds=context["horizon"])
+        day = context["day"]
+        index = np.arange(len(day))
+        if context["days_given"]:
+            starts = np.r_[True, day[1:] != day[:-1]]
+            index = index - np.maximum.accumulate(np.where(starts, index, 0))
+        context["formed"] = index % every == 0
+    return context["formed"]
+
+
+def _hold_from(weights, formed):
+    """Carry each formation decision's weights until the next formation."""
+    anchor = np.maximum.accumulate(np.where(formed, np.arange(len(formed)), 0))
+    return weights[anchor]
+
+
 def _score(context: dict, values: NDArray[np.float64],
            config: BacktestConfig, *,
            with_series: bool = False) -> BacktestReport:
@@ -385,6 +473,8 @@ def _score(context: dict, values: NDArray[np.float64],
     day = context["day"]
     if config.rebalance == "daily":
         values = _hold_within_day(values, day)
+    if config.rebalance == "horizon":
+        values = _hold_from(values, _formations(context))
     # Every model is scored from its fills, so a cross fill is billed the
     # touch the order met (the arrival quotes, when the market carries them)
     # while the allocator planned against the quoted spread at the decision.
@@ -426,8 +516,7 @@ def _schedule(context: dict, config: BacktestConfig) -> int:
     if not context["days_given"]:
         raise ValueError(f"cost_model={config.cost_model!r} works orders over execution_days, so it "
                          "needs days labelling each decision's trading day")
-    per_day = float(np.median(np.bincount(context["day"])))
-    return int(round(days * per_day))
+    return _decisions_spanning(context, days=days)
 
 
 def _score_fills(context: dict, fills, config: BacktestConfig, *,
@@ -436,6 +525,11 @@ def _score_fills(context: dict, fills, config: BacktestConfig, *,
     positions = positions_from_fills(fills, drift=_drift(context, config)).values[:, :, 0]
     outcome_values = context["outcome_values"]
     valid = np.isfinite(positions) & np.isfinite(outcome_values)
+    if config.rebalance == "horizon":
+        # A held book earns its forward return ONCE, at the decision it was
+        # set: the decisions it is merely carried through are inside that same
+        # return, and booking them again would count it once per decision.
+        valid &= _formations(context)[:, None]
     gross = np.where(valid, positions * outcome_values, 0.0).sum(axis=1)
     quantity = fills.quantity[:, :, 0]
     traded = quantity != 0
@@ -463,6 +557,15 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         # One label per folded period, in the same order as the folded series.
         period_labels = context["day_labels"][order][edges[:-1]]
         periods_per_year = 252.0
+    elif config.rebalance == "horizon":
+        # One period per held book: the decisions it is carried through are
+        # folded into the one at which it was set, which labels the period.
+        block = np.cumsum(_formations(context)) - 1
+        edges = np.flatnonzero(np.r_[True, block[1:] != block[:-1], True])
+        fold = lambda series: np.add.reduceat(series, edges[:-1])
+        gross, net, costs_series = fold(gross), fold(net), fold(costs)
+        period_labels = np.asarray(context["decisions"])[edges[:-1]]
+        periods_per_year = (len(edges) - 1) / max(len(np.unique(day)), 1) * 252.0
     else:
         costs_series = costs
         period_labels = np.asarray(context["decisions"])

@@ -81,7 +81,13 @@ ANNUALIZATIONS = ("decisions", "daily")
 #: anchor; ``daily`` sets the book at each day's first decision and holds it,
 #: which cuts turnover by roughly the number of anchors in a day and is the
 #: difference between a signal that pays for its spread and one that does not.
-REBALANCE_RULES = ("every_decision", "daily")
+#: ``horizon`` sets the book once per forecast horizon (restarting each day),
+#: holds it for the horizon, and books its forward return ONCE: the way to
+#: score an h-horizon forecast on a grid of decisions closer together than h,
+#: where booking every decision's forward return counts each move about
+#: h / spacing times. The harness reads the horizon from the forecast and the
+#: spacing from the decisions.
+REBALANCE_RULES = ("every_decision", "daily", "horizon")
 
 #: How a position is carried from one decision to the next. ``rebalanced``
 #: holds each name at its weight: every decision's book is a fresh bet that
@@ -281,13 +287,16 @@ DEFAULT_BACKTEST = BacktestConfig()
 #: every Sharpe here one non-overlapping observation per day annualized at
 #: 252, which is what the execution-quality figure reports. ``cost_model`` is
 #: absent because ``efq`` is now the cost axis.
+#: ``rebalance`` sweeps the two schedules that are modelling choices;
+#: ``horizon`` is the accounting for a horizon longer than the decision
+#: spacing and is asked for by name.
 CONFIG_SPACE = {
     "universe": UNIVERSE_SCREENS,
     "selection": SELECTION_RULES,
     "weighting": ALLOCATORS,
     "risk_model": RISK_MODELS,
     "efq": EFQ_GRID,
-    "rebalance": REBALANCE_RULES,
+    "rebalance": ("every_decision", "daily"),
 }
 
 
