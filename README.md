@@ -383,6 +383,23 @@ The mean-variance allocator sizes its book with one risk aversion per
 decision, from the forecasts up to that decision. A forecast made later never
 resizes a book already held.
 
+### How much of the forecast reached the book
+
+`BacktestReport.transfer_coefficient` is Clarke, de Silva and Thorley's
+(2002) transfer coefficient, the cosine between the risk-weighted positions
+`Sigma^(1/2) w` and the risk-adjusted forecast `Sigma^(-1/2) alpha`, averaged
+over decisions: 1 for frictionless mean-variance on its own forecast, and
+lower as selection, constraints and costs take the book away from it.
+`transfer_coefficient(weights, alpha, covariance)` computes it on any book,
+and it is NaN for a run entered below the forecast level.
+
+`scoring.stats` holds the statistics for comparing many backtests, all in
+closed form: `probabilistic_sharpe` and `min_track_record` (Bailey and López
+de Prado, 2012), `deflated_sharpe` for the best of `n_trials` (2014), `pbo`,
+the probability of backtest overfitting by combinatorially symmetric
+cross-validation over every split (Bailey et al., 2017), and
+`sharpe_difference`, a HAC test of two Sharpe ratios (Ledoit and Wolf, 2008).
+
 ## Is the forecast worth its spread?
 
 A Sharpe ratio is the wrong headline statistic for a short-horizon forecast,

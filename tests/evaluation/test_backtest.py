@@ -764,3 +764,48 @@ def test_the_transforms_are_ignored_below_the_forecast_level():
     assert np.isnan(report.information_coefficient)
 
 
+# ── the transfer coefficient ────────────────────────────────────────────────
+
+def test_the_frictionless_mean_variance_book_transfers_the_whole_forecast():
+    # The zero-cost solver lands on the target Sigma^-1 mu / lambda, so the
+    # held book is the unconstrained optimum and its TC is one to roundoff.
+    w = world()
+    report = run_backtest(w["forecast"], w["realized"], history=w["history"],
+                          config=FRICTIONLESS)
+    assert report.transfer_coefficient == pytest.approx(1.0, abs=1e-6)
+
+
+def test_selecting_the_tails_transfers_less_of_the_forecast_than_holding_all():
+    w = world()
+    every = run_backtest(w["forecast"], w["realized"], history=w["history"],
+                         config=FRICTIONLESS)
+    tails = run_backtest(w["forecast"], w["realized"], history=w["history"],
+                         config=FRICTIONLESS.replace(selection="decile"))
+    assert tails.transfer_coefficient < every.transfer_coefficient - 0.05
+
+
+def test_weights_have_no_forecast_and_so_no_transfer_coefficient():
+    w = world()
+    weights = PortfolioWeights(np.full((80, 6, 1), 1 / 6), w["forecast"].decisions,
+                               ASSETS, AXIS)
+    report = run_backtest(weights, w["realized"], config=FRICTIONLESS)
+    assert np.isnan(report.transfer_coefficient)
+    assert np.isnan(report.as_dict()["transfer_coefficient"])
+
+
+def test_a_sweep_reports_the_transfer_coefficient_each_run_would():
+    w = world()
+    configs = [FRICTIONLESS.replace(selection=selection, rebalance=rebalance, **extra)
+               for selection in ("all", "decile")
+               for rebalance in ("every_decision", "daily")
+               for extra in ({}, {"neutralize": "beta"})]
+    swept = sweep_configs(w["forecast"], w["realized"], configs,
+                          history=w["history"], days=w["days"])
+    alone = [run_backtest(w["forecast"], w["realized"], history=w["history"],
+                          days=w["days"], config=c) for c in configs]
+    assert ([r.transfer_coefficient for r in swept]
+            == [r.transfer_coefficient for r in alone])
+    daily = [r.transfer_coefficient for r in alone if r.config.rebalance == "daily"]
+    every = [r.transfer_coefficient for r in alone
+             if r.config.rebalance == "every_decision"]
+    assert max(daily) < min(every)

@@ -75,6 +75,7 @@ from stable_finance.evaluation.returns.probes import RidgeProbe
 from stable_finance.evaluation.scoring.ic import grouped_rank_ic
 from stable_finance.evaluation.scoring.pnl import positions_from_fills
 from stable_finance.evaluation.scoring.sharpe import sharpe_ratio
+from stable_finance.evaluation.scoring.tc import transfer_coefficient
 from stable_finance.evaluation.trades.rebalance import rebalance
 
 __all__ = ["LEVELS", "BacktestReport", "run_backtest", "sweep_configs"]
@@ -129,12 +130,24 @@ class BacktestReport:
     frictionless number from being read as an executable one.
     ``information_coefficient`` is measured on the same forecast over the same
     screened universe, so the pair is comparable by construction.
+
+    ``transfer_coefficient`` is how much of the forecast the book expresses
+    (:func:`~stable_finance.evaluation.scoring.tc.transfer_coefficient`): the
+    correlation, over the screened names, of the positions actually HELD --
+    after the solver, the fills and ``rebalance`` -- with the forecast
+    the book was built from, AFTER the signal transforms, both in the risk
+    model's units. It is measured against the transformed forecast rather than
+    the raw one because the transforms are what the book was asked to express;
+    the IC is what scores the raw forecast. Below the forecast level there is
+    no forecast to transfer, and it is NaN.
     """
 
     config: BacktestConfig
     horizon: int
     information_coefficient: float
     information_coefficient_se: float
+    #: NaN where there is no forecast.
+    transfer_coefficient: float
     sharpe_mid: float
     sharpe_net: float
     mean_gross_return_bps: float
@@ -295,7 +308,22 @@ def _signal(context: dict, config: BacktestConfig, sigma, screened) -> NDArray[n
 def _weights(context: dict, config: BacktestConfig,
              sigma: NDArray[np.float64]) -> NDArray[np.float64]:
     """Target weights under one configuration's book-determining axes."""
-    mu, spread = context["mu"], context["spread"]
+    return _book(context, config, sigma)[0]
+
+
+def _book(context: dict, config: BacktestConfig, sigma: NDArray[np.float64]
+          ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Target weights, and the transformed forecast they were built from.
+
+    The forecast is returned beside the weights, rather than stashed in
+    ``context``, because the context is shared by every configuration of a
+    sweep and the transformed forecast is not: two configurations differing
+    only in ``neutralize`` would read each other's. Returned together, the pair
+    is cached together, so the transfer coefficient a sweep reports is the one
+    :func:`run_backtest` would.
+    """
+    spread = context["spread"]
+    mu = context["mu"]
 
     # THE SCREEN AND THE BOOK ARE DIFFERENT SETS. ``screened`` is what the
     # portfolio may trade at all; ``signs`` is what this configuration chose to
@@ -307,7 +335,7 @@ def _weights(context: dict, config: BacktestConfig,
     signs = select_book(config.selection, mu, screened)
     if config.weighting != "mean_variance":
         return weight_book(config.weighting, signs, mu, sigma,
-                           gross_exposure=config.gross_exposure)
+                           gross_exposure=config.gross_exposure), mu
 
     # A name outside the BOOK gets a zero expected return, so the optimizer
     # unwinds it as risk and cost allow. A name outside the UNIVERSE gets an
@@ -333,7 +361,7 @@ def _weights(context: dict, config: BacktestConfig,
         target, sigma[None], risk_aversion=risk_aversion,
         cost=np.where(screened, np.nan_to_num(cost, nan=0.0), np.inf),
         max_iter=config.max_iter,
-    ).values[:, :, 0]
+    ).values[:, :, 0], mu
 
 
 def _cost(config: BacktestConfig, spread, shape, *, context=None,
@@ -468,8 +496,13 @@ def _hold_from(weights, formed):
 
 def _score(context: dict, values: NDArray[np.float64],
            config: BacktestConfig, *,
-           with_series: bool = False) -> BacktestReport:
-    """Mark a book, charge it, and annualize -- the axes that act on a book."""
+           with_series: bool = False, alpha: NDArray[np.float64] | None = None,
+           sigma: NDArray[np.float64] | None = None) -> BacktestReport:
+    """Mark a book, charge it, and annualize -- the axes that act on a book.
+
+    ``alpha`` and ``sigma`` are the transformed forecast and the covariance the
+    book was built from; given both, the report carries a transfer coefficient.
+    """
     day = context["day"]
     if config.rebalance == "daily":
         values = _hold_within_day(values, day)
@@ -479,7 +512,7 @@ def _score(context: dict, values: NDArray[np.float64],
     # touch the order met (the arrival quotes, when the market carries them)
     # while the allocator planned against the quoted spread at the decision.
     return _score_fills(context, _fills_toward(context, values, config), config,
-                        with_series=with_series)
+                        with_series=with_series, alpha=alpha, sigma=sigma)
 
 
 def _fills_toward(context: dict, values: NDArray[np.float64], config: BacktestConfig):
@@ -520,7 +553,8 @@ def _schedule(context: dict, config: BacktestConfig) -> int:
 
 
 def _score_fills(context: dict, fills, config: BacktestConfig, *,
-                 with_series: bool = False) -> BacktestReport:
+                 with_series: bool = False, alpha: NDArray[np.float64] | None = None,
+                 sigma: NDArray[np.float64] | None = None) -> BacktestReport:
     """Mark the positions fills produced, and charge each fill's own cost."""
     positions = positions_from_fills(fills, drift=_drift(context, config)).values[:, :, 0]
     outcome_values = context["outcome_values"]
@@ -538,11 +572,12 @@ def _score_fills(context: dict, fills, config: BacktestConfig, *,
                             / fills.mid_price[:, :, 0], 0.0)
     costs = (quantity * slippage).sum(axis=1)
     return _report(context, config, gross, costs, np.abs(quantity), positions,
-                   with_series=with_series)
+                   with_series=with_series, alpha=alpha, sigma=sigma)
 
 
 def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_asset,
-            values, *, with_series: bool) -> BacktestReport:
+            values, *, with_series: bool, alpha: NDArray[np.float64] | None = None,
+            sigma: NDArray[np.float64] | None = None) -> BacktestReport:
     """Annualize a profit path and summarize it, with the IC where there is a forecast."""
     mu, spread, day = context["mu"], context["spread"], context["day"]
     net = gross - costs
@@ -583,6 +618,17 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         ic = grouped_rank_ic(np.where(screened, mu, np.nan), context["outcome_values"],
                              min_assets=2)
         ic_mean, ic_se = float(ic.mean), float(ic.standard_error)
+    # THE TC READS THE SAME SCREENED NAMES AS THE IC, so the two factors of the
+    # fundamental law are measured over one cross-section. The positions are
+    # the HELD ones, with roundoff residue zeroed under the same threshold as
+    # ``mean_names_held``: a book that returned to flat is flat, not a vector of
+    # ulps whose correlation with the forecast is noise. NaN is the module
+    # constant, not a fresh float, so two NaN reports compare equal as rows.
+    tc = np.nan
+    if mu is not None and alpha is not None and sigma is not None:
+        held = np.where(np.isfinite(values) & (np.abs(values) <= 1e-12), 0.0, values)
+        mean = transfer_coefficient(held, alpha, sigma, eligible=screened).mean
+        tc = float(mean) if np.isfinite(mean) else np.nan
     return BacktestReport(
         config=config, horizon=context["horizon"],
         information_coefficient=ic_mean,
@@ -598,6 +644,7 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         # A position is a holding above roundoff: a path of fills that returns
         # to flat leaves a weight of a few ulps, not a name held.
         mean_names_held=float((np.abs(values) > 1e-12).sum(axis=1).mean()),
+        transfer_coefficient=tc,
         series=PnLSeries(
             periods=period_labels.astype(str),
             gross=gross.copy(), net=net.copy(), cost=costs_series.copy(),
@@ -713,8 +760,9 @@ def run_backtest(
         sigma = _risk(context, config, history, realized, embeddings, horizon_index)
         if config.neutralize in ("beta", "beta_industry"):
             _beta(context, history, realized)
-        return _score(context, _weights(context, config, sigma), config,
-                      with_series=with_series)
+        weights, alpha = _book(context, config, sigma)
+        return _score(context, weights, config, with_series=with_series,
+                      alpha=alpha, sigma=sigma)
     if isinstance(source, PortfolioWeights):
         return _score(context, source.values[:, :, horizon_index], config,
                       with_series=with_series)
@@ -806,7 +854,10 @@ def sweep_configs(
     # book vary fastest -- as they do in enumerate_configs -- and merely
     # recomputes on an unlucky ordering rather than exhausting memory.
     risk_cache: dict[tuple, NDArray[np.float64]] = {}
-    book_cache: "OrderedDict[tuple, NDArray[np.float64]]" = OrderedDict()
+    # Each entry is a book AND the transformed forecast it was built from, so
+    # a reused book reports the transfer coefficient its first solve would.
+    book_cache: "OrderedDict[tuple, tuple[NDArray[np.float64], NDArray[np.float64]]]" = (
+        OrderedDict())
     reports = []
     for config in configs:
         try:
@@ -821,13 +872,14 @@ def sweep_configs(
             if book_key in book_cache:
                 book_cache.move_to_end(book_key)
             else:
-                book_cache[book_key] = _weights(
+                book_cache[book_key] = _book(
                     context, config, risk_cache[risk_key]
                 )
                 if len(book_cache) > book_cache_size:
                     book_cache.popitem(last=False)
-            reports.append(_score(context, book_cache[book_key], config,
-                                  with_series=with_series))
+            weights, alpha = book_cache[book_key]
+            reports.append(_score(context, weights, config, with_series=with_series,
+                                  alpha=alpha, sigma=risk_cache[risk_key]))
         except Exception:
             if on_error == "raise":
                 raise
