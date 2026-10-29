@@ -43,6 +43,11 @@ harness, and a spec that names none of them runs exactly as before:
 of its own (the inputs differ, so it cannot share a sweep), and every row
 carries the keys the spec names, which also enter its ``row_id``.
 
+Beside ``series.npz`` (each row's gross, net and cost per period) the run
+writes ``periods.npz``, the label of every one of those periods, so the
+day and time of day of each period can be read back afterwards
+(``experiments/inference.py``).
+
     uv run --extra experiments python -m experiments.run experiments/specs/e1_transfer_map.json
 """
 
@@ -491,7 +496,7 @@ def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0,
                                history=inputs["history"], days=inputs["days"],
                                horizon_index=hi, with_series=True, on_error=spec.get("on_error", "skip"))
     elapsed = time.perf_counter() - t0
-    rows, series, daily = [], {}, {}
+    rows, series, daily, periods = [], {}, {}, _PeriodSets()
     tag = {k: v for k, v in fspec.items() if k != "kind"}
     for report in reports:
         row = {"forecast": fspec["kind"], **{f"f_{k}": v for k, v in tag.items()}, **variant,
@@ -506,12 +511,60 @@ def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0,
         rows.append(row)
         series[row["row_id"]] = np.stack([report.series.gross, report.series.net,
                                           report.series.cost])
+        periods.add(row["row_id"], report.series.periods)
         if spec.get("save_daily"):
             daily[row["row_id"]] = _daily(report.series)
     timing = {"forecast": tag, "horizon": horizon, "chunk": chunk, "configs": len(configs),
               "seconds": elapsed, **({"data": variant} if variant else {})}
     extra = {"__daily__": daily} if spec.get("save_daily") else {}
-    return rows, series | {"__timing__": timing} | extra
+    return rows, series | {"__timing__": timing, "__periods__": periods.as_dict()} | extra
+
+
+class _PeriodSets:
+    """Each row's period labels, every distinct label array stored once.
+
+    A series is saved without its labels, and a held or daily book has fewer
+    periods than decisions, so which day -- or which time of day -- a period
+    belongs to cannot be read off its position afterwards. The rows of a run
+    share a handful of label arrays (every decision, each horizon's
+    formations, the days), so they are kept once each and the rows point at
+    them: the labels of a four-thousand-row run cost about what one row's do.
+    """
+
+    def __init__(self) -> None:
+        self.sets: list[np.ndarray] = []
+        self.rows: dict[str, int] = {}
+        self._index: dict[bytes, int] = {}
+
+    def add(self, row_id: str, labels) -> None:
+        labels = np.asarray(labels).astype(str)
+        key = hashlib.sha256(labels.tobytes() + str(labels.dtype).encode()).digest()
+        if key not in self._index:
+            self._index[key] = len(self.sets)
+            self.sets.append(labels)
+        self.rows[row_id] = self._index[key]
+
+    def update(self, saved: dict | None) -> None:
+        """Add a task's :meth:`as_dict`; a checkpoint written before labels were kept has none."""
+        for row_id, index in (saved or {}).get("rows", {}).items():
+            self.add(row_id, saved["sets"][index])
+
+    def as_dict(self) -> dict:
+        return {"sets": self.sets, "rows": self.rows}
+
+    def write(self, path: Path) -> None:
+        """``periods.npz``: ``row_id`` and ``set`` (one entry per row) and ``set_<k>`` label arrays.
+
+        Row ``i``'s labels are ``set_<set[i]>``. A run assembled only from
+        checkpoints that predate the labels writes no file, and removes a
+        stale one, so the file never describes rows it was not written with.
+        """
+        if not self.rows:
+            path.unlink(missing_ok=True)
+            return
+        ids = np.asarray(list(self.rows))
+        np.savez_compressed(path, row_id=ids, set=np.asarray(list(self.rows.values())),
+                            **{f"set_{k}": labels for k, labels in enumerate(self.sets)})
 
 
 # ── the experiment ──────────────────────────────────────────────────────────
@@ -643,12 +696,13 @@ def run(spec_path: str, workers: int = 4) -> Path:
         for done, (f, h, c, v, p) in enumerate(pending, start=1):
             _run_and_save(spec, f, h, c, p, v)
             print(f"  {spec['name']}: task {done}/{len(pending)} done", flush=True)
-    rows, series, timings, daily = [], {}, [], {}
+    rows, series, timings, daily, periods = [], {}, [], {}, _PeriodSets()
     for path in paths:
         with open(path, "rb") as handle:
             task_rows, task_series = pickle.load(handle)
         timings.append(task_series.pop("__timing__"))
         daily.update(task_series.pop("__daily__", {}))
+        periods.update(task_series.pop("__periods__", None))
         rows.extend(task_rows)
         series.update(task_series)
     frame = pd.DataFrame(rows)
@@ -656,6 +710,7 @@ def run(spec_path: str, workers: int = 4) -> Path:
     np.savez_compressed(out / "series.npz", **series)
     if spec.get("save_daily"):
         _write_daily(out / "daily.npz", daily)
+    periods.write(out / "periods.npz")
     manifest = {
         "spec": spec, "git_sha": git_sha, "n_rows": len(rows), "n_tasks": len(tasks),
         "resumed_tasks": len(tasks) - len(pending),
