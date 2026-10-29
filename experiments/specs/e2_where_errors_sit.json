@@ -1,0 +1,16 @@
+{
+  "name": "e2_where_errors_sit",
+  "description": "Where the forecast is wrong, holding how wrong fixed: tails, middle and random noise with equal per-decision IC dispersion (scatter='sampling'), so the three differ only in which names carry the error.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [300, 900, 3600],
+  "forecasts": {"kind": "oracle", "ic": [0.01, 0.02, 0.03, 0.05, 0.1],
+                "noise": ["tails", "middle", "random"], "scatter": "sampling", "seed": 0},
+  "configs": {
+    "base": {"cost_model": "cross", "risk_model": "shrunk_sample", "universe": "all",
+             "annualization": "decisions", "efq": 0.7},
+    "grid": {"weighting": ["equal", "rank", "signal", "hrp"],
+             "selection": ["all", "decile"],
+             "rebalance": ["every_decision", "horizon"]}
+  }
+}

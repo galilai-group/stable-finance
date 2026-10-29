@@ -1,0 +1,58 @@
+{
+  "name": "e1_transfer_map",
+  "description": "How a forecast's IC becomes net Sharpe: noised oracles at six ICs and three noise modes, through every covariance-light construction, at three horizons and three execution qualities, with and without held-book scoring.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [
+    300,
+    900,
+    3600
+  ],
+  "forecasts": {
+    "kind": "oracle",
+    "ic": [
+      0.005,
+      0.01,
+      0.02,
+      0.03,
+      0.05,
+      0.1
+    ],
+    "noise": [
+      "tails",
+      "middle",
+      "random"
+    ],
+    "seed": 0
+  },
+  "configs": {
+    "base": {
+      "cost_model": "cross",
+      "risk_model": "shrunk_sample",
+      "universe": "all",
+      "annualization": "decisions"
+    },
+    "grid": {
+      "weighting": [
+        "equal",
+        "rank",
+        "signal",
+        "hrp",
+        "min_var_qp"
+      ],
+      "selection": [
+        "all",
+        "decile"
+      ],
+      "efq": [
+        0.0,
+        0.7,
+        1.0
+      ],
+      "rebalance": [
+        "every_decision",
+        "horizon"
+      ]
+    }
+  }
+}
