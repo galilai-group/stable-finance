@@ -34,8 +34,9 @@ src/stable_finance/
                            streamed) and oracle forecasts
     portfolio/             stage 3: the target portfolio, as if trading were free;
                            risk.py (risk management: universe screens and the risk
-                           model) and construction.py (selection and weighting, or
-                           the mean-variance target)
+                           model), signals.py (alpha refinement and neutralization)
+                           and construction.py (selection and weighting, or the
+                           mean-variance target)
     trades/                stage 4: trading policies, how far to move given costs;
                            rebalance and trade rules, and rl/ reserved for learned
                            policies
@@ -320,6 +321,43 @@ the covariance appears under one risk model, and equal-risk-contribution on a
 diagonal model is inverse-volatility, so it is not also counted as its own
 option.
 
+`enumerate_configs` sweeps any `BacktestConfig` field given a list or tuple
+of options and pins any field given one value, so a setting outside the
+default space is swept the same way, as in
+`enumerate_configs(neutralize=(None, "beta"))`.
+Two such settings are unset by default, so the default space and every label
+in it are unchanged:
+
+| Setting | Options |
+|---|---|
+| `alpha` | `"grinold"` or `"grinold_rank"`, with `alpha_ic` — rescale the forecast to `alpha_ic * sigma * z` before construction, `z` the cross-sectional z-score or, for `grinold_rank`, the Gaussian rank score |
+| `neutralize` | `"beta"`, `"industry"`, `"beta_industry"` — residualise the forecast on those exposures before construction |
+
+### Signal transforms
+
+A forecast and the portfolio built from it need not say the same thing.
+`refine_alpha` puts a forecast in return units with Grinold's (1994) rule,
+`alpha = IC * sigma * z`: a probe fit against a rank target, or any score, is
+not in the units of a covariance or a spread, and mean-variance sizing and
+the edge-to-cost rules compare the forecast with both. `neutralize` takes the
+per-decision cross-sectional residual of the forecast on an intercept and the
+chosen exposures, so the book cannot express a market or industry bet the
+forecast never meant to make. Beta is estimated from the risk history against
+the equal-weighted mean of the panel (`estimate_beta`), so it needs no index
+and runs on any data. The industry is a column role, `industry`, a numeric
+code per name like `market_cap`; Market-1T supplies it as the Fama-French 49
+code through `market_from_days(..., industry_map=...)`, reading the map that
+`sf-industry-map` writes. The IC is always measured on the
+raw forecast: the transforms change what the portfolio expresses, not what
+the model predicted.
+
+```python
+from stable_finance import BacktestConfig, refine_alpha, neutralize
+
+config = BacktestConfig(alpha="grinold", alpha_ic=0.05, neutralize="beta_industry")
+alpha = refine_alpha(scores, volatility, ic=0.05, score="gauss_rank")
+```
+
 ## Is the forecast worth its spread?
 
 A Sharpe ratio is the wrong headline statistic for a short-horizon forecast,
@@ -529,6 +567,7 @@ refuses with `MissingRolesError` when a column is absent:
 | fills through the book (`cost_model="book"`) | `book_bid_price`, `book_bid_size`, `book_ask_price`, `book_ask_size` |
 | the impact model (`cost_model="impact"`) | `adv`, average daily dollar volume |
 | the stock-specific impact model (`cost_model="impact_stock"`) | `adv`, `market_cap`, `idio_vol`, `market_vol`, `time_trend` |
+| industry neutralization (`neutralize="industry"` or `"beta_industry"`) | `industry` |
 | limit orders, any model but `impact` | `window_best_buy` and `window_best_sell`, and a decision price |
 | `cross_spread_sharpe` | `bid_price` and `ask_price` |
 
@@ -641,7 +680,7 @@ no price, and the return is NaN rather than a guess.
 
 **Roles decide what is possible downstream.** The roles are `mid`, `open`,
 `high`, `low`, `close`, `vwap`, `volume`, `n_trades`, `bid_price`,
-`ask_price`, `bid_size`, `ask_size` and `market_cap`. None is required. Every target family
+`ask_price`, `bid_size`, `ask_size`, `market_cap` and `industry`. None is required. Every target family
 and every stage declares the roles it needs. A univariate series gets returns
 and frictionless portfolios, and a backtest that charges the spread is
 refused with `MissingRolesError` naming the missing columns. Bars without

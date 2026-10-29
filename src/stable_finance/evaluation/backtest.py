@@ -67,6 +67,9 @@ from stable_finance.evaluation.portfolio.construction import (
     mean_variance_target, select_book, weight_book,
 )
 from stable_finance.evaluation.portfolio.risk import apply_screen, estimate_risk
+from stable_finance.evaluation.portfolio.signals import (
+    alpha_from_rule, apply_signal, estimate_beta,
+)
 from stable_finance.evaluation.returns.contract import ForwardReturns
 from stable_finance.evaluation.returns.probes import RidgeProbe
 from stable_finance.evaluation.scoring.ic import grouped_rank_ic
@@ -80,7 +83,21 @@ __all__ = ["LEVELS", "BacktestReport", "run_backtest", "sweep_configs"]
 #: hold the identical book, so the expensive part is computed once and the
 #: remaining axes -- which act only on an existing book -- are evaluated on top.
 _BOOK_AXES = ("universe", "selection", "weighting", "risk_model", "cost_model",
-              "efq", "gross_exposure", "shrinkage", "max_iter", "equity", "impact")
+              "efq", "gross_exposure", "shrinkage", "max_iter", "equity", "impact",
+              "alpha", "alpha_ic", "neutralize")
+
+
+#: The book axes only the cost-aware allocator reads. A path-independent rule
+#: sizes a book from the forecast and the risk model alone, so configurations
+#: differing only in what trading costs hold the same book and share it.
+_COST_AXES = ("cost_model", "efq", "equity", "impact", "max_iter")
+
+
+def _book_key(config: BacktestConfig) -> tuple:
+    """The settings that determine a configuration's book, and nothing else."""
+    axes = (_BOOK_AXES if config.weighting == "mean_variance"
+            else tuple(a for a in _BOOK_AXES if a not in _COST_AXES))
+    return tuple((axis, getattr(config, axis)) for axis in axes)
 
 
 @dataclass(frozen=True)
@@ -215,6 +232,26 @@ def _prepare(like, realized, market: MarketData, days, horizon_index) -> dict:
     }
 
 
+def _history_panel(context, history, realized) -> ForwardReturns:
+    """The risk history at the horizon being scored, checked against the input.
+
+    The history is matched to the input BY LABEL, not by position: its assets
+    must be the input's assets in the input's order, and its horizon is found
+    by value. A history whose columns were merely the same length used to be
+    read as though they lined up, which silently paired one name's risk with
+    another's forecast.
+    """
+    source = history if history is not None else realized
+    if not np.array_equal(source.assets, context["assets"]):
+        raise ValueError("assets of the history and the input are not aligned")
+    matches = np.flatnonzero(np.asarray(source.horizons) == context["horizon"])
+    if len(matches) == 0:
+        raise ValueError(f"the history has no horizon {context['horizon']}; "
+                         f"it has {list(source.horizons)}")
+    return ForwardReturns(source.values[:, :, matches[0]][:, :, None],
+                          source.decisions, source.assets, context["axis"])
+
+
 def _risk(context, config, history, realized, embeddings, horizon_index):
     """The covariance for one risk model, on the horizon being scored."""
     source = history if history is not None else realized
@@ -224,6 +261,35 @@ def _risk(context, config, history, realized, embeddings, horizon_index):
     )
     return estimate_risk(config.risk_model, panel, embeddings=embeddings,
                          shrinkage=config.shrinkage, min_samples=2)[0]
+
+
+def _beta(context, history, realized) -> NDArray[np.float64]:
+    """Each name's beta at the scored horizon, estimated once per run."""
+    if "beta" not in context:
+        context["beta"] = estimate_beta(_history_panel(context, history, realized))[0]
+    return context["beta"]
+
+
+def _signal(context: dict, config: BacktestConfig, sigma, screened) -> NDArray[np.float64]:
+    """The forecast the book is built from, after the configured transforms.
+
+    Neutralization runs first, so the alpha is scaled from the part of the
+    forecast the book is meant to express; both read only the screened names.
+    The IC is still measured on the raw forecast: these transforms change what
+    the portfolio expresses, not what the model predicted.
+    """
+    mu = context["mu"]
+    if config.neutralize is not None:
+        market = context["market"]
+        mu = apply_signal(
+            config.neutralize, mu, eligible=screened,
+            beta=context.get("beta"),
+            industry=market.get("industry") if market.has("industry") else None,
+        )
+    if config.alpha is not None:
+        mu = alpha_from_rule(config.alpha, mu, np.sqrt(np.maximum(np.diag(sigma), 0.0)),
+                             ic=config.alpha_ic, eligible=screened)
+    return mu
 
 
 # ── the book ────────────────────────────────────────────────────────────────
@@ -239,6 +305,7 @@ def _weights(context: dict, config: BacktestConfig,
     # keeps `selection` a real axis for mean-variance rather than a label on
     # four identical portfolios.
     screened = apply_screen(config.universe, spread, shape=mu.shape)
+    mu = _signal(context, config, sigma, screened)
     signs = select_book(config.selection, mu, screened)
     if config.weighting != "mean_variance":
         return weight_book(config.weighting, signs, mu, sigma,
@@ -454,7 +521,8 @@ def _check_axes(config: BacktestConfig, market: MarketData, source) -> None:
     if isinstance(source, ForwardReturns):
         check_config(config, market)
     else:
-        check_config(config.replace(universe="all"), market)
+        check_config(config.replace(universe="all", alpha=None, alpha_ic=None,
+                                    neutralize=None), market)
 
 
 def run_backtest(
@@ -540,6 +608,8 @@ def run_backtest(
         context["efq"] = np.broadcast_to(_efq_array(efq), (context["n_decisions"], context["n_assets"]))
     if isinstance(source, ForwardReturns):
         sigma = _risk(context, config, history, realized, embeddings, horizon_index)
+        if config.neutralize in ("beta", "beta_industry"):
+            _beta(context, history, realized)
         return _score(context, _weights(context, config, sigma), config,
                       with_series=with_series)
     if isinstance(source, PortfolioWeights):
@@ -642,7 +712,9 @@ def sweep_configs(
                 risk_cache[risk_key] = _risk(
                     context, config, history, realized, embeddings, horizon_index
                 )
-            book_key = tuple(getattr(config, axis) for axis in _BOOK_AXES)
+            if config.neutralize in ("beta", "beta_industry"):
+                _beta(context, history, realized)
+            book_key = _book_key(config)
             if book_key in book_cache:
                 book_cache.move_to_end(book_key)
             else:
