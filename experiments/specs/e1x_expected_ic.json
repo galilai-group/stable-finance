@@ -1,0 +1,77 @@
+{
+  "name": "e1x_expected_ic",
+  "description": "E1 with expected-IC oracles: tails and middle with scatter='sampling' (each decision's IC drawn around the target, as a real forecast's would be) and random, under three seeds each, at the 15-minute horizon with held books. The exact-IC E1 measures cost ratios; this is the version whose gross Sharpe can be read against the fundamental law. About 54 tasks of 20 configurations: roughly 30-40 minutes on 4 cores.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [
+    900
+  ],
+  "forecasts": [
+    {
+      "kind": "oracle",
+      "ic": [
+        0.005,
+        0.01,
+        0.02,
+        0.03,
+        0.05,
+        0.1
+      ],
+      "noise": [
+        "tails",
+        "middle"
+      ],
+      "scatter": "sampling",
+      "seed": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "kind": "oracle",
+      "ic": [
+        0.005,
+        0.01,
+        0.02,
+        0.03,
+        0.05,
+        0.1
+      ],
+      "noise": [
+        "random"
+      ],
+      "seed": [
+        0,
+        1,
+        2
+      ]
+    }
+  ],
+  "configs": {
+    "base": {
+      "cost_model": "cross",
+      "risk_model": "shrunk_sample",
+      "universe": "all",
+      "annualization": "decisions",
+      "rebalance": "horizon"
+    },
+    "grid": {
+      "weighting": [
+        "equal",
+        "rank",
+        "signal",
+        "hrp",
+        "min_var_qp"
+      ],
+      "selection": [
+        "all",
+        "decile"
+      ],
+      "efq": [
+        0.0,
+        0.7
+      ]
+    }
+  }
+}

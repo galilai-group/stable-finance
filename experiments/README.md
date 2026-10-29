@@ -24,6 +24,12 @@ export STABLE_FINANCE_CACHE=/path/with/space      # downloads and caches live he
 | 5. Stage costs | `python -m experiments.bench` (on an idle machine) | `results/bench/bench.json` |
 | 6. Figures | `python -m experiments.figures` | `results/figures/*-{light,dark}.png` |
 | 7. Solver convergence | `python -m experiments.mv_solver --efq 0.7 1.0 0.0 --variants 200` | `results/mv_solver/summary.json`, `per_decision.npz`: the mean-variance book under the default 400-iteration FISTA and solved to convergence (`mv_solver="restart"`), with iterations, optimality residuals, distance from a verified exact optimum, seconds and the change in scores |
+| 8. Inference | `python -m experiments.inference <run>` (needs `arch`, in the extra) | `results/<run>/inference.parquet`, `inference.json`: Lo-adjusted and HAC Sharpe per row; model confidence set, SPA, StepM, deflated Sharpe (effective trials) and PBO per group |
+| 9. Sanity checks | `python -m experiments.sanity [--results DIR] [--quick]` | `results/sanity/report.json`: analytic TCs, fundamental law, placebo, IC-1 invariance, look-ahead canaries, cost identity, latency, determinism -- PASS/FLAG/WARN/FAIL/SKIP |
+| 10. Risk models | `python -m experiments.risk_eval` | `results/risk_eval/risk_eval.json`: each risk model scored out of sample (GMV variance, Diebold-Mariano, bias by half hour) |
+| 11. Dynamic trading | `python -m experiments.dynamic` | `results/dynamic/dynamic.json`: aim portfolio, partial adjustment and no-trade bands tuned on July, scored on August |
+| 12. Walk-forward signals | `python -m experiments.signals_wf [--window N] [--ofi]` | `results/signals_wf/{ridge_wf,lasso_wf}.npz`, `ic_table.json`: daily refits with purged, embargoed CV |
+| 13. More figures, appendix | `python -m experiments.figures_v2`, `python -m experiments.appendix` | fundamental-law, daily-CI, seed, break-even, walk-forward and MCS figures; `appendix/appendix.csv` (every row) and `lookup.csv` (IC to break even) |
 
 Run each with `uv run --extra experiments python -m ...`. `month_cache` streams the
 Hugging Face day store one day at a time and deletes each unpacked day after
@@ -79,6 +85,11 @@ rows carry the keys the spec names.
 | `e4_harness_sensitivity` | For a fixed forecast, how far do the risk model, neutralization, Grinold scaling and the liquidity screen move net Sharpe? |
 | `e5_real_signals` | Where do cheap real forecasts land on the oracle's map? |
 | `e6_sanity_checks` | Do the controls behave? IC-0 placebos under ten seeds must centre on zero, the seed-to-seed spread at IC 0.03 says how much one draw can mislead, and at IC 1 the three oracles must coincide |
+| `e1x_expected_ic` | E1 with expected-IC oracles (scatter "sampling", three seeds) at 15 minutes: the version whose gross Sharpe can be read against the fundamental law |
+| `e7_factor_oracle` | Do beta neutralization and a factor risk model help when forecast errors are factor bets (`factor_forecast`, 0/30/60% factor share)? |
+| `e8_costs` | Cost realism on cache v2: midquote vs VWAP returns, 1/5/30 s latency, 2020 fees, for an oracle and the real reversal signal |
+| `e9_impact_capacity` | Capacity: the impact model at $0.1M-$100M against the cross-spread model (cache v2 supplies `adv`) |
+| `e10_mv_converged` | E1b with the converged mean-variance solver (`mv_solver="restart"`): the solver error in the published mean-variance results |
 
 A spec names the evaluation month, the risk-history month, the horizons, the
 forecasts and a grid of `BacktestConfig` settings. `"rebalance": "horizon"`
@@ -156,6 +167,22 @@ Months are tagged with the pre-declared protocol segments: `design`
 `"save_daily": true` works in any spec: `run.py` then also writes
 `daily.npz` (per row, the P&L summed over each day), which the per-period
 series cannot give back once saved.
+
+## Prepared, not yet run: every month of the store
+
+The 18-month extension is built and smoke-tested on one day, but has not been
+run. It takes, in order:
+
+```bash
+python -m experiments.months                     # every month's v2 cache, raw deleted after each
+python -m experiments.walkforward experiments/specs/<spec>.json --months 2019-08..2020-12
+```
+
+`months.py` downloads each month of the day store (about 1.5-1.7 GB, roughly
+27 GB over the 16 months not yet local), writes its v2 cache (about 200 MB)
+and deletes the raw month before the next, so peak disk stays at a few GB; the
+compute is about 1-2 hours on one core. It is resumable after a restart. The
+walk-forward then costs about one month's run of the spec per evaluation month.
 
 ## On a cluster
 

@@ -180,6 +180,17 @@ the positive semidefinite cone. A NaN cost marks an asset that cannot be
 traded at that decision, so it holds its previous weight; a NaN forecast is a
 zero expected return that still pays risk and cost.
 
+`trades.dynamic` holds three rules that trade less than all the way to the
+target, each a function of a target path and the book held:
+`partial_adjustment(target, rate)` moves a fixed fraction of the gap each
+decision; `no_trade_band(target, band, cost=half_spread)` holds a name until
+its target leaves a band (here a multiple of its cost) and then trades to the
+band's edge (Constantinides, 1986); `aim_portfolio(forecast, sigma,
+risk_aversion=..., cost_aversion=...)` is Garleanu and Pedersen's (2013) aim,
+which weights forecasts at several horizons by how slowly they decay. Their
+output is `PortfolioWeights`, scored by entering `run_backtest` at the
+weights level.
+
 `trades.rl` holds policies learned for their net-of-cost performance rather
 than written by hand. The first, `ParametricPolicy`, follows Brandt,
 Santa-Clara and Valkanov (2009) with a learned partial-adjustment rate
@@ -365,7 +376,7 @@ predictors.
 | `universe` | `all`, `tight_50pct`, `tight_25pct` — a cross-sectional screen on each name's own quoted half-spread |
 | `selection` | `all`, `quintile`, `decile`, `decile_long_only` — how much of the ranking to trade |
 | `weighting` | `mean_variance` (cost-aware, path-dependent), `equal`, `inverse_vol`, `min_var`, `erc`, `rank`, `signal` (proportional to the forecast's distance from the median), `min_var_qp` (the long-only minimum-variance optimum `min_var` approximates), `hrp` (hierarchical risk parity) |
-| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `nonlinear_shrinkage` (Ledoit and Wolf, 2020), `embedding` — the last forecasts correlations from the encoder's own representation |
+| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `nonlinear_shrinkage` (Ledoit and Wolf, 2020), `embedding` — the last forecasts correlations from the encoder's own representation; `factor` (statistical and, when the market has an `industry` column, industry factors plus specific risk; `factor_covariance`) is asked for by name and is outside the default space |
 | `cost_model` | `mid`, `cross` — free, or the name's own quoted half-spread times `efq` |
 | `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it; `horizon` is outside the default space (see below) |
 | `annualization` | `decisions`, `daily` — whether every decision is an independent period |
