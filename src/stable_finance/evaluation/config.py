@@ -266,11 +266,13 @@ def _is_degenerate(config: BacktestConfig) -> bool:
     one risk model is kept for it. And under a diagonal risk model,
     inverse-volatility and equal-risk-contribution both reduce to ``w ~
     1/sigma``, so keeping all three would triple-count one portfolio and
-    silently weight the summary toward it.
+    silently weight the summary toward it. Hierarchical risk parity and the
+    long-only minimum-variance solution land on ``w ~ 1/sigma^2`` under the
+    same model, which is ``min_var``'s book.
     """
-    if config.weighting in ("equal", "rank") and config.risk_model != "diagonal":
+    if config.weighting in ("equal", "rank", "signal") and config.risk_model != "diagonal":
         return True
-    if config.risk_model == "diagonal" and config.weighting == "erc":
+    if config.risk_model == "diagonal" and config.weighting in ("erc", "hrp", "min_var_qp"):
         return True
     return False
 
