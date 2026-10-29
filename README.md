@@ -38,8 +38,8 @@ src/stable_finance/
                            and construction.py (selection and weighting, or the
                            mean-variance target)
     trades/                stage 4: trading policies, how far to move given costs;
-                           rebalance and trade rules, and rl/ reserved for learned
-                           policies
+                           rebalance and trade rules, and rl/ for learned policies
+                           (parametric.py, the first)
     scoring/               stage 5: how good each output is; ic.py (forecast IC),
                            pnl.py (positions and P&L), sharpe.py (Sharpe, EFQ curves)
     config.py, backtest.py the harness: one named configuration, entered at any level
@@ -169,6 +169,24 @@ covariance over finite observations, shrunk toward its diagonal and clipped to
 the positive semidefinite cone. A NaN cost marks an asset that cannot be
 traded at that decision, so it holds its previous weight; a NaN forecast is a
 zero expected return that still pays risk and cost.
+
+`trades.rl` holds policies learned for their net-of-cost performance rather
+than written by hand. The first, `ParametricPolicy`, follows Brandt,
+Santa-Clara and Valkanov (2009) with a learned partial-adjustment rate
+(DeMiguel et al., 2020): the target is a dollar-neutral blend `X_t @ theta`
+of characteristics (forecasts at several horizons, say), the held book moves
+a fraction `eta` of the way there each decision, and `theta` and `eta` are
+chosen by full-batch gradient ascent on mean net return minus a variance
+penalty, from a fixed start for a fixed number of steps, so a fit is
+deterministic.
+
+```python
+from stable_finance import ParametricPolicy
+
+policy = ParametricPolicy(gross_exposure=2.0, risk_aversion=5.0).fit(
+    train_forecasts, train_returns, cost=train_market)
+held = policy.predict(test_forecasts, cost=test_market)    # PortfolioWeights
+```
 
 Orders are the weight changes along a target path; fills are what executed:
 

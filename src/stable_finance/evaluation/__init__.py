@@ -175,11 +175,13 @@ from stable_finance.evaluation.scoring import (
 )
 from stable_finance.evaluation.trades import (
     MeanVarianceAllocator,
+    ParametricPolicy,
     allocate,
     edge_to_cost,
     persistent_selection,
     rebalance,
     threshold_selection,
+    to_weights,
 )
 
 __all__ = [
@@ -222,6 +224,7 @@ __all__ = [
     "OPTIONAL_SETTINGS",
     "Orders",
     "PBOResult",
+    "ParametricPolicy",
     "PnLSeries",
     "PortfolioWeights",
     "ProbeData",
@@ -311,6 +314,7 @@ __all__ = [
     "tail_selection",
     "threshold_selection",
     "to_grid",
+    "to_weights",
     "tradable",
     "trading_cost",
     "transfer_coefficient",
