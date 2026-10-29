@@ -102,8 +102,8 @@ from stable_finance.evaluation.inputs import (
     to_grid,
 )
 from stable_finance.evaluation.portfolio import (
-    RISK_MODEL_REQUIRES,
     RISK_MODELS,
+    RISK_MODEL_REQUIRES,
     SELECTION_REQUIRES,
     SELECTION_RULES,
     UNIVERSE_REQUIRES,
@@ -119,6 +119,7 @@ from stable_finance.evaluation.portfolio import (
     ledoit_wolf_covariance,
     liquidity_screen,
     mean_variance_target,
+    nonlinear_shrinkage_covariance,
     select_book,
     tail_selection,
     weight_book,
@@ -248,6 +249,7 @@ __all__ = [
     "liquidity_screen",
     "mean_variance_target",
     "mid_price_sharpe",
+    "nonlinear_shrinkage_covariance",
     "oracle_forecast",
     "orders_from_weights",
     "paired_difference",

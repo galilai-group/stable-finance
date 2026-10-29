@@ -1,4 +1,4 @@
-"""Stage 3, forward returns to the target portfolio, with no trading costs: risk management (the universe screens and the risk model) and construction (selection and weighting, or the mean-variance target)."""
+"""Stage 3, forward returns to the target portfolio, with no trading costs: risk management (the universe screens and the risk model), signal transforms (alpha refinement and neutralization), and construction (selection and weighting, or the mean-variance target)."""
 
 from stable_finance.evaluation.portfolio.construction import (
     SELECTION_REQUIRES,
@@ -25,6 +25,7 @@ from stable_finance.evaluation.portfolio.risk import (
     estimate_risk,
     ledoit_wolf_covariance,
     liquidity_screen,
+    nonlinear_shrinkage_covariance,
 )
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     "ledoit_wolf_covariance",
     "liquidity_screen",
     "mean_variance_target",
+    "nonlinear_shrinkage_covariance",
     "select_book",
     "tail_selection",
     "weight_book",
