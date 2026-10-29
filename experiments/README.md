@@ -17,6 +17,7 @@ export STABLE_FINANCE_CACHE=/path/with/space      # downloads and caches live he
 | Step | Script | Output |
 |---|---|---|
 | 1. Cache months | `python -m experiments.month_cache 2020-07 2020-08` | `$STABLE_FINANCE_CACHE/experiments/market1t-YYYY-MM.npz`, about 120 MB a month |
+| 1b. Cache months, v2 (optional) | `python -m experiments.months` | `$STABLE_FINANCE_CACHE/experiments/market1t-v2-YYYY-MM.npz`, about 200 MB a month, every month of the store |
 | 2. Real forecasts | `python -m experiments.signals` | `results/signals/{reversal_15m,ridge,lasso}.npz`, `ic_table.json` |
 | 3. Run a spec | `python -m experiments.run experiments/specs/<spec>.json --workers 4` | `results/<name>/rows.parquet`, `manifest.json`, `series.npz` |
 | 4. Learned policy | `python -m experiments.policy` | `results/policy/policy.json` |
@@ -28,6 +29,44 @@ Run each with `uv run --extra experiments python -m ...`. `month_cache` streams 
 Hugging Face day store one day at a time and deletes each unpacked day after
 reading it, so a month needs about 1.6 GB of download plus one unpacked day
 (about 0.6 GB) of scratch space.
+
+## Month cache v2 and every month of the store
+
+`month_cache_v2` reads the same days in the same pass and writes
+`market1t-v2-YYYY-MM.npz` (about 200 MB a month): every v1 array, bit for bit
+the same as the cached v1 files, plus what cost realism and order flow need:
+
+| Array | What |
+|---|---|
+| `realized_mid` | midquote-to-midquote forward returns at the store's horizons, from the decision row, NaN on the same structural cells as the VWAP label |
+| `exec_{bid,ask}_price_{1,5,30}s` | the touch 1, 5 and 30 seconds after the decision (5 s is v1's `exec_` pair) |
+| `dollar_volume`, `day_close` | the name's dollar volume and last midpoint over its whole day, on every decision row of that day (not causal within the day) |
+| `ofi_features` (`ofi_60s`, `ofi_300s`) | best-level order-flow imbalance (Cont, Kukanov and Stoikov 2014) over the last 60 and 300 seconds, divided by the average depth |
+
+```bash
+python -m experiments.month_cache_v2 --days 2020-08-12 --check   # one day, checked against v1
+python -m experiments.months --list                              # the store's months and their state
+python -m experiments.months --keep-raw 2020-07 2020-08          # build every month, in order
+```
+
+`months` builds each month in date order and deletes its download and per-day
+files once its cache is written, so peak disk is one month's download plus one
+unpacked day (about 2.5 GB) plus the finished caches. It is safe to kill and
+rerun: done months are skipped, days and months are written atomically, a lock
+file stops a second copy, and progress goes to `months.log` beside the caches.
+`--v1` also writes each month's v1 file, cut from the v2 one.
+
+A spec opts in with three keys; a spec without them runs exactly as before
+(same task keys, rows and row ids):
+
+| Key | Options | Default |
+|---|---|---|
+| `cache` | `"v1"`, `"v2"`; v2 adds an `adv` market column, the mean daily dollar volume over the `adv_days` (default 20) days strictly before each decision's day, history month included | `"v1"` |
+| `returns` | `"vwap"` (the store's), `"mid"` (v2's midquote returns, for the risk history too; same universe either way) | `"vwap"` |
+| `latency` | `0` (the decision's quote), `1`, `5`, `30` seconds to the touch an order meets; 1 and 30 need v2 | `5` |
+
+`returns` and `latency` may be lists: each combination becomes a task axis, and
+rows carry the keys the spec names.
 
 ## Specs
 
@@ -76,11 +115,53 @@ depends only on the number of days, so intervals are reproducible and paired
 across rows. A month has about twenty days: the intervals give the scale of
 the uncertainty rather than exact coverage.
 
+## Walk-forward
+
+`walkforward.py` runs one spec, unchanged, on every consecutive (history,
+evaluation) month pair whose caches exist, and asks what a single month cannot
+answer: how far each configuration moves from month to month, whether the
+rankings hold, and whether the answer depends on the market regime.
+
+```bash
+python -m experiments.walkforward experiments/specs/e4_harness_sensitivity.json \
+    --months 2019-08..2020-12 --workers 4          # evaluation months; history is the month before
+python -m experiments.walkforward SPEC --months 2019-08..2020-10 --seal-holdout   # while designing
+python -m experiments.walkforward SPEC --months 2019-08..2020-12 --aggregate-only # re-summarize
+```
+
+Each pair is a per-month spec (`<name>_wf/<YYYY-MM>`, the evaluation month,
+with `eval_month` and `history_month` substituted and `"save_daily": true`) run
+in-process by `run.py`, so it resumes and reproduces like any run. A pair
+whose months are not cached (`market1t-v2-YYYY-MM.npz` when the spec says
+`"cache": "v2"`, else v1) is skipped and reported; nothing is downloaded.
+`--pairs HISTORY:EVAL,...` names pairs explicitly (a non-causal pair is allowed
+for smoke tests and marked). The aggregate describes the months of the last
+invocation.
+
+| Output under `results/<name>_wf/` | What it holds |
+|---|---|
+| `<YYYY-MM>/` | `run.py`'s files for that evaluation month, plus `daily.npz` |
+| `rows.parquet` | every month's rows with `eval_month`, `history_month`, `segment`, `month_missing_days` |
+| `daily.npz` | `(configurations, days)` gross, net and cost P&L summed per day, with `days`, `day_month`, `row_ids` |
+| `configs.parquet` | per configuration: mean, spread, range and share of positive months of each metric; Sharpe pooled over every day with a paired day-block interval; pooled break-even EFQ; deflated Sharpe within its group |
+| `stability.parquet` | per (forecast, horizon) group and over all rows, per segment: Kendall's W and its chi-square p, mean and worst Spearman between months, top-decile persistence, PBO with blocks of about a month |
+| `regimes.parquet` | per day: realized volatility, quoted half-spread, cross-sectional dispersion (from the cache), and their day and month terciles |
+| `regime_summary.parquet` | per configuration and tercile: Sharpe, mean daily P&L and break-even EFQ |
+| `coverage.json` | per month: days missing against the NYSE calendar and the store index, thin days, early closes, the March 2020 halts |
+| `summary.json`, `figures/wf_{months,trajectories,regimes}-{light,dark}.png` | the headline and the small multiples |
+
+Months are tagged with the pre-declared protocol segments: `design`
+(2019-08 to 2019-12, where the grid and the primary metric are frozen),
+`stress` (2020-02 to 2020-04), `holdout` (2020-11, 2020-12) and `test`.
+`"save_daily": true` works in any spec: `run.py` then also writes
+`daily.npz` (per row, the P&L summed over each day), which the per-period
+series cannot give back once saved.
+
 ## On a cluster
 
 Everything above runs on a CPU: one month and all six specs take a few hours
 on four cores. For the full 18 months, run `month_cache` over every month and
-point the specs at each (history, evaluation) pair. Tasks are independent, so
+`walkforward.py` over each spec (above). Tasks are independent, so
 `--workers` scales with cores.
 
 The TFWM encoders (arXiv 2610.09048) need a GPU to embed a month. Embed with

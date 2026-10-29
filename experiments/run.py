@@ -19,6 +19,29 @@ Each row is a configuration's :meth:`~stable_finance.BacktestReport.as_dict`
 plus the forecast's parameters, the horizon, and the break-even EFQ of its
 own profit path. EFQ itself is a grid axis: fills are priced off the touch on
 arrival, so cost is not exactly linear in EFQ and each point is its own run.
+A spec with ``"save_daily": true`` also writes ``daily.npz``, every row's P&L
+summed over each trading day, which ``walkforward.py`` pools across months.
+
+WHICH DATA. Three optional spec keys pick the evaluation data rather than the
+harness, and a spec that names none of them runs exactly as before:
+
+* ``"cache": "v1" | "v2"`` (default ``"v1"``): the month cache to read
+  (:mod:`experiments.month_cache` or :mod:`experiments.month_cache_v2`). On
+  v2 the market also carries ``adv``, each name's average daily dollar volume
+  over the ``"adv_days"`` (default 20) trading days strictly before the
+  decision's day, the history month's days included, which the ``impact``
+  cost model needs.
+* ``"returns": "vwap" | "mid"`` (default ``"vwap"``): the store's VWAP
+  forward returns or v2's midquote-to-midquote ones, for the evaluation and
+  the risk history alike. The universe is chosen from the VWAP panel either
+  way, so the two are scored on the same names.
+* ``"latency": 0 | 1 | 5 | 30`` (default 5): seconds between the decision and
+  the touch an order meets. 5 is v1's execution quote; 0 is the decision's
+  own quote; 1 and 30 need v2.
+
+``returns`` and ``latency`` may be lists. Each combination is then a task axis
+of its own (the inputs differ, so it cannot share a sweep), and every row
+carries the keys the spec names, which also enter its ``row_id``.
 
     uv run --extra experiments python -m experiments.run experiments/specs/e1_transfer_map.json
 """
@@ -47,8 +70,19 @@ import numpy as np
 
 import stable_finance as sf
 from experiments.month_cache import load_month
+from experiments.month_cache_v2 import load_month_v2
+from stable_finance.dataset.characteristics import trailing_from_days
 
 RESULTS = Path(__file__).resolve().parent / "results"
+
+#: Options of the data keys (see the module docstring). Defaults reproduce v1.
+CACHES = ("v1", "v2")
+RETURNS = ("vwap", "mid")
+LATENCIES = (0, 1, 5, 30)
+DATA_DEFAULTS = {"returns": "vwap", "latency": 5}
+
+#: Trading days in the ``adv`` window when the spec does not say.
+ADV_DAYS = 20
 
 
 # ── inputs ──────────────────────────────────────────────────────────────────
@@ -71,14 +105,89 @@ def _restrict(panel: sf.ForwardReturns, assets) -> sf.ForwardReturns:
                              panel.horizons)
 
 
-def load_inputs(spec: dict) -> dict:
-    """The evaluation month, its risk history, and the market, on one asset grid.
+def data_variants(spec: dict) -> list[dict]:
+    """The spec's data settings, one dict per combination of ``returns`` and ``latency``.
 
-    Names are the ones present in both months and quoted on at least
-    ``min_presence`` of the evaluation decisions, so every risk model has a
-    full history row for every name it is asked about.
+    Only the keys the spec names appear, in a fixed order, so a spec naming
+    neither has the one empty variant and its tasks, rows and row ids are
+    exactly what they were before these keys existed.
     """
-    evaluation, history = load_month(spec["eval_month"]), load_month(spec["history_month"])
+    named = [k for k in DATA_DEFAULTS if k in spec]
+    options = [spec[k] if isinstance(spec[k], list) else [spec[k]] for k in named]
+    return [dict(zip(named, combo)) for combo in itertools.product(*options)]
+
+
+def variant_key(variant: dict | None) -> str:
+    return json.dumps(variant or {}, sort_keys=True)
+
+
+def _data_setting(spec: dict, variant: dict | None, key: str):
+    """One data setting: the variant's, else the spec's (its first, if a list), else the default."""
+    if variant and key in variant:
+        return variant[key]
+    value = spec.get(key, DATA_DEFAULTS[key])
+    return value[0] if isinstance(value, list) else value
+
+
+def check_data_keys(spec: dict) -> None:
+    """Refuse a data setting the chosen cache cannot supply, before any month is read."""
+    cache = spec.get("cache", "v1")
+    if cache not in CACHES:
+        raise ValueError(f"cache must be one of {CACHES}; got {cache!r}")
+    adv_days = spec.get("adv_days", ADV_DAYS)
+    if adv_days is not None and (not isinstance(adv_days, int) or adv_days < 1):
+        raise ValueError(f"adv_days must be a positive number of days or null; got {adv_days!r}")
+    for variant in data_variants(spec):
+        returns, latency = (_data_setting(spec, variant, k) for k in ("returns", "latency"))
+        if returns not in RETURNS:
+            raise ValueError(f"returns must be one of {RETURNS}; got {returns!r}")
+        if latency not in LATENCIES:
+            raise ValueError(f"latency must be one of {LATENCIES} seconds; got {latency!r}")
+        if cache == "v1" and (returns != "vwap" or latency not in (0, 5)):
+            raise ValueError(f"returns={returns!r}, latency={latency!r} needs \"cache\": \"v2\"; "
+                             "v1 holds VWAP returns and the touch at 0 and 5 seconds only")
+
+
+def _load(spec: dict, month: str) -> dict:
+    return load_month_v2(month) if spec.get("cache", "v1") == "v2" else load_month(month)
+
+
+def trailing_adv(evaluation: dict, history: dict, assets, adv_days: int | None) -> np.ndarray:
+    """``(decisions, assets)`` average daily dollar volume before each decision's day.
+
+    The days are the history month's and the evaluation month's, in date
+    order; each decision reads the ``adv_days`` days strictly before its own
+    (all of them when ``None``), so nothing of its own day enters. This is
+    :func:`~stable_finance.dataset.characteristics.trailing_from_days`, the
+    rule ``market_from_days(lookback=...)`` uses: the mean over the days in
+    the window on which the name traded, NaN when it traded on none.
+    """
+    days, dollars, closes = [], [], []
+    for month in (history, evaluation):
+        labels = month["days"]
+        first = np.flatnonzero(np.r_[True, labels[1:] != labels[:-1]])
+        index = {a: i for i, a in enumerate(month["realized"].assets.astype(str))}
+        take = np.array([index.get(a, -1) for a in np.asarray(assets).astype(str)])
+        known = take >= 0
+        for name, out in (("dollar_volume", dollars), ("day_close", closes)):
+            block = np.full((len(first), len(take)), np.nan)
+            block[:, known] = month[name][first][:, take[known]]
+            out.append(block)
+        days.append(labels[first])
+    labels = np.concatenate(days)
+    order = np.argsort(labels, kind="stable")
+    labels, unique = np.unique(labels[order], return_index=True)
+    pick = order[unique]
+    lookback = len(labels) if adv_days is None else int(adv_days)
+    adv = trailing_from_days(np.concatenate(closes)[pick], np.concatenate(dollars)[pick],
+                             lookback)[0]
+    row = {d: i for i, d in enumerate(labels.tolist())}
+    return adv[[row[d] for d in evaluation["days"].tolist()]]
+
+
+def assemble_inputs(spec: dict, evaluation: dict, history: dict,
+                    variant: dict | None = None) -> dict:
+    """One data variant's inputs from two loaded months (see :func:`load_inputs`)."""
     horizons = spec["horizons"]
     realized = _horizon_panel(evaluation["realized"], horizons)
     past = _horizon_panel(history["realized"], horizons)
@@ -88,14 +197,49 @@ def load_inputs(spec: dict) -> dict:
     keep = set(realized.assets[quoted].astype(str)) & set(past.assets[seen >= 0.95].astype(str))
     assets = np.asarray(sorted(keep))
     realized, past = _restrict(realized, assets), _restrict(past, assets)
+    if _data_setting(spec, variant, "returns") == "mid":
+        # Chosen from the VWAP panel above, so mid and VWAP runs score the same names.
+        realized = _restrict(_horizon_panel(evaluation["realized_mid"], horizons), assets)
+        past = _restrict(_horizon_panel(history["realized_mid"], horizons), assets)
     index = {a: i for i, a in enumerate(evaluation["realized"].assets.astype(str))}
     take = [index[a] for a in assets]
     market_columns = {q: evaluation["market"].get(q)[:, take]
                       for q in ("bid_price", "ask_price", "exec_bid_price", "exec_ask_price")}
+    latency = _data_setting(spec, variant, "latency")
+    if latency != 5:
+        market = evaluation["market"]
+        quotes = evaluation.get("exec", {0: (market.get("bid_price"), market.get("ask_price"))})
+        bid, ask = quotes[latency]
+        market_columns["exec_bid_price"], market_columns["exec_ask_price"] = bid[:, take], ask[:, take]
+    if spec.get("cache", "v1") == "v2":
+        market_columns["adv"] = trailing_adv(evaluation, history, assets,
+                                             spec.get("adv_days", ADV_DAYS))
     market = sf.MarketData(market_columns, realized.decisions, assets)
     features = evaluation["features"][:, take]
     return {"realized": realized, "history": past, "market": market, "days": evaluation["days"],
             "features": features, "feature_names": evaluation["feature_names"]}
+
+
+def load_inputs(spec: dict, variant: dict | None = None) -> dict:
+    """The evaluation month, its risk history, and the market, on one asset grid.
+
+    Names are the ones present in both months and quoted on at least
+    ``min_presence`` of the evaluation decisions, so every risk model has a
+    full history row for every name it is asked about. ``variant`` picks one
+    data setting of a spec whose ``returns`` or ``latency`` is a list (default:
+    the first of each).
+    """
+    check_data_keys(spec)
+    evaluation, history = _load(spec, spec["eval_month"]), _load(spec, spec["history_month"])
+    return assemble_inputs(spec, evaluation, history, variant)
+
+
+def load_all_inputs(spec: dict) -> dict[str, dict]:
+    """Every data variant's inputs, keyed by :func:`variant_key`; the months are read once."""
+    check_data_keys(spec)
+    evaluation, history = _load(spec, spec["eval_month"]), _load(spec, spec["history_month"])
+    return {variant_key(v): assemble_inputs(spec, evaluation, history, v)
+            for v in data_variants(spec)}
 
 
 def _hash(array) -> str:
@@ -239,12 +383,13 @@ def configs_for(spec: dict, horizon: int, spacing: int) -> list[sf.BacktestConfi
 
 # ── one task ────────────────────────────────────────────────────────────────
 
-_INPUTS: dict | None = None
+#: Each data variant's inputs, keyed by :func:`variant_key`, once a worker has loaded them.
+_INPUTS: dict[str, dict] | None = None
 
 
 def _init(spec):
     global _INPUTS
-    _INPUTS = load_inputs(spec)
+    _INPUTS = load_all_inputs(spec)
 
 
 def _breakeven(series, efq: float) -> float:
@@ -302,8 +447,29 @@ def _inference(series) -> dict:
     return out
 
 
-def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0) -> tuple[list[dict], dict]:
-    inputs = _INPUTS if _INPUTS is not None else load_inputs(spec)
+def _daily(series) -> tuple[np.ndarray, np.ndarray]:
+    """A profit path summed over each trading day: ``(days, (3, n_days))``.
+
+    Rows are gross, net and cost, the same day sums ``_inference`` takes its
+    Sharpe ratios from (NaN periods count as zero), so a figure or a pooled
+    statistic built from them agrees with the row. The per-period series
+    carries no period labels once saved, and a held or daily book has fewer
+    periods than decisions, so the day of each period cannot be recovered
+    afterwards; a study that conditions on the day -- the walk-forward's
+    regime buckets, a pooled Sharpe over months -- needs the sums written now.
+    """
+    days = np.char.partition(np.asarray(series.periods).astype(str), "|")[:, 0]
+    labels, index = np.unique(days, return_inverse=True)
+    sums = np.stack([np.bincount(index, weights=np.nan_to_num(values), minlength=len(labels))
+                     for values in (series.gross, series.net, series.cost)])
+    return labels, sums
+
+
+def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0,
+             variant: dict | None = None) -> tuple[list[dict], dict]:
+    key, variant = variant_key(variant), variant or {}
+    inputs = (_INPUTS[key] if _INPUTS is not None and key in _INPUTS
+              else load_inputs(spec, variant))
     if fspec["kind"] == "file":
         covered = np.load(fspec["path"], allow_pickle=False)["decisions"]
         inputs = restrict_decisions(inputs, covered)
@@ -317,24 +483,27 @@ def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0) -> tuple[lis
                                history=inputs["history"], days=inputs["days"],
                                horizon_index=hi, with_series=True, on_error=spec.get("on_error", "skip"))
     elapsed = time.perf_counter() - t0
-    rows, series = [], {}
+    rows, series, daily = [], {}, {}
     tag = {k: v for k, v in fspec.items() if k != "kind"}
     for report in reports:
-        row = {"forecast": fspec["kind"], **{f"f_{k}": v for k, v in tag.items()},
+        row = {"forecast": fspec["kind"], **{f"f_{k}": v for k, v in tag.items()}, **variant,
                "eval_horizon": horizon, **report.as_dict()}
         if report.config.cost_model != "mid":
             row["breakeven_efq"] = _breakeven(report.series, report.config.efq)
         row.update(_inference(report.series))
         row["row_id"] = hashlib.sha256(json.dumps(
             {k: row[k] for k in sorted(row) if k.startswith("f_") or k in
-             ("eval_horizon",)} | {"label": report.config.label},
+             ("eval_horizon", *variant)} | {"label": report.config.label},
             sort_keys=True, default=str).encode()).hexdigest()[:16]
         rows.append(row)
         series[row["row_id"]] = np.stack([report.series.gross, report.series.net,
                                           report.series.cost])
+        if spec.get("save_daily"):
+            daily[row["row_id"]] = _daily(report.series)
     timing = {"forecast": tag, "horizon": horizon, "chunk": chunk, "configs": len(configs),
-              "seconds": elapsed}
-    return rows, series | {"__timing__": timing}
+              "seconds": elapsed, **({"data": variant} if variant else {})}
+    extra = {"__daily__": daily} if spec.get("save_daily") else {}
+    return rows, series | {"__timing__": timing} | extra
 
 
 # ── the experiment ──────────────────────────────────────────────────────────
@@ -366,19 +535,53 @@ def _chunk(configs: list, spec: dict, chunk: int) -> list:
     return configs[bounds[chunk]:bounds[chunk + 1]]
 
 
-def _task_key(spec: dict, fspec: dict, horizon: int, chunk: int = 0) -> str:
-    """A task's identity: everything that determines its rows."""
+def _task_key(spec: dict, fspec: dict, horizon: int, chunk: int = 0,
+              variant: dict | None = None) -> str:
+    """A task's identity: everything that determines its rows.
+
+    The data keys enter only when the spec names them, so a spec that names
+    none keeps the keys, and the checkpoints, it had before they existed. A
+    variant enters as its resolved settings, not the spec's lists, so adding a
+    latency to a list leaves the finished tasks of the others valid.
+    """
     payload = {k: spec.get(k) for k in ("eval_month", "history_month", "horizons", "configs",
                                          "decision_spacing", "min_presence", "on_error")}
     payload.update(forecast=fspec, horizon=horizon)
     if int(spec.get("config_chunks", 1)) > 1:
         payload.update(config_chunks=int(spec["config_chunks"]), chunk=chunk)
+    payload.update({k: spec[k] for k in ("cache", "adv_days") if k in spec})
+    if variant:
+        payload.update(data=variant)
+    # Named only when set, like the chunks: a checkpoint written without day
+    # sums must not be reused by a run that needs them, and every key a spec
+    # without the option produced stays the same.
+    if spec.get("save_daily"):
+        payload.update(save_daily=True)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:20]
 
 
-def _run_and_save(spec: dict, fspec: dict, horizon: int, chunk: int, path: str) -> str:
+def _write_daily(path: Path, daily: dict) -> None:
+    """Every row's day sums on the run's union of days, NaN where a row has none.
+
+    ``__days__`` holds the day labels and each row id a ``(3, n_days)`` array
+    of gross, net and cost. A day a row has no period on (a forecast file
+    covering part of the month) is NaN rather than zero, so it is not read as
+    a flat day.
+    """
+    days = np.asarray(sorted({str(d) for labels, _ in daily.values() for d in labels}))
+    column = {d: i for i, d in enumerate(days.tolist())}
+    arrays = {}
+    for row_id, (labels, sums) in daily.items():
+        full = np.full((3, len(days)), np.nan)
+        full[:, [column[str(d)] for d in labels]] = sums
+        arrays[row_id] = full
+    np.savez_compressed(path, __days__=days, **arrays)
+
+
+def _run_and_save(spec: dict, fspec: dict, horizon: int, chunk: int, path: str,
+                  variant: dict | None = None) -> str:
     """Run one task and checkpoint it atomically, so a killed run loses only it."""
-    result = run_task(spec, fspec, horizon, chunk)
+    result = run_task(spec, fspec, horizon, chunk, variant)
     partial = Path(path).with_suffix(".partial")
     with open(partial, "wb") as handle:
         pickle.dump(result, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -401,37 +604,50 @@ def run(spec_path: str, workers: int = 4) -> Path:
     out = RESULTS / spec["name"]
     checkpoints = out / "tasks"
     checkpoints.mkdir(parents=True, exist_ok=True)
-    inputs = load_inputs(spec)
+    variants = data_variants(spec)
+    all_inputs = load_all_inputs(spec)
+    inputs = all_inputs[variant_key(variants[0])]
+    # Recorded only for a spec that names the data keys, so other manifests keep their shape.
+    data_hashes = [] if variants == [{}] else [
+        {**v, "realized": _hash(x["realized"].values), "history": _hash(x["history"].values),
+         "exec_bid_price": _hash(x["market"].get("exec_bid_price"))}
+        for v, x in ((v, all_inputs[variant_key(v)]) for v in variants)]
     chunks = range(max(int(spec.get("config_chunks", 1)), 1))
-    tasks = [(f, h, c) for f in forecast_specs(spec) for h in spec["horizons"] for c in chunks]
-    paths = [checkpoints / f"{_task_key(spec, f, h, c)}.pkl" for f, h, c in tasks]
-    pending = [(f, h, c, str(p)) for (f, h, c), p in zip(tasks, paths) if not p.is_file()]
+    tasks = [(f, h, c, v) for f in forecast_specs(spec) for h in spec["horizons"]
+             for v in variants for c in chunks]
+    paths = [checkpoints / f"{_task_key(spec, f, h, c, v)}.pkl" for f, h, c, v in tasks]
+    pending = [(f, h, c, v, str(p)) for (f, h, c, v), p in zip(tasks, paths) if not p.is_file()]
     print(f"{spec['name']}: {len(tasks) - len(pending)} of {len(tasks)} tasks already done",
           flush=True)
     t0 = time.perf_counter()
     if pending and workers > 1:
+        del all_inputs     # each worker loads its own; the parent keeps only the manifest's
         with ProcessPoolExecutor(max_workers=workers, initializer=_init,
                                  initargs=(spec,)) as pool:
-            futures = [pool.submit(_run_and_save, spec, f, h, c, p) for f, h, c, p in pending]
+            futures = [pool.submit(_run_and_save, spec, f, h, c, p, v)
+                       for f, h, c, v, p in pending]
             for done, future in enumerate(as_completed(futures), start=1):
                 future.result()
                 print(f"  {spec['name']}: task {done}/{len(pending)} done at "
                       f"{time.strftime('%H:%M:%S')}", flush=True)
     elif pending:
         _init(spec)
-        for done, (f, h, c, p) in enumerate(pending, start=1):
-            _run_and_save(spec, f, h, c, p)
+        for done, (f, h, c, v, p) in enumerate(pending, start=1):
+            _run_and_save(spec, f, h, c, p, v)
             print(f"  {spec['name']}: task {done}/{len(pending)} done", flush=True)
-    rows, series, timings = [], {}, []
+    rows, series, timings, daily = [], {}, [], {}
     for path in paths:
         with open(path, "rb") as handle:
             task_rows, task_series = pickle.load(handle)
         timings.append(task_series.pop("__timing__"))
+        daily.update(task_series.pop("__daily__", {}))
         rows.extend(task_rows)
         series.update(task_series)
     frame = pd.DataFrame(rows)
     frame.to_parquet(out / "rows.parquet", index=False)
     np.savez_compressed(out / "series.npz", **series)
+    if spec.get("save_daily"):
+        _write_daily(out / "daily.npz", daily)
     manifest = {
         "spec": spec, "git_sha": git_sha, "n_rows": len(rows), "n_tasks": len(tasks),
         "resumed_tasks": len(tasks) - len(pending),
@@ -443,6 +659,10 @@ def run(spec_path: str, workers: int = 4) -> Path:
                    "realized": _hash(inputs["realized"].values),
                    "history": _hash(inputs["history"].values)},
     }
+    if inputs["market"].has("adv"):
+        manifest["inputs"]["adv"] = _hash(inputs["market"].get("adv"))
+    if data_hashes:
+        manifest["data"] = data_hashes
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
     print(f"{spec['name']}: {len(rows)} rows from {len(tasks)} tasks in "
           f"{manifest['wall_seconds_this_session']:.0f}s -> {out}")
