@@ -809,3 +809,56 @@ def test_a_sweep_reports_the_transfer_coefficient_each_run_would():
     every = [r.transfer_coefficient for r in alone
              if r.config.rebalance == "every_decision"]
     assert max(daily) < min(every)
+
+
+# ── the mean-variance solver ────────────────────────────────────────────────
+
+def test_an_unset_solver_leaves_every_label_and_row_unchanged():
+    assert "mv_solver" not in DEFAULT_BACKTEST.label
+    setup = world()
+    assert "mv_solver" not in run_backtest(**setup, config=DEFAULT_BACKTEST).as_dict()
+    converged = DEFAULT_BACKTEST.replace(mv_solver="restart")
+    assert converged.label == DEFAULT_BACKTEST.label + "|mv_solver=restart"
+    assert run_backtest(**setup, config=converged).as_dict()["mv_solver"] == "restart"
+
+
+def test_the_solver_setting_is_validated():
+    with pytest.raises(ValueError, match="mv_solver"):
+        BacktestConfig(mv_solver="newton")
+
+
+def test_the_converged_book_does_not_depend_on_the_iteration_budget():
+    """Under ``restart`` max_iter only floors a safety cap; under FISTA it is the answer."""
+    setup = world()
+
+    def run(**changes):
+        return run_backtest(**setup, config=DEFAULT_BACKTEST.replace(**changes))
+
+    assert run(max_iter=1).mean_turnover != pytest.approx(run(max_iter=400).mean_turnover)
+    low, high = run(mv_solver="restart", max_iter=1), run(mv_solver="restart", max_iter=400)
+    assert {**low.as_dict(), "max_iter": 0} == {**high.as_dict(), "max_iter": 0}
+    tight = run(max_iter=100000)
+    assert low.sharpe_net == pytest.approx(tight.sharpe_net, rel=1e-6)
+    assert low.mean_turnover == pytest.approx(tight.mean_turnover, rel=1e-6)
+
+
+def test_the_solver_is_read_only_by_the_mean_variance_allocator():
+    setup = world()
+    for weighting in ("signal", "min_var_qp"):
+        config = DEFAULT_BACKTEST.replace(weighting=weighting)
+        plain = run_backtest(**setup, config=config).as_dict()
+        restart = run_backtest(**setup, config=config.replace(mv_solver="restart")).as_dict()
+        assert restart.pop("mv_solver") == "restart"
+        assert restart == plain
+
+
+def test_a_sweep_keeps_the_two_solvers_books_apart():
+    setup = world()
+    configs = [DEFAULT_BACKTEST.replace(max_iter=5, mv_solver=solver, efq=efq)
+               for solver in (None, "restart") for efq in (0.0, 1.0)]
+    swept = sweep_configs(setup["forecast"], setup["realized"], configs,
+                          half_spread=setup["half_spread"], history=setup["history"],
+                          days=setup["days"])
+    alone = [run_backtest(**setup, config=config) for config in configs]
+    assert [r.as_dict() for r in swept] == [r.as_dict() for r in alone]
+    assert swept[1].mean_turnover != pytest.approx(swept[3].mean_turnover)

@@ -22,6 +22,7 @@ export STABLE_FINANCE_CACHE=/path/with/space      # downloads and caches live he
 | 4. Learned policy | `python -m experiments.policy` | `results/policy/policy.json` |
 | 5. Stage costs | `python -m experiments.bench` (on an idle machine) | `results/bench/bench.json` |
 | 6. Figures | `python -m experiments.figures` | `results/figures/*-{light,dark}.png` |
+| 7. Solver convergence | `python -m experiments.mv_solver --efq 0.7 1.0 0.0 --variants 200` | `results/mv_solver/summary.json`, `per_decision.npz`: the mean-variance book under the default 400-iteration FISTA and solved to convergence (`mv_solver="restart"`), with iterations, optimality residuals, distance from a verified exact optimum, seconds and the change in scores |
 
 Run each with `uv run --extra experiments python -m ...`. `month_cache` streams the
 Hugging Face day store one day at a time and deletes each unpacked day after

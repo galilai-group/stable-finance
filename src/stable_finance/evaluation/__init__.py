@@ -174,6 +174,8 @@ from stable_finance.evaluation.scoring import (
     transfer_coefficient,
 )
 from stable_finance.evaluation.trades import (
+    REBALANCE_SOLVERS,
+    RESTART_MAX_ITER,
     MeanVarianceAllocator,
     ParametricPolicy,
     allocate,
@@ -230,6 +232,8 @@ __all__ = [
     "ProbeData",
     "HOLDING_RULES",
     "REBALANCE_RULES",
+    "REBALANCE_SOLVERS",
+    "RESTART_MAX_ITER",
     "RISK_MODELS",
     "RISK_MODEL_REQUIRES",
     "RidgeProbe",

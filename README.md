@@ -149,6 +149,16 @@ decisions are solved in order and each starts from the previous solution. The
 problem is convex and solved by accelerated proximal gradient descent, whose
 proximal step is the trade rule itself.
 
+By default that solver is FISTA with a fixed iteration budget (`max_iter`),
+which on a real month of some 650 names runs out at every decision: the book is
+where the iterations stopped, not the optimum. `solver="restart"` (on
+`rebalance`, `allocate` and `MeanVarianceAllocator`; `mv_solver="restart"` in
+`BacktestConfig`) solves to the step tolerance instead, with the adaptive
+restart of O'Donoghue and Candes (2015) in a metric scaled by each name's
+variance, and warns (`ConvergenceWarning`) if it ever reaches its cap of at
+least `RESTART_MAX_ITER` iterations. `return_n_iter=True` returns each
+decision's iteration count beside the weights.
+
 ```python
 from stable_finance import (
     MeanVarianceAllocator, allocate, estimate_covariance, mean_variance_target, rebalance,
@@ -362,13 +372,14 @@ option.
 of options and pins any field given one value, so a setting outside the
 default space is swept the same way, as in
 `enumerate_configs(neutralize=(None, "beta"), rebalance=("every_decision", "horizon"))`.
-Two such settings are unset by default, so the default space and every label
-in it are unchanged:
+Settings of this kind are unset by default, so the default space and every
+label in it are unchanged:
 
 | Setting | Options |
 |---|---|
 | `alpha` | `"grinold"` or `"grinold_rank"`, with `alpha_ic` — rescale the forecast to `alpha_ic * sigma * z` before construction, `z` the cross-sectional z-score or, for `grinold_rank`, the Gaussian rank score |
 | `neutralize` | `"beta"`, `"industry"`, `"beta_industry"` — residualise the forecast on those exposures before construction |
+| `mv_solver` | `"restart"` — solve the mean-variance rebalance to convergence rather than within the `max_iter` budget (a numerical setting; only `weighting="mean_variance"` reads it) |
 
 ### Signal transforms
 

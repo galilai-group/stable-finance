@@ -45,6 +45,7 @@ from stable_finance.evaluation.portfolio.signals import (
     NEUTRALIZATIONS,
     SIGNAL_REQUIRES,
 )
+from stable_finance.evaluation.trades.rebalance import REBALANCE_SOLVERS
 
 __all__ = [
     "ANNUALIZATIONS",
@@ -122,7 +123,7 @@ AXIS_REQUIRES: dict[str, dict[str, tuple[str, ...]]] = {
 #: Settings that are ``None`` unless a model needs them, and that labels and
 #: result rows leave out while unset.
 OPTIONAL_SETTINGS = ("equity", "execution_days", "impact", "alpha", "alpha_ic",
-                     "neutralize")
+                     "neutralize", "mv_solver")
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,16 @@ class BacktestConfig:
     #: the risk history), ``"industry"`` (needs an ``industry`` market
     #: quantity) or ``"beta_industry"``. ``None`` leaves it as forecast.
     neutralize: str | None = None
+    #: How the cost-aware allocator's rebalance is solved, a NUMERICAL setting
+    #: like ``max_iter`` and read only by ``weighting='mean_variance'``.
+    #: ``None`` is FISTA within the ``max_iter`` budget, which every earlier
+    #: result used and which on a real month spends the whole budget at every
+    #: decision. ``"restart"`` is accelerated proximal gradient with adaptive
+    #: restart, run until the step falls below the solver's tolerance under a
+    #: cap of at least :data:`~stable_finance.evaluation.trades.rebalance.RESTART_MAX_ITER`
+    #: iterations: the converged book, so that a result about the allocator is
+    #: not a result about where its solver was stopped.
+    mv_solver: str | None = None
 
     def __post_init__(self) -> None:
         for field, allowed in (
@@ -239,6 +250,9 @@ class BacktestConfig:
                              "coefficient to scale the forecast by")
         if self.neutralize is not None and self.neutralize not in NEUTRALIZATIONS:
             raise ValueError(f"neutralize={self.neutralize!r} is not one of {NEUTRALIZATIONS}")
+        if self.mv_solver is not None and self.mv_solver not in REBALANCE_SOLVERS:
+            raise ValueError(f"mv_solver={self.mv_solver!r} is not None or one of "
+                             f"{REBALANCE_SOLVERS}")
         if self.rebalance == "horizon" and self.holding == "drift":
             raise ValueError("rebalance='horizon' books each held book's forward return once; "
                              "holding='drift' already carries positions step by step on "

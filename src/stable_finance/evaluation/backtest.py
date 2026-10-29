@@ -85,13 +85,13 @@ __all__ = ["LEVELS", "BacktestReport", "run_backtest", "sweep_configs"]
 #: remaining axes -- which act only on an existing book -- are evaluated on top.
 _BOOK_AXES = ("universe", "selection", "weighting", "risk_model", "cost_model",
               "efq", "gross_exposure", "shrinkage", "max_iter", "equity", "impact",
-              "alpha", "alpha_ic", "neutralize")
+              "alpha", "alpha_ic", "neutralize", "mv_solver")
 
 
 #: The book axes only the cost-aware allocator reads. A path-independent rule
 #: sizes a book from the forecast and the risk model alone, so configurations
 #: differing only in what trading costs hold the same book and share it.
-_COST_AXES = ("cost_model", "efq", "equity", "impact", "max_iter")
+_COST_AXES = ("cost_model", "efq", "equity", "impact", "max_iter", "mv_solver")
 
 
 def _book_key(config: BacktestConfig) -> tuple:
@@ -360,7 +360,7 @@ def _book(context: dict, config: BacktestConfig, sigma: NDArray[np.float64]
     return rebalance(
         target, sigma[None], risk_aversion=risk_aversion,
         cost=np.where(screened, np.nan_to_num(cost, nan=0.0), np.inf),
-        max_iter=config.max_iter,
+        max_iter=config.max_iter, solver=config.mv_solver,
     ).values[:, :, 0], mu
 
 
