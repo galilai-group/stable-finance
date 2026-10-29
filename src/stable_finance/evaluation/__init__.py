@@ -140,6 +140,7 @@ from stable_finance.evaluation.returns import (
     ProbeData,
     RidgeProbe,
     StreamingRidge,
+    copula_forecast,
     fit,
     oracle_forecast,
 )
@@ -247,6 +248,7 @@ __all__ = [
     "bar_half_spread",
     "breakeven_efq",
     "check_config",
+    "copula_forecast",
     "cross_spread_sharpe",
     "deflated_sharpe",
     "deflated_sharpe_from_trials",

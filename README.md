@@ -261,6 +261,25 @@ shrunk towards the cross-sectional mean by `scale`, which defaults to `|ic|`
 dispersion, which a cost-aware allocator or `edge_to_cost` reads as an edge
 `1 / IC` times too large; `scale=1.0` gives it anyway.
 
+`ic` may be one value per horizon, as a real forecast decays with the
+horizon. `persistence=k` replays the same draws for `k` consecutive
+decisions (restarting each day when `days` is given), so the same rank
+positions stay wrong while the truth underneath them moves; each decision's
+IC keeps its distribution, and only the dependence across decisions changes.
+
+`copula_forecast` is a different model rather than a fourth mode: each name
+carries its own error, an AR(1) series across decisions with half-life
+`half_life` (restarting each day), mixed with the normal score of its
+realized rank through a Gaussian copula. Errors belong to a name rather than
+to a rank position, which is how a slow real signal is wrong, and the IC is
+hit in expectation with the same `1 / sqrt(n - 1)` scatter as `random`.
+
+```python
+from stable_finance import copula_forecast
+
+forecast = copula_forecast(realized, [0.03, 0.02, 0.01], half_life=12, days=days, seed=0)
+```
+
 ## The harness is a configuration, not a constant
 
 A Sharpe ratio is not a property of a forecast. It is a property of a forecast
