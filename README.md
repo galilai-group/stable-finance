@@ -26,6 +26,50 @@ runs the downstream adapters and metrics you ask for.
 
 ## Where things live
 
+Multi-horizon additions reuse the existing constructors:
+`combine_horizon_targets` combines their `(decision, asset, horizon)` targets
+into one current net book with fixed capital fractions. An optional
+`construct_joint_portfolio` exposes experimental cross-interval-risk planning.
+Neither trains a forecast model or changes the existing cost/execution path.
+See [the additive multi-horizon guide](docs/multi_horizon_extension.md) and
+`examples/multi_horizon.py` for a minimal native-pipeline example.
+
+`portfolio_exposure_report` checks the supplied final weight book for beta,
+industry exposure, concentration and declared constraint violations. It
+works on single-horizon, per-horizon and combined current targets without
+changing their weights. See [the exposure-report guide](docs/portfolio_exposure_report.md)
+and `examples/portfolio_exposure.py`.
+
+`solve_constrained_rebalance` tracks a supplied net target from current actual
+and pending holdings, with explicit beta, gross, net and name limits. Missing
+trading costs or untradable quotes freeze committed positions, and infeasibility
+is reported explicitly. `execution_attribution` and `paired_execution_attribution`
+allocate realized costs, P&L, turnover and beta changes by stock. See
+[the constrained-tracking guide](docs/constrained_trade_tracking.md) for
+actual-state accounting and the policy's capital-use limitations.
+
+`solve_return_risk_rebalance` retains the supplied original forecast reward
+and full interval-major covariance through the trades stage. It jointly
+reoptimizes all reference intervals, charges only the current net order and
+emits only the current book. `K=1` is the original single-horizon objective.
+See [the preserved-return-objective guide](docs/preserved_return_objectives.md)
+for the original objective handoff and its distinction from target tracking.
+
+To run that objective natively, call `run_backtest(forecast_panel, price_marks,
+objective=ReturnRiskBacktestSpec(...), execution_state=BacktestExecutionState(...))`.
+This explicit path carries original single/joint forecasts, causal risk,
+constraints and actual/pending physical execution state together. Omitting
+`objective` preserves the existing backtest behavior. See
+[the native integration guide](docs/native_return_risk_backtest.md) and the
+self-contained `examples/native_return_risk_backtest.py`.
+
+`FactorExposureConstraints` supplies named linear exposure budgets to the
+constrained single/joint portfolio path, trade solvers and native backtest.
+The same contract also reports target or actual factor exposures. Existing
+beta limits remain supported; supplied generic limits intersect them. See
+[the generic-factor guide](docs/generic_factor_constraints.md) and
+`examples/generic_factor_constraints.py` for a deterministic end-to-end example.
+
 ```text
 src/stable_finance/
   evaluation/              the pipeline, one package per stage
@@ -855,6 +899,9 @@ Use `uv` exclusively:
 uv sync
 uv run pytest
 ```
+
+The constrained joint/trade examples and their tests require the numerical
+extra: run `uv sync --extra joint` before `uv run pytest` for the full suite.
 
 ## Migration plan
 

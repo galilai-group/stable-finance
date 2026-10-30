@@ -39,7 +39,7 @@ most of the space shares work.
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -162,6 +162,7 @@ class BacktestReport:
     #: and four thousand embedded arrays would turn a 3 MB result file into a
     #: gigabyte one.
     series: PnLSeries | None = None
+    objective_trace: object | None = None
 
     def as_dict(self) -> dict:
         """A flat, JSON-serializable row: config axes beside the scores.
@@ -169,11 +170,15 @@ class BacktestReport:
         ``equity`` is left out when unset, as in the config's label, so rows
         written before it existed keep the same columns.
         """
-        row = {k: v for k, v in asdict(self).items()
-               if k not in ("config", "series")}
+        row = {field.name: getattr(self, field.name) for field in fields(self)
+               if field.name not in ("config", "series", "objective_trace")}
         config = {k: v for k, v in asdict(self.config).items()
                   if not (k in OPTIONAL_SETTINGS and v is None)}
-        return {**config, **row}
+        result = {**config, **row}
+        metadata = getattr(self.objective_trace, "report_metadata", None)
+        if isinstance(metadata, dict):
+            result.update(metadata)
+        return result
 
 
 # ── shared setup ────────────────────────────────────────────────────────────
@@ -691,6 +696,8 @@ def run_backtest(
     probe: RidgeProbe | None = None,
     efq: ArrayLike | None = None,
     unfilled: str = "retry",
+    objective=None,
+    execution_state=None,
 ) -> BacktestReport:
     """Score one input, at any level, under one harness configuration.
 
@@ -740,6 +747,20 @@ def run_backtest(
     ``realized`` must then hold each name's return from each decision to the
     next. It is supported for the ``mid`` and ``cross`` cost models.
     """
+    if objective is not None or execution_state is not None:
+        if efq is not None or unfilled != "retry":
+            raise ValueError("the explicit physical objective uses its execution configuration; "
+                             "per-name efq and order retry overrides are not supported")
+        if any(value is not None for value in (history, embeddings, train, probe)):
+            raise ValueError("the explicit objective path consumes supplied forecasts and risk; "
+                             "do not also pass history, embeddings, train or probe")
+        from stable_finance.evaluation.return_risk_backtest import run_return_risk_backtest
+
+        return run_return_risk_backtest(
+            forecast, realized, objective=objective, execution_state=execution_state,
+            market=market, half_spread=half_spread, config=config, days=days,
+            with_series=with_series, horizon_index=horizon_index,
+        )
     source = forecast
     if isinstance(source, Embeddings):
         embeddings = source if embeddings is None else embeddings

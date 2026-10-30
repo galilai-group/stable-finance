@@ -12,7 +12,23 @@ from stable_finance.evaluation.trades.rules import (
     threshold_selection,
 )
 
+from stable_finance.evaluation.trades.constrained import (
+    RebalanceConstraints,
+    ConstrainedRebalanceResult,
+    solve_constrained_rebalance,
+)
+
+from stable_finance.evaluation.trades.objective import (
+    ReturnRiskTradeResult,
+    solve_return_risk_rebalance,
+)
+
 __all__ = [
+    "RebalanceConstraints",
+    "ConstrainedRebalanceResult",
+    "solve_constrained_rebalance",
+    "ReturnRiskTradeResult",
+    "solve_return_risk_rebalance",
     "MeanVarianceAllocator",
     "ParametricPolicy",
     "allocate",

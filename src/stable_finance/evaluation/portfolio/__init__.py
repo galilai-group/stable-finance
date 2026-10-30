@@ -39,7 +39,55 @@ from stable_finance.evaluation.portfolio.signals import (
     refine_alpha,
 )
 
+from stable_finance.evaluation.portfolio.multihorizon import (
+    combine_horizon_targets,
+)
+
+from stable_finance.evaluation.portfolio.exposure import (
+    PortfolioExposureLimits,
+    PortfolioExposureReport,
+    portfolio_exposure_report,
+)
+
+from stable_finance.evaluation.portfolio.factors import (
+    FactorExposureConstraints,
+    ResolvedFactorConstraints,
+    FactorExposureReport,
+    factor_exposure_report,
+)
+
+from stable_finance.evaluation.portfolio.joint_constraints import (
+    JointPortfolioConstraints,
+)
+
+from stable_finance.evaluation.portfolio.joint import (
+    JointPortfolioConfig,
+    JointPortfolioResult,
+    construct_joint_portfolio,
+)
+
+from stable_finance.evaluation.portfolio.joint_risk import (
+    JointReturnPanel,
+    JointRiskModel,
+    estimate_joint_risk,
+)
+
 __all__ = [
+    "combine_horizon_targets",
+    "PortfolioExposureLimits",
+    "PortfolioExposureReport",
+    "portfolio_exposure_report",
+    "FactorExposureConstraints",
+    "ResolvedFactorConstraints",
+    "FactorExposureReport",
+    "factor_exposure_report",
+    "JointPortfolioConstraints",
+    "JointPortfolioConfig",
+    "JointPortfolioResult",
+    "construct_joint_portfolio",
+    "JointReturnPanel",
+    "JointRiskModel",
+    "estimate_joint_risk",
     "ALPHA_RULES",
     "NEUTRALIZATIONS",
     "PortfolioWeights",

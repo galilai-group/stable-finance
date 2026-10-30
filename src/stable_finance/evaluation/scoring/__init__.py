@@ -38,7 +38,14 @@ from stable_finance.evaluation.scoring.tc import (
     transfer_coefficient,
 )
 
+from stable_finance.evaluation.scoring.holdings_attribution import (
+    execution_attribution,
+    paired_execution_attribution,
+)
+
 __all__ = [
+    "execution_attribution",
+    "paired_execution_attribution",
     "BacktestResult",
     "ExecutionQualityCurve",
     "InformationCoefficient",

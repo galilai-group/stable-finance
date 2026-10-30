@@ -25,6 +25,12 @@ hf = [
     "huggingface-hub>=0.30",
 ]
 
+# Optional constrained joint planning and actual-state trading backend.
+joint = [
+    "osqp>=1.0,<2",
+    "scipy>=1.14.1",
+]
+
 [project.scripts]
 # The data-preparation CLIs, in pipeline order. Each reads its default paths
 # from the environment (RAW_DATA_DIR, METADATA_PATH, MOSAIC_DIR, HOLIDAY_CSV,

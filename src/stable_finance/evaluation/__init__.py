@@ -184,7 +184,98 @@ from stable_finance.evaluation.trades import (
     to_weights,
 )
 
+from stable_finance.evaluation.portfolio.multihorizon import (
+    combine_horizon_targets,
+)
+
+from stable_finance.evaluation.portfolio.exposure import (
+    PortfolioExposureLimits,
+    PortfolioExposureReport,
+    portfolio_exposure_report,
+)
+
+from stable_finance.evaluation.portfolio.factors import (
+    FactorExposureConstraints,
+    ResolvedFactorConstraints,
+    FactorExposureReport,
+    factor_exposure_report,
+)
+
+from stable_finance.evaluation.portfolio.joint_constraints import (
+    JointPortfolioConstraints,
+)
+
+from stable_finance.evaluation.portfolio.joint import (
+    JointPortfolioConfig,
+    JointPortfolioResult,
+    construct_joint_portfolio,
+)
+
+from stable_finance.evaluation.portfolio.joint_risk import (
+    JointReturnPanel,
+    JointRiskModel,
+    estimate_joint_risk,
+)
+
+from stable_finance.evaluation.trades.constrained import (
+    RebalanceConstraints,
+    ConstrainedRebalanceResult,
+    solve_constrained_rebalance,
+)
+
+from stable_finance.evaluation.trades.objective import (
+    ReturnRiskTradeResult,
+    solve_return_risk_rebalance,
+)
+
+from stable_finance.evaluation.scoring.holdings_attribution import (
+    execution_attribution,
+    paired_execution_attribution,
+)
+
+from stable_finance.evaluation.physical import (
+    PhysicalExecutionConfig,
+    PhysicalExecutionReport,
+    PricePanel,
+    execute_portfolio_targets,
+)
+
+from stable_finance.evaluation.return_risk_backtest import (
+    BacktestExecutionState,
+    ReturnRiskBacktestSpec,
+    ReturnRiskTrace,
+)
+
 __all__ = [
+    "combine_horizon_targets",
+    "PortfolioExposureLimits",
+    "PortfolioExposureReport",
+    "portfolio_exposure_report",
+    "FactorExposureConstraints",
+    "ResolvedFactorConstraints",
+    "FactorExposureReport",
+    "factor_exposure_report",
+    "JointPortfolioConstraints",
+    "JointPortfolioConfig",
+    "JointPortfolioResult",
+    "construct_joint_portfolio",
+    "JointReturnPanel",
+    "JointRiskModel",
+    "estimate_joint_risk",
+    "RebalanceConstraints",
+    "ConstrainedRebalanceResult",
+    "solve_constrained_rebalance",
+    "ReturnRiskTradeResult",
+    "solve_return_risk_rebalance",
+    "execution_attribution",
+    "paired_execution_attribution",
+    "PhysicalExecutionConfig",
+    "PhysicalExecutionReport",
+    "PricePanel",
+    "execute_portfolio_targets",
+    "BacktestExecutionState",
+    "ReturnRiskBacktestSpec",
+    "ReturnRiskTrace",
     "ADV",
     "ALLOCATORS",
     "ALPHA_RULES",
