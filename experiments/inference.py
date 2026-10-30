@@ -738,18 +738,41 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
     losses = pd.DataFrame(-pnl, columns=ids)
 
     # Model Confidence Set: the configurations indistinguishable from the best.
-    method = "R" if len(ids) <= MCS_R_LIMIT else "max"
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        mcs = MCS(losses, size=MCS_SIZE, reps=reps, block_size=block_sb, method=method,
-                  bootstrap="stationary", seed=seed)
-        mcs.compute()
-    pvalues = mcs.pvalues["Pvalue"]
-    for r in ids:
-        per_row[r]["mcs_pvalue"] = float(pvalues.loc[r])
-        per_row[r]["in_mcs"] = bool(pvalues.loc[r] > MCS_SIZE)
-    summary["mcs"] = {"size": MCS_SIZE, "method": method,
-                      "included": [r for r in ids if per_row[r]["in_mcs"]]}
+    # Configurations with the same daily P&L (a setting that changed nothing)
+    # are one model to it, since its pairwise statistic divides by their
+    # zero-variance difference; each duplicate takes its representative's
+    # p-value. A group the statistic still cannot handle falls back to the
+    # max statistic, and failing that is reported as skipped.
+    _, first, inverse = np.unique(pnl, axis=1, return_index=True, return_inverse=True)
+    distinct = [ids[i] for i in first]
+    method = "R" if len(distinct) <= MCS_R_LIMIT else "max"
+    pvalues = None
+    if len(distinct) >= 2:
+        for attempt in dict.fromkeys((method, "max")):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    mcs = MCS(losses[distinct], size=MCS_SIZE, reps=reps, block_size=block_sb,
+                              method=attempt, bootstrap="stationary", seed=seed)
+                    mcs.compute()
+                pvalues, method = mcs.pvalues["Pvalue"], attempt
+                break
+            except (IndexError, ValueError, np.linalg.LinAlgError) as error:
+                summary.setdefault("mcs_errors", []).append(f"{attempt}: {error}")
+    if len(distinct) < 2:
+        summary["mcs"] = {"size": MCS_SIZE, "skipped": "every configuration has the same P&L",
+                          "included": list(ids)}
+        for r in ids:
+            per_row[r]["mcs_pvalue"], per_row[r]["in_mcs"] = 1.0, True
+    elif pvalues is None:
+        summary["mcs"] = {"size": MCS_SIZE, "skipped": "the MCS statistic failed on this group"}
+    else:
+        for j, r in enumerate(ids):
+            value = float(pvalues.loc[distinct[int(np.ravel(inverse)[j])]])
+            per_row[r]["mcs_pvalue"] = value
+            per_row[r]["in_mcs"] = bool(value > MCS_SIZE)
+        summary["mcs"] = {"size": MCS_SIZE, "method": method, "distinct_models": len(distinct),
+                          "included": [r for r in ids if per_row[r]["in_mcs"]]}
 
     # SPA / StepM / Sharpe differences against the benchmark.
     hits = np.flatnonzero(match_rows(group.set_index("row_id").loc[ids].reset_index(), benchmark))
