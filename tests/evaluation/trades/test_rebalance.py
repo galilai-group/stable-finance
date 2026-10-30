@@ -8,6 +8,8 @@ from stable_finance import (
     MeanVarianceAllocator,
     allocate,
     estimate_covariance,
+    mean_variance_target,
+    rebalance,
 )
 
 
@@ -155,3 +157,63 @@ def test_without_costs_the_rebalance_lands_on_the_target():
     np.testing.assert_allclose(held, target.values, rtol=1e-7, atol=1e-10)
     np.testing.assert_allclose(
         target.values[:, :, 0], np.linalg.solve(sigma[0], forecast.values[:, :, 0].T).T / 2.0)
+
+
+# Per-decision risk aversion in the cost-aware rebalance.
+def problem(seed=0, n_decisions=6, n_assets=4):
+    rng = np.random.default_rng(seed)
+    factors = rng.normal(size=(n_assets, 2))
+    sigma = factors @ factors.T * 1e-4 + np.diag(rng.uniform(1e-4, 3e-4, n_assets))
+    forecast = ForwardReturns(rng.normal(0, 1e-3, (n_decisions, n_assets, 1)),
+                              np.arange(n_decisions), [f"A{i}" for i in range(n_assets)],
+                              [300])
+    cost = 1e-4 * (1 + rng.random((n_decisions, n_assets)))
+    return forecast, sigma[None], cost
+
+
+def test_a_constant_array_reproduces_the_scalar_path_exactly():
+    forecast, sigma, cost = problem()
+    for solve in (allocate, lambda f, s, **k: rebalance(
+            mean_variance_target(f, s, risk_aversion=k["risk_aversion"]), s, **k)):
+        scalar = solve(forecast, sigma, risk_aversion=3.0, cost=cost).values
+        array = solve(forecast, sigma, risk_aversion=np.full(6, 3.0), cost=cost).values
+        np.testing.assert_array_equal(array, scalar)
+
+
+def test_without_cost_the_path_is_the_per_decision_closed_form():
+    forecast, sigma, _ = problem(seed=1)
+    aversion = np.array([0.5, 1.0, 2.0, 4.0, 8.0, 16.0])
+    target = mean_variance_target(forecast, sigma, risk_aversion=aversion)
+    # The target moves by up to 2x between decisions here, so tighten the
+    # solver's step-size stopping rule to measure the answer, not the stop.
+    solver = {"max_iter": 20000, "tol": 1e-13}
+    held = rebalance(target, sigma, risk_aversion=aversion, **solver).values[:, :, 0]
+    closed = np.linalg.solve(sigma[0], forecast.values[:, :, 0].T).T / aversion[:, None]
+    np.testing.assert_allclose(held, closed, rtol=1e-7, atol=1e-10)
+    direct = allocate(forecast, sigma, risk_aversion=aversion, **solver).values[:, :, 0]
+    np.testing.assert_allclose(direct, closed, rtol=1e-7, atol=1e-10)
+
+
+def test_the_two_step_and_one_shot_solves_agree_under_per_decision_risk_aversion():
+    forecast, sigma, cost = problem(seed=2)
+    aversion = np.linspace(1.0, 6.0, 6)
+    one_shot = allocate(forecast, sigma, risk_aversion=aversion, cost=cost).values
+    target = mean_variance_target(forecast, sigma, risk_aversion=aversion)
+    two_step = rebalance(target, sigma, risk_aversion=aversion, cost=cost).values
+    np.testing.assert_allclose(two_step, one_shot, rtol=1e-9, atol=1e-12)
+
+
+@pytest.mark.parametrize("bad, message", [
+    (np.ones(5), "one value per decision"),
+    (np.ones((6, 1)), "one value per decision"),
+    (np.array([1.0, 1.0, -2.0, 1.0, 1.0, 1.0]), "positive"),
+    (0.0, "positive"),
+    (np.array([1.0, np.inf, 1.0, 1.0, 1.0, 1.0]), "finite"),
+])
+def test_rebalance_and_allocate_reject_a_malformed_risk_aversion(bad, message):
+    forecast, sigma, _ = problem()
+    target = mean_variance_target(forecast, sigma)
+    with pytest.raises(ValueError, match=message):
+        rebalance(target, sigma, risk_aversion=bad)
+    with pytest.raises(ValueError, match=message):
+        allocate(forecast, sigma, risk_aversion=bad)

@@ -5,6 +5,7 @@ from stable_finance.evaluation.returns.contract import (
 )
 from stable_finance.evaluation.returns.oracle import (
     NOISE_MODES,
+    copula_forecast,
     oracle_forecast,
 )
 from stable_finance.evaluation.returns.probes import (
@@ -22,6 +23,7 @@ __all__ = [
     "ProbeData",
     "RidgeProbe",
     "StreamingRidge",
+    "copula_forecast",
     "fit",
     "oracle_forecast",
 ]
