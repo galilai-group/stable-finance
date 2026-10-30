@@ -1,4 +1,4 @@
-"""Stage 3, forward returns to the target portfolio, with no trading costs: risk management (the universe screens and the risk model) and construction (selection and weighting, or the mean-variance target)."""
+"""Stage 3, forward returns to the target portfolio, with no trading costs: risk management (the universe screens and the risk model), signal transforms (alpha refinement and neutralization), and construction (selection and weighting, or the mean-variance target)."""
 
 from stable_finance.evaluation.portfolio.construction import (
     SELECTION_REQUIRES,
@@ -25,26 +25,48 @@ from stable_finance.evaluation.portfolio.risk import (
     estimate_risk,
     ledoit_wolf_covariance,
     liquidity_screen,
+    nonlinear_shrinkage_covariance,
+)
+from stable_finance.evaluation.portfolio.signals import (
+    ALPHA_RULES,
+    NEUTRALIZATIONS,
+    SIGNAL_REQUIRES,
+    alpha_from_rule,
+    apply_signal,
+    estimate_beta,
+    industry_exposures,
+    neutralize,
+    refine_alpha,
 )
 
 __all__ = [
+    "ALPHA_RULES",
+    "NEUTRALIZATIONS",
     "PortfolioWeights",
     "RISK_MODELS",
     "RISK_MODEL_REQUIRES",
     "SELECTION_REQUIRES",
     "SELECTION_RULES",
+    "SIGNAL_REQUIRES",
     "UNIVERSE_REQUIRES",
     "UNIVERSE_SCREENS",
     "WEIGHTING_REQUIRES",
     "WEIGHTING_RULES",
+    "alpha_from_rule",
     "apply_screen",
+    "apply_signal",
     "diagonal_covariance",
     "embedding_covariance",
+    "estimate_beta",
     "estimate_covariance",
     "estimate_risk",
+    "industry_exposures",
     "ledoit_wolf_covariance",
     "liquidity_screen",
     "mean_variance_target",
+    "neutralize",
+    "nonlinear_shrinkage_covariance",
+    "refine_alpha",
     "select_book",
     "tail_selection",
     "weight_book",
