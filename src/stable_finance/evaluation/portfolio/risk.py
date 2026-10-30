@@ -41,8 +41,10 @@ __all__ = [
     "diagonal_covariance",
     "embedding_covariance",
     "estimate_risk",
+    "factor_covariance",
     "ledoit_wolf_covariance",
     "liquidity_screen",
+    "nonlinear_shrinkage_covariance",
 ]
 
 
@@ -134,6 +136,237 @@ def ledoit_wolf_covariance(
     return out
 
 
+_SQRT5 = np.sqrt(5.0)
+
+
+def _analytical_shrinkage(
+    centered: NDArray[np.float64], n_effective: int
+) -> NDArray[np.float64]:
+    """Ledoit and Wolf's (2020) closed form on an already centred panel.
+
+    A line-by-line port of the authors' ``analytical_shrinkage.m``: the
+    sample spectrum is smoothed with an Epanechnikov kernel whose bandwidth
+    is proportional to each eigenvalue (``h = n^(-1/3)``), and each eigenvalue
+    is replaced by the oracle value that the kernel estimates of the spectral
+    density and its Hilbert transform imply (their equations 4.3 and C.4-C.8).
+    Eigenvectors are the sample's, untouched.
+    """
+    p = centered.shape[1]
+    n = n_effective
+    sample = centered.T @ centered / n
+    eigenvalues, eigenvectors = np.linalg.eigh((sample + sample.T) / 2)
+    order = np.argsort(eigenvalues, kind="stable")
+    eigenvalues, eigenvectors = eigenvalues[order], eigenvectors[:, order]
+    # Only the top min(p, n) eigenvalues are informative; when p > n the rest
+    # are structurally zero and get their own closed form below. A relative
+    # floor keeps the kernel bandwidths positive where rounding (or the
+    # zero-filled panel) leaves an informative eigenvalue at or below zero.
+    lam = eigenvalues[max(0, p - n):]
+    largest = float(lam.max())
+    if largest <= 0:
+        raise ValueError("returns have no variance")
+    lam = np.maximum(lam, 1e-12 * largest)
+
+    h = n ** (-1.0 / 3.0)
+    bandwidth = h * lam[np.newaxis, :]  # H[i, j] = h * lambda_j
+    x = (lam[:, np.newaxis] - lam[np.newaxis, :]) / bandwidth
+    density = (3 / 4 / _SQRT5) * np.mean(
+        np.maximum(1 - x**2 / 5, 0.0) / bandwidth, axis=1
+    )
+    # The kernel's Hilbert transform has a log singularity at |x| = sqrt(5),
+    # where its (1 - x^2/5) factor vanishes; the reference code drops the log
+    # term there, which is what zeroing it does.
+    edge = np.isclose(np.abs(x), _SQRT5)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_term = np.log(np.abs((_SQRT5 - x) / (_SQRT5 + x)))
+    log_term = np.where(edge, 0.0, log_term)
+    hilbert = (-3 / 10 / np.pi) * x + (3 / 4 / _SQRT5 / np.pi) * (
+        1 - x**2 / 5
+    ) * log_term
+    hilbert = np.mean(hilbert / bandwidth, axis=1)
+
+    ratio = p / n
+    if p <= n:
+        shrunk = lam / (
+            (np.pi * ratio * lam * density) ** 2
+            + (1 - ratio - np.pi * ratio * lam * hilbert) ** 2
+        )
+    else:
+        hilbert_null = (
+            (1 / np.pi)
+            * (
+                3 / 10 / h**2
+                + 3 / 4 / _SQRT5 / h * (1 - 1 / 5 / h**2)
+                * np.log((1 + _SQRT5 * h) / (1 - _SQRT5 * h))
+            )
+            * np.mean(1 / lam)
+        )
+        null = 1 / (np.pi * (p - n) / n * hilbert_null)
+        informative = lam / (np.pi**2 * lam**2 * (density**2 + hilbert**2))
+        shrunk = np.concatenate([np.full(p - n, null), informative])
+    return (eigenvectors * shrunk) @ eigenvectors.T
+
+
+def nonlinear_shrinkage_covariance(
+    history: ForwardReturns, *, min_samples: int = 2
+) -> NDArray[np.float64]:
+    """Sample eigenvectors with each eigenvalue shrunk by its own amount.
+
+    Linear shrinkage (:func:`ledoit_wolf_covariance`) pulls every sample
+    eigenvalue toward the grand mean by ONE data-chosen intensity, which is
+    the best a single number can do but still too little for the extreme
+    eigenvalues and too much for the bulk. Nonlinear shrinkage keeps the
+    sample eigenvectors and replaces each eigenvalue by an estimate of the
+    variance the portfolio along that eigenvector will actually realize, so
+    the correction is largest exactly where estimation error is. Ledoit and
+    Wolf (2020), "Analytical nonlinear shrinkage of large-dimensional
+    covariance matrices", Annals of Statistics 48(5), give that estimate in
+    closed form -- a kernel estimate of the sample spectral density and its
+    Hilbert transform -- so it costs one eigendecomposition rather than the
+    numerical inversion of the earlier QuEST estimator, and it is defined
+    when there are more assets than decisions.
+
+    The panel is centred with each asset's own mean, so the effective sample
+    size is one less than the number of decisions, as in the authors' code
+    for demeaned data. The closed form needs at least 12 of them: below that
+    the kernel bandwidth ``n^(-1/3)`` is too wide for the null-eigenvalue
+    term to be defined.
+
+    MISSING OBSERVATIONS ARE ZERO-FILLED AFTER CENTERING, which biases a
+    sparsely observed asset's covariance toward zero. The presence screen in
+    :func:`stable_finance.dataset.universe.presence_screen` is what keeps that bias small; without one,
+    a name quoted on a handful of decisions would look riskless.
+    """
+    n_decisions, n_assets, n_horizons = history.values.shape
+    n_effective = n_decisions - 1
+    if n_effective < 12:
+        raise ValueError(
+            f"nonlinear shrinkage needs at least 13 decisions; got {n_decisions}"
+        )
+    out = np.empty((n_horizons, n_assets, n_assets), dtype=np.float64)
+    for horizon in range(n_horizons):
+        _, centered, _ = _observed_moments(
+            history.values[:, :, horizon], min_samples
+        )
+        out[horizon] = _project_psd(_analytical_shrinkage(centered, n_effective))
+    return out
+
+
+def _industry_dummies(industry: ArrayLike, n_assets: int) -> NDArray[np.float64]:
+    """``(n_assets, n_industries)`` membership of the industries with two or more names.
+
+    A one-name industry is left out, its name treated as unclassified: its
+    factor would be that name's own return, which explains it completely and
+    leaves it no specific risk -- a perfect fit that is pure overfitting.
+    """
+    codes = np.asarray(industry, dtype=np.float64)
+    if codes.shape != (n_assets,):
+        raise ValueError(
+            f"industry must be one code per asset, shape {(n_assets,)}; got {codes.shape}")
+    known = np.isfinite(codes)
+    industries = np.unique(codes[known])
+    dummies = (codes[:, None] == industries[None, :]).astype(np.float64)
+    return dummies[:, dummies.sum(axis=0) >= 2]
+
+
+def factor_covariance(
+    history: ForwardReturns,
+    *,
+    n_factors: int = 5,
+    industry: ArrayLike | None = None,
+    min_samples: int = 2,
+) -> NDArray[np.float64]:
+    """Industry and statistical factors, plus a diagonal of specific risk.
+
+    The shrinkage estimators repair a sample covariance's spectrum; a factor
+    model replaces its structure. Every name's return is a few common
+    factors' returns times its exposures plus a residual that is independent
+    across names, so the covariance is ``B F B' + D``: ``N k`` exposures and
+    ``N`` specific variances instead of ``N^2 / 2`` free entries. The
+    off-diagonal terms are then only what the factors explain, which is why a
+    factor model does not mistake idiosyncratic noise for correlation, and
+    why it is the risk model practitioners actually run.
+
+    THE FACTORS ARE STATISTICAL, because a return history carries no
+    fundamental exposures: the first ``n_factors`` principal components of the
+    history's returns at each horizon, which at intraday frequency are the
+    market and a handful of sector and style directions (Connor and
+    Korajczyk, 1986). ``industry`` optionally adds one dummy factor per
+    industry code (one finite code per asset; NaN is unclassified, and an
+    industry with a single name is left out, since its factor would be that
+    name). The industry factors are fitted first, as each decision's
+    industry-average return, and the principal components are taken of what
+    they leave, so the statistical factors describe the co-movement the
+    classification does not. An average over ``m`` members carries ``1/m`` of
+    their specific variance, so a small industry's internal correlations come
+    out high by about that much -- the usual price of a cross-sectional
+    industry factor.
+
+    The model is fitted to the CORRELATION matrix and rescaled by each name's
+    own volatility, so a few high-volatility names cannot claim the leading
+    components for themselves. Without industries the specific variance is
+    exactly what the factors leave of each name's variance, so every name's
+    variance is the one :func:`diagonal_covariance` gives it, and
+    ``n_factors=0`` without industries IS that diagonal model; the factors
+    only add covariances. Specific risk is the variance of the residual after
+    every factor, and the eigenvalues get the same relative floor as the other
+    estimators, so the result is positive definite even when the residual of
+    a name is numerically zero.
+
+    MISSING OBSERVATIONS ARE ZERO-FILLED AFTER CENTERING, as in the other
+    estimators, which biases a sparsely observed name's covariances toward
+    zero; the presence screen in
+    :func:`stable_finance.dataset.universe.presence_screen` keeps that small.
+    """
+    if (isinstance(n_factors, bool) or not isinstance(n_factors, (int, np.integer))
+            or n_factors < 0):
+        raise ValueError("n_factors must be a non-negative integer")
+    n_decisions, n_assets, n_horizons = history.values.shape
+    if n_factors >= n_assets:
+        raise ValueError(f"n_factors must be below the number of assets ({n_assets})")
+    if n_decisions < 2:
+        raise ValueError("a factor model needs at least two decisions")
+    dummies = None if industry is None else _industry_dummies(industry, n_assets)
+    out = np.empty((n_horizons, n_assets, n_assets), dtype=np.float64)
+    for horizon in range(n_horizons):
+        _, centered, counts = _observed_moments(
+            history.values[:, :, horizon], min_samples
+        )
+        squares = (centered * centered).sum(axis=0)
+        variance = squares / np.maximum(counts - 1, 1)
+        largest = float(variance.max())
+        if largest <= 0:
+            raise ValueError("returns have no variance")
+        variance = np.maximum(variance, 1e-8 * largest)
+        # Standardized so that z'z / (n - 1) is the zero-filled sample
+        # correlation, with an exact unit diagonal; a constant name stays zero.
+        scale = np.sqrt(squares / (n_decisions - 1))
+        residual = np.divide(centered, scale, out=np.zeros_like(centered),
+                             where=scale > 0)
+        exposures, factor_returns = [], []
+        if dummies is not None and dummies.shape[1] > 0:
+            averages = (residual @ dummies) / dummies.sum(axis=0)
+            residual = residual - averages @ dummies.T
+            exposures.append(dummies)
+            factor_returns.append(averages)
+        if n_factors > 0:
+            _, eigenvectors = np.linalg.eigh(residual.T @ residual)
+            loadings = eigenvectors[:, ::-1][:, :n_factors]
+            components = residual @ loadings
+            residual = residual - components @ loadings.T
+            exposures.append(loadings)
+            factor_returns.append(components)
+        specific = (residual * residual).sum(axis=0) / (n_decisions - 1)
+        correlation = np.diag(specific)
+        if exposures:
+            beta = np.hstack(exposures)
+            f = np.hstack(factor_returns)
+            correlation += beta @ (f.T @ f / (n_decisions - 1)) @ beta.T
+        sigma = np.sqrt(variance)
+        out[horizon] = _project_psd(correlation * np.outer(sigma, sigma))
+    return out
+
+
 def embedding_covariance(
     history: ForwardReturns,
     embeddings: Embeddings,
@@ -197,8 +430,15 @@ def estimate_risk(
     embeddings: Embeddings | None = None,
     shrinkage: float = 0.3,
     min_samples: int = 2,
+    n_factors: int = 5,
+    industry: ArrayLike | None = None,
 ) -> NDArray[np.float64]:
-    """Dispatch to one named risk model; see :data:`RISK_MODELS`."""
+    """Dispatch to one named risk model; see :data:`RISK_MODELS`.
+
+    ``n_factors`` and ``industry`` are read by ``factor`` alone (see
+    :func:`factor_covariance`), and ``shrinkage`` by ``shrunk_sample`` and
+    ``embedding``; every other model ignores them.
+    """
 
     if name == "diagonal":
         return diagonal_covariance(history, min_samples=min_samples)
@@ -208,21 +448,34 @@ def estimate_risk(
         )
     if name == "ledoit_wolf":
         return ledoit_wolf_covariance(history, min_samples=min_samples)
+    if name == "nonlinear_shrinkage":
+        return nonlinear_shrinkage_covariance(history, min_samples=min_samples)
     if name == "embedding":
         if embeddings is None:
             raise ValueError("the 'embedding' risk model needs embeddings")
         return embedding_covariance(
             history, embeddings, shrinkage=shrinkage, min_samples=min_samples
         )
+    if name == "factor":
+        return factor_covariance(history, n_factors=n_factors, industry=industry,
+                                 min_samples=min_samples)
     raise ValueError(f"unknown risk model {name!r}; choose from {RISK_MODELS}")
 
 
-#: The risk models a backtest configuration may name.
-RISK_MODELS = ("diagonal", "shrunk_sample", "ledoit_wolf", "embedding")
+#: The risk models a backtest configuration may name. ``factor`` is named
+#: but not swept: :data:`~stable_finance.evaluation.config.CONFIG_SPACE` lists
+#: the others explicitly, so adding it left the default space and every label
+#: as they were, and a study asks for it by name.
+RISK_MODELS = (
+    "diagonal", "shrunk_sample", "ledoit_wolf", "nonlinear_shrinkage", "embedding",
+    "factor",
+)
 
 #: What each risk model needs of the market: nothing, since all of them are
 #: estimated from returns (``embedding`` also needs the embeddings, which are
-#: not market data and are checked where they are used).
+#: not market data and are checked where they are used; ``factor`` adds
+#: industry factors when the market has an ``industry`` code, and runs on
+#: statistical factors alone when it does not).
 RISK_MODEL_REQUIRES: dict[str, tuple[str, ...]] = {name: () for name in RISK_MODELS}
 
 

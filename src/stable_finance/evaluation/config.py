@@ -27,7 +27,13 @@ from dataclasses import dataclass, fields, replace
 import numpy as np
 
 from stable_finance.dataset.schema import MissingRolesError
-from stable_finance.evaluation.execution import COST_MODEL_REQUIRES, COST_MODELS
+from stable_finance.evaluation.execution import (
+    COST_MODEL_REQUIRES,
+    COST_MODELS,
+    FEE_REQUIRES,
+    FEE_SETTINGS,
+    _fee_setting,
+)
 from stable_finance.evaluation.portfolio.construction import (
     SELECTION_REQUIRES,
     SELECTION_RULES,
@@ -40,6 +46,12 @@ from stable_finance.evaluation.portfolio.risk import (
     UNIVERSE_REQUIRES,
     UNIVERSE_SCREENS,
 )
+from stable_finance.evaluation.portfolio.signals import (
+    ALPHA_RULES,
+    NEUTRALIZATIONS,
+    SIGNAL_REQUIRES,
+)
+from stable_finance.evaluation.trades.rebalance import REBALANCE_SOLVERS
 
 __all__ = [
     "ANNUALIZATIONS",
@@ -76,7 +88,13 @@ ANNUALIZATIONS = ("decisions", "daily")
 #: anchor; ``daily`` sets the book at each day's first decision and holds it,
 #: which cuts turnover by roughly the number of anchors in a day and is the
 #: difference between a signal that pays for its spread and one that does not.
-REBALANCE_RULES = ("every_decision", "daily")
+#: ``horizon`` sets the book once per forecast horizon (restarting each day),
+#: holds it for the horizon, and books its forward return ONCE: the way to
+#: score an h-horizon forecast on a grid of decisions closer together than h,
+#: where booking every decision's forward return counts each move about
+#: h / spacing times. The harness reads the horizon from the forecast and the
+#: spacing from the decisions.
+REBALANCE_RULES = ("every_decision", "daily", "horizon")
 
 #: How a position is carried from one decision to the next. ``rebalanced``
 #: holds each name at its weight: every decision's book is a fresh bet that
@@ -104,12 +122,14 @@ AXIS_REQUIRES: dict[str, dict[str, tuple[str, ...]]] = {
     "weighting": {"mean_variance": (), **WEIGHTING_REQUIRES},
     "risk_model": RISK_MODEL_REQUIRES,
     "cost_model": COST_MODEL_REQUIRES,
+    "neutralize": SIGNAL_REQUIRES,
 }
 
 
 #: Settings that are ``None`` unless a model needs them, and that labels and
 #: result rows leave out while unset.
-OPTIONAL_SETTINGS = ("equity", "execution_days", "impact")
+OPTIONAL_SETTINGS = ("equity", "execution_days", "impact", "alpha", "alpha_ic",
+                     "neutralize", "mv_solver", *FEE_SETTINGS)
 
 
 @dataclass(frozen=True)
@@ -159,6 +179,51 @@ class BacktestConfig:
     #: How positions are carried between decisions (:data:`HOLDING_RULES`).
     #: Accounting rather than a modelling axis, so it is not swept.
     holding: str = "rebalanced"
+    #: Convert the forecast to return units before construction:
+    #: ``"grinold"`` is ``alpha = alpha_ic * sigma * z`` (Grinold, 1994), with
+    #: ``sigma`` from the risk model and ``z`` the cross-sectional z-score;
+    #: ``"grinold_rank"`` takes ``z`` as the Gaussian rank score, which an
+    #: outlying forecast cannot dominate. ``None`` uses the forecast as given.
+    alpha: str | None = None
+    #: The information coefficient the ``alpha`` rule scales by.
+    alpha_ic: float | None = None
+    #: Residualise the forecast on exposures before construction, so the book
+    #: expresses no market or industry bet: ``"beta"`` (beta estimated from
+    #: the risk history), ``"industry"`` (needs an ``industry`` market
+    #: quantity) or ``"beta_industry"``. ``None`` leaves it as forecast.
+    neutralize: str | None = None
+    #: How the cost-aware allocator's rebalance is solved, a NUMERICAL setting
+    #: like ``max_iter`` and read only by ``weighting='mean_variance'``.
+    #: ``None`` is FISTA within the ``max_iter`` budget, which every earlier
+    #: result used and which on a real month spends the whole budget at every
+    #: decision. ``"restart"`` is accelerated proximal gradient with adaptive
+    #: restart, run until the step falls below the solver's tolerance under a
+    #: cap of at least :data:`~stable_finance.evaluation.trades.rebalance.RESTART_MAX_ITER`
+    #: iterations: the converged book, so that a result about the allocator is
+    #: not a result about where its solver was stopped.
+    mv_solver: str | None = None
+    #: FEES, charged per unit of weight traded ON TOP of the cost model, and,
+    #: like ``efq``, to the cost-aware allocator and in the scoring alike, so
+    #: a book is planned against the fees it then pays. All three are refused
+    #: with ``cost_model='mid'``, the frictionless benchmark (``cross`` at
+    #: ``efq=0`` is a midpoint fill that still pays them). ``fee_bps`` is a
+    #: commission in basis points of the notional traded, on either side.
+    fee_bps: float | None = None
+    #: Dollars per share traded, on either side, such as an exchange's take
+    #: fee. It needs each name's share price (a ``mid``, or the bid and ask),
+    #: and :func:`check_config` refuses it on a market without one.
+    fee_per_share: float | None = None
+    #: A fraction of the notional SOLD, the SEC's Section 31 fee. The
+    #: allocator's cost is one rate for either side of a trade, so it is
+    #: charged half of this on every unit, which is exact per round trip (see
+    #: :func:`~stable_finance.evaluation.execution.fee_per_unit`); the scoring
+    #: bills each sale in full. For a sample from 2020::
+    #:
+    #:     BacktestConfig(fee_per_share=0.003,    # Reg NMS Rule 610 access-fee cap
+    #:                    sec_fee_rate=22.10e-6)  # SEC Section 31, fiscal 2020
+    #:
+    #: which is about 1.5 bp per side on a $20 stock, plus 0.22 bp on each sale.
+    sec_fee_rate: float | None = None
 
     def __post_init__(self) -> None:
         for field, allowed in (
@@ -204,6 +269,28 @@ class BacktestConfig:
                 raise ValueError(f"impact must be {wanted} finite coefficients for "
                                  f"cost_model={self.cost_model!r}")
             object.__setattr__(self, "impact", tuple(float(v) for v in values))
+        if self.alpha is not None and self.alpha not in ALPHA_RULES:
+            raise ValueError(f"alpha={self.alpha!r} is not one of {ALPHA_RULES}")
+        if self.alpha is not None and (
+                self.alpha_ic is None or isinstance(self.alpha_ic, bool)
+                or not np.isfinite(self.alpha_ic)):
+            raise ValueError(f"alpha={self.alpha!r} needs alpha_ic, a finite information "
+                             "coefficient to scale the forecast by")
+        if self.neutralize is not None and self.neutralize not in NEUTRALIZATIONS:
+            raise ValueError(f"neutralize={self.neutralize!r} is not one of {NEUTRALIZATIONS}")
+        if self.mv_solver is not None and self.mv_solver not in REBALANCE_SOLVERS:
+            raise ValueError(f"mv_solver={self.mv_solver!r} is not None or one of "
+                             f"{REBALANCE_SOLVERS}")
+        for name in FEE_SETTINGS:
+            object.__setattr__(self, name, _fee_setting(name, getattr(self, name)))
+        if self.cost_model == "mid" and self.fees:
+            raise ValueError("cost_model='mid' is the frictionless benchmark and charges no fees; "
+                             "charge them on top of 'cross' (efq=0 for midpoint fills that still "
+                             "pay them), 'book' or an impact model")
+        if self.rebalance == "horizon" and self.holding == "drift":
+            raise ValueError("rebalance='horizon' books each held book's forward return once; "
+                             "holding='drift' already carries positions step by step on "
+                             "one-step returns, so use one or the other")
 
     @property
     def label(self) -> str:
@@ -219,13 +306,26 @@ class BacktestConfig:
         )
 
     @property
+    def fees(self) -> dict[str, float]:
+        """The fee settings this configuration charges, by name; empty when it charges none."""
+        return {name: getattr(self, name) for name in FEE_SETTINGS
+                if getattr(self, name) is not None}
+
+    @property
     def requires(self) -> dict[str, tuple[str, ...]]:
-        """Market quantities this configuration needs, by the axis needing them."""
+        """Market quantities this configuration needs, by the axis needing them.
+
+        A fee that needs the market is listed under its own name, as an axis
+        option is: ``fee_per_share`` needs the share price.
+        """
         out = {}
         for axis, table in AXIS_REQUIRES.items():
             needed = table.get(getattr(self, axis), ())
             if needed:
                 out[axis] = tuple(needed)
+        for name in self.fees:
+            if FEE_REQUIRES[name]:
+                out[name] = tuple(FEE_REQUIRES[name])
         return out
 
     def supported_by(self, market) -> bool:
@@ -248,13 +348,20 @@ DEFAULT_BACKTEST = BacktestConfig()
 #: every Sharpe here one non-overlapping observation per day annualized at
 #: 252, which is what the execution-quality figure reports. ``cost_model`` is
 #: absent because ``efq`` is now the cost axis.
+#: ``rebalance`` sweeps the two schedules that are modelling choices;
+#: ``horizon`` is the accounting for a horizon longer than the decision
+#: spacing and is asked for by name. ``risk_model`` lists its options
+#: explicitly rather than taking :data:`RISK_MODELS`, so the ``factor`` model
+#: added later is asked for by name and the space every published result was
+#: drawn from is unchanged.
 CONFIG_SPACE = {
     "universe": UNIVERSE_SCREENS,
     "selection": SELECTION_RULES,
     "weighting": ALLOCATORS,
-    "risk_model": RISK_MODELS,
+    "risk_model": ("diagonal", "shrunk_sample", "ledoit_wolf", "nonlinear_shrinkage",
+                   "embedding"),
     "efq": EFQ_GRID,
-    "rebalance": REBALANCE_RULES,
+    "rebalance": ("every_decision", "daily"),
 }
 
 
@@ -266,11 +373,18 @@ def _is_degenerate(config: BacktestConfig) -> bool:
     one risk model is kept for it. And under a diagonal risk model,
     inverse-volatility and equal-risk-contribution both reduce to ``w ~
     1/sigma``, so keeping all three would triple-count one portfolio and
-    silently weight the summary toward it.
+    silently weight the summary toward it. Hierarchical risk parity and the
+    long-only minimum-variance solution land on ``w ~ 1/sigma^2`` under the
+    same model, which is ``min_var``'s book.
+
+    A Grinold alpha reads each name's volatility from the risk model, so with
+    it set even the covariance-free rules change with the risk model and none
+    of the first collapse applies.
     """
-    if config.weighting in ("equal", "rank") and config.risk_model != "diagonal":
+    if (config.weighting in ("equal", "rank", "signal") and config.alpha is None
+            and config.risk_model != "diagonal"):
         return True
-    if config.risk_model == "diagonal" and config.weighting == "erc":
+    if config.risk_model == "diagonal" and config.weighting in ("erc", "hrp", "min_var_qp"):
         return True
     return False
 
@@ -288,7 +402,13 @@ def check_config(config: BacktestConfig, market) -> None:
                            "'impact' needs adv, the average daily dollar volume; "
                            "'impact_stock' also needs market_cap, idio_vol, market_vol "
                            "and time_trend",
-             "universe": "universe='all' runs without quotes"}
+             "universe": "universe='all' runs without quotes",
+             "neutralize": "neutralize='beta' runs on any market data, estimating beta "
+                           "from the risk history; 'industry' needs an industry code "
+                           "for each name",
+             "fee_per_share": "fee_per_share is dollars per share, so it needs each name's "
+                              "share price (mid, or bid_price and ask_price); fee_bps and "
+                              "sec_fee_rate are charged on notional and need none"}
     for axis, needed in config.requires.items():
         try:
             market.require(*needed, purpose=f"{axis}={getattr(config, axis)!r}")
@@ -300,10 +420,14 @@ def check_config(config: BacktestConfig, market) -> None:
 def enumerate_configs(*, market=None, **overrides) -> tuple[BacktestConfig, ...]:
     """The configuration space, or a named slice of it.
 
-    Each keyword replaces one axis's option list; a scalar is accepted and
-    treated as a one-element list, so ``enumerate_configs(cost_model="mid")``
-    sweeps everything else at zero friction. Configurations that duplicate
-    another point are removed, so every element is a distinct portfolio.
+    Each keyword names a :class:`BacktestConfig` field. A list or tuple of
+    options sweeps it -- any field, so ``enumerate_configs(neutralize=(None,
+    "beta"))`` adds an axis the default space does not have -- and a single
+    value pins it, so ``enumerate_configs(cost_model="mid")`` sweeps
+    everything else at zero friction. (``impact`` is itself a tuple of
+    coefficients: one tuple pins it, a list of tuples sweeps it.)
+    Configurations that duplicate another point are removed, so every element
+    is a distinct portfolio.
 
     ``market`` restricts the space to what that market data can support.
     Without a half-spread there is nothing to charge, so unless the caller
@@ -318,16 +442,17 @@ def enumerate_configs(*, market=None, **overrides) -> tuple[BacktestConfig, ...]
             scalars["cost_model"] = "mid"
         if "efq" not in overrides:
             axes["efq"] = (0.0,)
+    known = {f.name for f in fields(BacktestConfig)}
     for name, value in overrides.items():
-        if name in axes:
-            # A scalar is a one-element list, so a caller can pin an axis with
-            # ``efq=0.7`` or ``selection="all"`` as readily as passing a tuple.
-            axes[name] = ((value,) if isinstance(value, (str, float, int))
-                          else tuple(value))
-        elif name in {f.name for f in fields(BacktestConfig)}:
-            scalars[name] = value
-        else:
+        if name not in known:
             raise ValueError(f"{name!r} is not a configuration axis")
+        sweep = isinstance(value, (list, tuple, np.ndarray)) and not (
+            name == "impact" and all(isinstance(v, (int, float)) for v in value))
+        if sweep:
+            axes[name] = tuple(value)
+        else:
+            axes.pop(name, None)
+            scalars[name] = value
 
     names = list(axes)
     out = []

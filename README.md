@@ -34,11 +34,12 @@ src/stable_finance/
                            streamed) and oracle forecasts
     portfolio/             stage 3: the target portfolio, as if trading were free;
                            risk.py (risk management: universe screens and the risk
-                           model) and construction.py (selection and weighting, or
-                           the mean-variance target)
+                           model), signals.py (alpha refinement and neutralization)
+                           and construction.py (selection and weighting, or the
+                           mean-variance target)
     trades/                stage 4: trading policies, how far to move given costs;
-                           rebalance and trade rules, and rl/ reserved for learned
-                           policies
+                           rebalance and trade rules, and rl/ for learned policies
+                           (parametric.py, the first)
     scoring/               stage 5: how good each output is; ic.py (forecast IC),
                            pnl.py (positions and P&L), sharpe.py (Sharpe, EFQ curves)
     config.py, backtest.py the harness: one named configuration, entered at any level
@@ -148,6 +149,16 @@ decisions are solved in order and each starts from the previous solution. The
 problem is convex and solved by accelerated proximal gradient descent, whose
 proximal step is the trade rule itself.
 
+By default that solver is FISTA with a fixed iteration budget (`max_iter`),
+which on a real month of some 650 names runs out at every decision: the book is
+where the iterations stopped, not the optimum. `solver="restart"` (on
+`rebalance`, `allocate` and `MeanVarianceAllocator`; `mv_solver="restart"` in
+`BacktestConfig`) solves to the step tolerance instead, with the adaptive
+restart of O'Donoghue and Candes (2015) in a metric scaled by each name's
+variance, and warns (`ConvergenceWarning`) if it ever reaches its cap of at
+least `RESTART_MAX_ITER` iterations. `return_n_iter=True` returns each
+decision's iteration count beside the weights.
+
 ```python
 from stable_finance import (
     MeanVarianceAllocator, allocate, estimate_covariance, mean_variance_target, rebalance,
@@ -168,6 +179,35 @@ covariance over finite observations, shrunk toward its diagonal and clipped to
 the positive semidefinite cone. A NaN cost marks an asset that cannot be
 traded at that decision, so it holds its previous weight; a NaN forecast is a
 zero expected return that still pays risk and cost.
+
+`trades.dynamic` holds three rules that trade less than all the way to the
+target, each a function of a target path and the book held:
+`partial_adjustment(target, rate)` moves a fixed fraction of the gap each
+decision; `no_trade_band(target, band, cost=half_spread)` holds a name until
+its target leaves a band (here a multiple of its cost) and then trades to the
+band's edge (Constantinides, 1986); `aim_portfolio(forecast, sigma,
+risk_aversion=..., cost_aversion=...)` is Garleanu and Pedersen's (2013) aim,
+which weights forecasts at several horizons by how slowly they decay. Their
+output is `PortfolioWeights`, scored by entering `run_backtest` at the
+weights level.
+
+`trades.rl` holds policies learned for their net-of-cost performance rather
+than written by hand. The first, `ParametricPolicy`, follows Brandt,
+Santa-Clara and Valkanov (2009) with a learned partial-adjustment rate
+(DeMiguel et al., 2020): the target is a dollar-neutral blend `X_t @ theta`
+of characteristics (forecasts at several horizons, say), the held book moves
+a fraction `eta` of the way there each decision, and `theta` and `eta` are
+chosen by full-batch gradient ascent on mean net return minus a variance
+penalty, from a fixed start for a fixed number of steps, so a fit is
+deterministic.
+
+```python
+from stable_finance import ParametricPolicy
+
+policy = ParametricPolicy(gross_exposure=2.0, risk_aversion=5.0).fit(
+    train_forecasts, train_returns, cost=train_market)
+held = policy.predict(test_forecasts, cost=test_market)    # PortfolioWeights
+```
 
 Orders are the weight changes along a target path; fills are what executed:
 
@@ -194,7 +234,9 @@ without a positive quote is left unfilled and the realized position lags the
 target. When every order fills, `evaluate_fills` reproduces
 `cross_spread_sharpe` exactly. Depth, partial fills, impact, and commissions
 remain outside the simulator; bring your own `Fills` to evaluate a richer
-execution model.
+execution model. Fees are billed beside the fills, not in their prices:
+`evaluate_fills(fills, realized, fees=fee_cost(fills.quantity, ...))` (see
+[Fees on top of the spread](#fees-on-top-of-the-spread)).
 
 In the originating market-jepa setup, the default for supervised training,
 ridge fitting, and evaluation is the empirical-uniform target within each
@@ -260,6 +302,43 @@ shrunk towards the cross-sectional mean by `scale`, which defaults to `|ic|`
 dispersion, which a cost-aware allocator or `edge_to_cost` reads as an edge
 `1 / IC` times too large; `scale=1.0` gives it anyway.
 
+`ic` may be one value per horizon, as a real forecast decays with the
+horizon. `persistence=k` replays the same draws for `k` consecutive
+decisions (restarting each day when `days` is given), so the same rank
+positions stay wrong while the truth underneath them moves; each decision's
+IC keeps its distribution, and only the dependence across decisions changes.
+
+`copula_forecast` is a different model rather than a fourth mode: each name
+carries its own error, an AR(1) series across decisions with half-life
+`half_life` (restarting each day), mixed with the normal score of its
+realized rank through a Gaussian copula. Errors belong to a name rather than
+to a rank position, which is how a slow real signal is wrong, and the IC is
+hit in expectation with the same `1 / sqrt(n - 1)` scatter as `random`.
+
+```python
+from stable_finance import copula_forecast
+
+forecast = copula_forecast(realized, [0.03, 0.02, 0.01], half_life=12, days=days, seed=0)
+```
+
+`factor_forecast` is the copula with three properties of real forecasts
+added, each by a parameter. Its errors are factor bets: they load on the
+principal components of past returns (`n_factors`, `factor_share`), so a
+forecast is wrong about many names at once and neutralization or a risk
+model has something to remove. Its IC drifts: the per-decision target is an
+AR(1) around `ic` (`ic_dispersion`, `ic_persistence`). And its accuracy can
+rise with a name's spread or volatility (`quality="spread"` or `"vol"`). On
+August 2020, `factor_share=0.3` widens the per-decision IC's spread from the
+copula's 0.04 to 0.15, about what real signals show there. With all three
+off it is `copula_forecast`, draw for draw.
+
+```python
+from stable_finance import factor_forecast
+
+forecast = factor_forecast(realized, 0.03, history=prior, factor_share=0.3, half_life=12,
+                           quality="spread", market=market, days=days, seed=0)
+```
+
 ## The harness is a configuration, not a constant
 
 A Sharpe ratio is not a property of a forecast. It is a property of a forecast
@@ -296,10 +375,10 @@ predictors.
 |---|---|
 | `universe` | `all`, `tight_50pct`, `tight_25pct` — a cross-sectional screen on each name's own quoted half-spread |
 | `selection` | `all`, `quintile`, `decile`, `decile_long_only` — how much of the ranking to trade |
-| `weighting` | `mean_variance` (cost-aware, path-dependent), `equal`, `inverse_vol`, `min_var`, `erc`, `rank` |
-| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `embedding` — the last forecasts correlations from the encoder's own representation |
+| `weighting` | `mean_variance` (cost-aware, path-dependent), `equal`, `inverse_vol`, `min_var`, `erc`, `rank`, `signal` (proportional to the forecast's distance from the median), `min_var_qp` (the long-only minimum-variance optimum `min_var` approximates), `hrp` (hierarchical risk parity) |
+| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `nonlinear_shrinkage` (Ledoit and Wolf, 2020), `embedding` — the last forecasts correlations from the encoder's own representation; `factor` (statistical and, when the market has an `industry` column, industry factors plus specific risk; `factor_covariance`) is asked for by name and is outside the default space |
 | `cost_model` | `mid`, `cross` — free, or the name's own quoted half-spread times `efq` |
-| `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it |
+| `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it; `horizon` is outside the default space (see below) |
 | `annualization` | `decisions`, `daily` — whether every decision is an independent period |
 
 `efq` is the continuous cost axis, and `trading_cost` takes it as `multiple`.
@@ -319,6 +398,127 @@ point rather than reporting one portfolio several times: a book that ignores
 the covariance appears under one risk model, and equal-risk-contribution on a
 diagonal model is inverse-volatility, so it is not also counted as its own
 option.
+
+`enumerate_configs` sweeps any `BacktestConfig` field given a list or tuple
+of options and pins any field given one value, so a setting outside the
+default space is swept the same way, as in
+`enumerate_configs(neutralize=(None, "beta"), rebalance=("every_decision", "horizon"))`.
+Settings of this kind are unset by default, so the default space and every
+label in it are unchanged:
+
+| Setting | Options |
+|---|---|
+| `alpha` | `"grinold"` or `"grinold_rank"`, with `alpha_ic` — rescale the forecast to `alpha_ic * sigma * z` before construction, `z` the cross-sectional z-score or, for `grinold_rank`, the Gaussian rank score |
+| `neutralize` | `"beta"`, `"industry"`, `"beta_industry"` — residualise the forecast on those exposures before construction |
+| `mv_solver` | `"restart"` — solve the mean-variance rebalance to convergence rather than within the `max_iter` budget (a numerical setting; only `weighting="mean_variance"` reads it) |
+
+### Signal transforms
+
+A forecast and the portfolio built from it need not say the same thing.
+`refine_alpha` puts a forecast in return units with Grinold's (1994) rule,
+`alpha = IC * sigma * z`: a probe fit against a rank target, or any score, is
+not in the units of a covariance or a spread, and mean-variance sizing and
+the edge-to-cost rules compare the forecast with both. `neutralize` takes the
+per-decision cross-sectional residual of the forecast on an intercept and the
+chosen exposures, so the book cannot express a market or industry bet the
+forecast never meant to make. Beta is estimated from the risk history against
+the equal-weighted mean of the panel (`estimate_beta`), so it needs no index
+and runs on any data. The industry is a column role, `industry`, a numeric
+code per name like `market_cap`; Market-1T supplies it as the Fama-French 49
+code through `market_from_days(..., industry_map=...)`, reading the map that
+`sf-industry-map` writes. The IC is always measured on the
+raw forecast: the transforms change what the portfolio expresses, not what
+the model predicted.
+
+```python
+from stable_finance import BacktestConfig, refine_alpha, neutralize
+
+config = BacktestConfig(alpha="grinold", alpha_ic=0.05, neutralize="beta_industry")
+alpha = refine_alpha(scores, volatility, ic=0.05, score="gauss_rank")
+```
+
+### Scoring a long-horizon forecast
+
+Every decision books its forward return, `w_t . r(t, t + h)`. That is right
+when the horizon equals the spacing between decisions. When it is longer,
+consecutive returns overlap and each move is counted about `h / spacing`
+times. A 3600-second forecast on a 300-second grid would be counted twelve
+times over, while its turnover is charged once. `rebalance="horizon"` scores
+such a forecast without the overlap: each book is set once per horizon
+(restarting each day), carried until the next, and its forward return is
+booked once. The harness reads the horizon from the forecast and the spacing
+from the decisions, which must say when they are: epoch seconds, as
+`evaluation_inputs` writes them, or Market-1T's `"date|anchor"` labels. It is
+not the default, so existing results do not move; use it whenever the horizon
+is longer than the decision spacing. It is refused with `holding="drift"`,
+which already carries each position on one-step returns.
+
+```python
+report = run_backtest(forecast, realized, market=market, days=days,
+                      config=config.replace(rebalance="horizon"))
+```
+
+The mean-variance allocator sizes its book with one risk aversion per
+decision, from the forecasts up to that decision. A forecast made later never
+resizes a book already held.
+
+### Fees on top of the spread
+
+The spread is not the whole bill. A marketable order also pays the venue's
+access fee per share, and every sale pays the SEC's Section 31 fee; at
+five-minute holding periods the per-share fee is the same order as the
+half-spread of a liquid name. Three optional settings charge them on top of
+any cost model except `mid`, which stays the frictionless benchmark (use
+`cross` at `efq=0` for midpoint fills that still pay fees):
+
+| Setting | Charged |
+|---|---|
+| `fee_bps` | basis points of the notional traded, on either side (a commission) |
+| `fee_per_share` | dollars per share traded, on either side, converted at each name's mid; needs a `mid` (or the bid and ask), and `check_config` refuses it without one |
+| `sec_fee_rate` | a fraction of the notional sold, on sales only |
+
+With the values in force in 2020 -- the Regulation NMS Rule 610 access-fee
+cap and the fiscal-2020 Section 31 rate, both exported:
+
+```python
+from stable_finance import ACCESS_FEE_CAP_2020, SEC_FEE_RATE_FY2020, BacktestConfig
+
+config = BacktestConfig(fee_per_share=ACCESS_FEE_CAP_2020,   # $0.003 per share
+                        sec_fee_rate=SEC_FEE_RATE_FY2020)    # $22.10 per $1M sold
+report = run_backtest(forecast, realized, market=market, config=config)
+report.mean_fee_bps          # the part of mean_cost_bps that is fees
+```
+
+Like `efq`, the fees reach both places a cost does: the cost-aware allocator
+is charged them (`fee_per_unit`), so it trades less when trading costs more,
+and the scoring bills each fill exactly `|dw| (fee_bps / 1e4 + fee_per_share
+/ mid) + max(-dw, 0) sec_fee_rate` (`fee_cost`), beside its slippage rather
+than inside its price, so a limit still refers to the execution price. The
+allocator's cost is one rate for either side of a trade, so it is charged
+half the SEC rate on every unit -- exact per round trip, since every position
+is opened by one side and closed by the other. `PnLSeries.fee` keeps the fees
+apart from the rest of the cost, and the break-even EFQ after fees is
+`breakeven_efq(gross, (cost - fee) / efq, fees=fee)`: fees are paid at every
+execution quality and come off the gross. Unset, as by default, no fee code
+runs: labels, rows and numbers are what they were. FINRA's trading activity
+fee and maker rebates are not modelled.
+
+### How much of the forecast reached the book
+
+`BacktestReport.transfer_coefficient` is Clarke, de Silva and Thorley's
+(2002) transfer coefficient, the cosine between the risk-weighted positions
+`Sigma^(1/2) w` and the risk-adjusted forecast `Sigma^(-1/2) alpha`, averaged
+over decisions: 1 for frictionless mean-variance on its own forecast, and
+lower as selection, constraints and costs take the book away from it.
+`transfer_coefficient(weights, alpha, covariance)` computes it on any book,
+and it is NaN for a run entered below the forecast level.
+
+`scoring.stats` holds the statistics for comparing many backtests, all in
+closed form: `probabilistic_sharpe` and `min_track_record` (Bailey and López
+de Prado, 2012), `deflated_sharpe` for the best of `n_trials` (2014), `pbo`,
+the probability of backtest overfitting by combinatorially symmetric
+cross-validation over every split (Bailey et al., 2017), and
+`sharpe_difference`, a HAC test of two Sharpe ratios (Ledoit and Wolf, 2008).
 
 ## Is the forecast worth its spread?
 
@@ -529,6 +729,7 @@ refuses with `MissingRolesError` when a column is absent:
 | fills through the book (`cost_model="book"`) | `book_bid_price`, `book_bid_size`, `book_ask_price`, `book_ask_size` |
 | the impact model (`cost_model="impact"`) | `adv`, average daily dollar volume |
 | the stock-specific impact model (`cost_model="impact_stock"`) | `adv`, `market_cap`, `idio_vol`, `market_vol`, `time_trend` |
+| industry neutralization (`neutralize="industry"` or `"beta_industry"`) | `industry` |
 | limit orders, any model but `impact` | `window_best_buy` and `window_best_sell`, and a decision price |
 | `cross_spread_sharpe` | `bid_price` and `ask_price` |
 
@@ -641,7 +842,7 @@ no price, and the return is NaN rather than a guess.
 
 **Roles decide what is possible downstream.** The roles are `mid`, `open`,
 `high`, `low`, `close`, `vwap`, `volume`, `n_trades`, `bid_price`,
-`ask_price`, `bid_size`, `ask_size` and `market_cap`. None is required. Every target family
+`ask_price`, `bid_size`, `ask_size`, `market_cap` and `industry`. None is required. Every target family
 and every stage declares the roles it needs. A univariate series gets returns
 and frictionless portfolios, and a backtest that charges the spread is
 refused with `MissingRolesError` naming the missing columns. Bars without

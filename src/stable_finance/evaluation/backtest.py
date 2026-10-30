@@ -52,9 +52,12 @@ from stable_finance.evaluation.config import (
 )
 from stable_finance.evaluation.embeddings.contract import Embeddings
 from stable_finance.evaluation.execution import (
+    FEE_SETTINGS,
     Orders,
     _efq_array,
     execute,
+    fee_cost,
+    fee_per_unit,
     fill_path,
     impact_cost,
     impact_stock_cost,
@@ -67,11 +70,15 @@ from stable_finance.evaluation.portfolio.construction import (
     mean_variance_target, select_book, weight_book,
 )
 from stable_finance.evaluation.portfolio.risk import apply_screen, estimate_risk
+from stable_finance.evaluation.portfolio.signals import (
+    alpha_from_rule, apply_signal, estimate_beta,
+)
 from stable_finance.evaluation.returns.contract import ForwardReturns
 from stable_finance.evaluation.returns.probes import RidgeProbe
 from stable_finance.evaluation.scoring.ic import grouped_rank_ic
 from stable_finance.evaluation.scoring.pnl import positions_from_fills
 from stable_finance.evaluation.scoring.sharpe import sharpe_ratio
+from stable_finance.evaluation.scoring.tc import transfer_coefficient
 from stable_finance.evaluation.trades.rebalance import rebalance
 
 __all__ = ["LEVELS", "BacktestReport", "run_backtest", "sweep_configs"]
@@ -80,7 +87,22 @@ __all__ = ["LEVELS", "BacktestReport", "run_backtest", "sweep_configs"]
 #: hold the identical book, so the expensive part is computed once and the
 #: remaining axes -- which act only on an existing book -- are evaluated on top.
 _BOOK_AXES = ("universe", "selection", "weighting", "risk_model", "cost_model",
-              "efq", "gross_exposure", "shrinkage", "max_iter", "equity", "impact")
+              "efq", "gross_exposure", "shrinkage", "max_iter", "equity", "impact",
+              "alpha", "alpha_ic", "neutralize", "mv_solver", *FEE_SETTINGS)
+
+
+#: The book axes only the cost-aware allocator reads. A path-independent rule
+#: sizes a book from the forecast and the risk model alone, so configurations
+#: differing only in what trading costs hold the same book and share it.
+_COST_AXES = ("cost_model", "efq", "equity", "impact", "max_iter", "mv_solver",
+              *FEE_SETTINGS)
+
+
+def _book_key(config: BacktestConfig) -> tuple:
+    """The settings that determine a configuration's book, and nothing else."""
+    axes = (_BOOK_AXES if config.weighting == "mean_variance"
+            else tuple(a for a in _BOOK_AXES if a not in _COST_AXES))
+    return tuple((axis, getattr(config, axis)) for axis in axes)
 
 
 @dataclass(frozen=True)
@@ -95,12 +117,18 @@ class PnLSeries:
 
     ``periods`` are the labels the series is indexed by: one per decision, or
     one per day when the configuration annualizes daily.
+
+    ``fee`` is the part of ``cost`` that is fees, when the configuration
+    charges any (else None), so ``cost - fee`` is what the cost model itself
+    charged -- the part that scales with execution quality, which a
+    break-even EFQ is read from.
     """
 
     periods: NDArray[np.str_]
     gross: NDArray[np.float64]
     net: NDArray[np.float64]
     cost: NDArray[np.float64]
+    fee: NDArray[np.float64] | None = None
 
 
 @dataclass(frozen=True)
@@ -112,12 +140,24 @@ class BacktestReport:
     frictionless number from being read as an executable one.
     ``information_coefficient`` is measured on the same forecast over the same
     screened universe, so the pair is comparable by construction.
+
+    ``transfer_coefficient`` is how much of the forecast the book expresses
+    (:func:`~stable_finance.evaluation.scoring.tc.transfer_coefficient`): the
+    correlation, over the screened names, of the positions actually HELD --
+    after the solver, the fills and ``rebalance`` -- with the forecast
+    the book was built from, AFTER the signal transforms, both in the risk
+    model's units. It is measured against the transformed forecast rather than
+    the raw one because the transforms are what the book was asked to express;
+    the IC is what scores the raw forecast. Below the forecast level there is
+    no forecast to transfer, and it is NaN.
     """
 
     config: BacktestConfig
     horizon: int
     information_coefficient: float
     information_coefficient_se: float
+    #: NaN where there is no forecast.
+    transfer_coefficient: float
     sharpe_mid: float
     sharpe_net: float
     mean_gross_return_bps: float
@@ -132,15 +172,21 @@ class BacktestReport:
     #: and four thousand embedded arrays would turn a 3 MB result file into a
     #: gigabyte one.
     series: PnLSeries | None = None
+    #: The mean fee per period, in basis points of equity, when the
+    #: configuration charges fees; it is part of ``mean_cost_bps``, not on top
+    #: of it. None otherwise, and then absent from :meth:`as_dict`.
+    mean_fee_bps: float | None = None
 
     def as_dict(self) -> dict:
         """A flat, JSON-serializable row: config axes beside the scores.
 
         ``equity`` is left out when unset, as in the config's label, so rows
-        written before it existed keep the same columns.
+        written before it existed keep the same columns; so is
+        ``mean_fee_bps`` for a configuration that charges no fees.
         """
         row = {k: v for k, v in asdict(self).items()
-               if k not in ("config", "series")}
+               if k not in ("config", "series")
+               and not (k == "mean_fee_bps" and v is None)}
         config = {k: v for k, v in asdict(self.config).items()
                   if not (k in OPTIONAL_SETTINGS and v is None)}
         return {**config, **row}
@@ -215,15 +261,77 @@ def _prepare(like, realized, market: MarketData, days, horizon_index) -> dict:
     }
 
 
-def _risk(context, config, history, realized, embeddings, horizon_index):
-    """The covariance for one risk model, on the horizon being scored."""
+def _history_panel(context, history, realized) -> ForwardReturns:
+    """The risk history at the horizon being scored, checked against the input.
+
+    The history is matched to the input BY LABEL, not by position: its assets
+    must be the input's assets in the input's order, and its horizon is found
+    by value. A history whose columns were merely the same length used to be
+    read as though they lined up, which silently paired one name's risk with
+    another's forecast.
+    """
     source = history if history is not None else realized
-    panel = ForwardReturns(
-        source.values[:, :, horizon_index][:, :, None],
-        source.decisions, source.assets, context["axis"],
-    )
+    if not np.array_equal(source.assets, context["assets"]):
+        raise ValueError("assets of the history and the input are not aligned")
+    matches = np.flatnonzero(np.asarray(source.horizons) == context["horizon"])
+    if len(matches) == 0:
+        raise ValueError(f"the history has no horizon {context['horizon']}; "
+                         f"it has {list(source.horizons)}")
+    return ForwardReturns(source.values[:, :, matches[0]][:, :, None],
+                          source.decisions, source.assets, context["axis"])
+
+
+def _risk(context, config, history, realized, embeddings, horizon_index):
+    """The covariance for one risk model, on the horizon being scored.
+
+    The ``factor`` model adds industry factors when the market carries an
+    ``industry`` code, taking each name's FIRST known code: classifications
+    are static data, and the earliest code in the period is the one in force
+    when the model is fitted, so a reclassification later in the period
+    cannot leak into it.
+    """
+    panel = _history_panel(context, history, realized)
+    if embeddings is not None and not np.array_equal(embeddings.assets, context["assets"]):
+        raise ValueError("assets of the embeddings and the input are not aligned")
+    industry = None
+    if config.risk_model == "factor" and context["market"].has("industry"):
+        codes = context["market"].get("industry")
+        known = np.isfinite(codes)
+        first = np.argmax(known, axis=0)
+        industry = np.where(known.any(axis=0),
+                            codes[first, np.arange(codes.shape[1])], np.nan)
     return estimate_risk(config.risk_model, panel, embeddings=embeddings,
-                         shrinkage=config.shrinkage, min_samples=2)[0]
+                         shrinkage=config.shrinkage, min_samples=2,
+                         industry=industry)[0]
+
+
+def _beta(context, history, realized) -> NDArray[np.float64]:
+    """Each name's beta at the scored horizon, estimated once per run."""
+    if "beta" not in context:
+        context["beta"] = estimate_beta(_history_panel(context, history, realized))[0]
+    return context["beta"]
+
+
+def _signal(context: dict, config: BacktestConfig, sigma, screened) -> NDArray[np.float64]:
+    """The forecast the book is built from, after the configured transforms.
+
+    Neutralization runs first, so the alpha is scaled from the part of the
+    forecast the book is meant to express; both read only the screened names.
+    The IC is still measured on the raw forecast: these transforms change what
+    the portfolio expresses, not what the model predicted.
+    """
+    mu = context["mu"]
+    if config.neutralize is not None:
+        market = context["market"]
+        mu = apply_signal(
+            config.neutralize, mu, eligible=screened,
+            beta=context.get("beta"),
+            industry=market.get("industry") if market.has("industry") else None,
+        )
+    if config.alpha is not None:
+        mu = alpha_from_rule(config.alpha, mu, np.sqrt(np.maximum(np.diag(sigma), 0.0)),
+                             ic=config.alpha_ic, eligible=screened)
+    return mu
 
 
 # ── the book ────────────────────────────────────────────────────────────────
@@ -231,7 +339,22 @@ def _risk(context, config, history, realized, embeddings, horizon_index):
 def _weights(context: dict, config: BacktestConfig,
              sigma: NDArray[np.float64]) -> NDArray[np.float64]:
     """Target weights under one configuration's book-determining axes."""
-    mu, spread = context["mu"], context["spread"]
+    return _book(context, config, sigma)[0]
+
+
+def _book(context: dict, config: BacktestConfig, sigma: NDArray[np.float64]
+          ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Target weights, and the transformed forecast they were built from.
+
+    The forecast is returned beside the weights, rather than stashed in
+    ``context``, because the context is shared by every configuration of a
+    sweep and the transformed forecast is not: two configurations differing
+    only in ``neutralize`` would read each other's. Returned together, the pair
+    is cached together, so the transfer coefficient a sweep reports is the one
+    :func:`run_backtest` would.
+    """
+    spread = context["spread"]
+    mu = context["mu"]
 
     # THE SCREEN AND THE BOOK ARE DIFFERENT SETS. ``screened`` is what the
     # portfolio may trade at all; ``signs`` is what this configuration chose to
@@ -239,10 +362,11 @@ def _weights(context: dict, config: BacktestConfig,
     # keeps `selection` a real axis for mean-variance rather than a label on
     # four identical portfolios.
     screened = apply_screen(config.universe, spread, shape=mu.shape)
+    mu = _signal(context, config, sigma, screened)
     signs = select_book(config.selection, mu, screened)
     if config.weighting != "mean_variance":
         return weight_book(config.weighting, signs, mu, sigma,
-                           gross_exposure=config.gross_exposure)
+                           gross_exposure=config.gross_exposure), mu
 
     # A name outside the BOOK gets a zero expected return, so the optimizer
     # unwinds it as risk and cost allow. A name outside the UNIVERSE gets an
@@ -256,9 +380,10 @@ def _weights(context: dict, config: BacktestConfig,
     # lambda is set so the COST-FREE target averages the requested gross
     # exposure. mu is in return units and Sigma in squared ones, so their ratio
     # has no natural scale; fixing the exposure is what makes one forecast's
-    # spread bill comparable with another's.
-    raw = np.linalg.solve(sigma, np.nan_to_num(masked, nan=0.0).T).T
-    risk_aversion = max(float(np.abs(raw).sum(axis=1).mean()) / config.gross_exposure, 1e-12)
+    # spread bill comparable with another's. The average runs over the
+    # decisions UP TO each one, never past it: a lambda fit on the whole window
+    # let a forecast made next month resize the book held today.
+    risk_aversion = causal_risk_aversion(masked, sigma, config.gross_exposure)
     # The portfolio stage says what to hold; the trades stage how far to move
     # there, given what trading costs.
     target = mean_variance_target(forecast, sigma[None], risk_aversion=risk_aversion)
@@ -266,12 +391,33 @@ def _weights(context: dict, config: BacktestConfig,
     return rebalance(
         target, sigma[None], risk_aversion=risk_aversion,
         cost=np.where(screened, np.nan_to_num(cost, nan=0.0), np.inf),
-        max_iter=config.max_iter,
-    ).values[:, :, 0]
+        max_iter=config.max_iter, solver=config.mv_solver,
+    ).values[:, :, 0], mu
 
 
 def _cost(config: BacktestConfig, spread, shape, *, context=None,
           target=None) -> NDArray[np.float64]:
+    """Per-unit trading cost the allocator is charged: the cost model's, plus fees.
+
+    Fees are added on top of whatever the model charges, at
+    :func:`~stable_finance.evaluation.execution.fee_per_unit`, so the book is
+    planned against the same fees :func:`_score_fills` bills. A name the model
+    cannot trade stays at infinite cost, and so does one without the price a
+    per-share fee needs.
+    """
+    cost = _model_cost(config, spread, shape, context=context, target=target)
+    if not config.fees:
+        return cost
+    return cost + fee_per_unit(_share_price(context, config), **config.fees)
+
+
+def _share_price(context: dict, config: BacktestConfig) -> NDArray[np.float64] | None:
+    """The share price a per-share fee is converted at: the mid, else not needed."""
+    return context["market"].get("mid") if config.fee_per_share is not None else None
+
+
+def _model_cost(config: BacktestConfig, spread, shape, *, context=None,
+                target=None) -> NDArray[np.float64]:
     """Per-unit trading cost; zero for ``mid`` whether or not there are quotes.
 
     The impact model's cost depends on the order, so the allocator plans
@@ -311,18 +457,114 @@ def _hold_within_day(weights, day):
 
 # ── scoring ─────────────────────────────────────────────────────────────────
 
+def causal_risk_aversion(mu: ArrayLike, sigma: ArrayLike,
+                         gross_exposure: float) -> NDArray[np.float64]:
+    """One lambda per decision, from the decisions up to and including it.
+
+    ``lambda_t = mean_{s <= t} |Sigma^-1 mu_s|_1 / gross_exposure``: the
+    cost-free mean-variance book averages the requested gross exposure over
+    the forecasts seen so far. Only the past and the present enter, so a run
+    cut short gives the same weights on the decisions it kept.
+    """
+    raw = np.linalg.solve(np.asarray(sigma, dtype=np.float64),
+                          np.nan_to_num(np.asarray(mu, dtype=np.float64), nan=0.0).T).T
+    gross = np.abs(raw).sum(axis=1)
+    expanding = np.cumsum(gross) / np.arange(1, len(gross) + 1)
+    return np.maximum(expanding / gross_exposure, 1e-12)
+
+
+def _decision_seconds(context: dict) -> float:
+    """The spacing between consecutive decisions on one day, in seconds.
+
+    Read from the decisions themselves: epoch seconds, as
+    :func:`~stable_finance.evaluation.inputs.evaluation_inputs` takes them, or
+    the ``"date|anchor"`` labels the Market-1T readers write, whose anchor is
+    seconds past the session's origin. The median gap within a day is used,
+    so overnight gaps and an occasional missing decision do not count.
+    """
+    decisions = np.asarray(context["decisions"])
+    try:
+        stamps = decisions.astype(np.float64)
+    except (TypeError, ValueError):
+        parts = np.char.partition(decisions.astype(str), "|")
+        if not np.all(parts[:, 1] == "|"):
+            raise ValueError("this needs the decisions' times: pass decisions as epoch "
+                             "seconds or 'date|anchor' labels") from None
+        stamps = parts[:, 2].astype(np.float64)
+    gaps = np.diff(stamps)
+    if context["days_given"]:
+        day = context["day"]
+        gaps = gaps[day[1:] == day[:-1]]
+    gaps = gaps[gaps > 0]
+    if len(gaps) == 0:
+        raise ValueError("need two decisions on one day to measure their spacing; "
+                         "pass days labelling each decision's trading day")
+    return float(np.median(gaps))
+
+
+def _decisions_spanning(context: dict, *, seconds: float | None = None,
+                        days: float | None = None) -> int:
+    """How many decisions a span of time covers: the one time-to-decisions rule.
+
+    A span in ``days`` is that many times the decisions the data has in a
+    day, read from the ``days`` labels (the impact model's schedule). A span
+    in ``seconds`` is that over the spacing of the decisions (a held book's
+    horizon). Both round to the nearest whole decision.
+    """
+    if days is not None:
+        if not context["days_given"]:
+            raise ValueError("a span in days needs days labelling each decision's trading day")
+        per_day = float(np.median(np.bincount(context["day"])))
+        return int(round(days * per_day))
+    return max(round(float(seconds) / _decision_seconds(context)), 1)
+
+
+def _formations(context: dict) -> NDArray[np.bool_]:
+    """The decisions where a horizon-held book is set: every k-th of each day.
+
+    k is the forecast horizon in decisions. Blocks restart at each day, since
+    a forward return does not run across the close; without ``days`` the
+    decisions are one run.
+    """
+    if "formed" not in context:
+        if context["horizon"] <= 0:
+            raise ValueError("rebalance='horizon' needs a horizon of fixed length; a book "
+                             "held to the close is already set once a day (rebalance='daily')")
+        every = _decisions_spanning(context, seconds=context["horizon"])
+        day = context["day"]
+        index = np.arange(len(day))
+        if context["days_given"]:
+            starts = np.r_[True, day[1:] != day[:-1]]
+            index = index - np.maximum.accumulate(np.where(starts, index, 0))
+        context["formed"] = index % every == 0
+    return context["formed"]
+
+
+def _hold_from(weights, formed):
+    """Carry each formation decision's weights until the next formation."""
+    anchor = np.maximum.accumulate(np.where(formed, np.arange(len(formed)), 0))
+    return weights[anchor]
+
+
 def _score(context: dict, values: NDArray[np.float64],
            config: BacktestConfig, *,
-           with_series: bool = False) -> BacktestReport:
-    """Mark a book, charge it, and annualize -- the axes that act on a book."""
+           with_series: bool = False, alpha: NDArray[np.float64] | None = None,
+           sigma: NDArray[np.float64] | None = None) -> BacktestReport:
+    """Mark a book, charge it, and annualize -- the axes that act on a book.
+
+    ``alpha`` and ``sigma`` are the transformed forecast and the covariance the
+    book was built from; given both, the report carries a transfer coefficient.
+    """
     day = context["day"]
     if config.rebalance == "daily":
         values = _hold_within_day(values, day)
+    if config.rebalance == "horizon":
+        values = _hold_from(values, _formations(context))
     # Every model is scored from its fills, so a cross fill is billed the
     # touch the order met (the arrival quotes, when the market carries them)
     # while the allocator planned against the quoted spread at the decision.
     return _score_fills(context, _fills_toward(context, values, config), config,
-                        with_series=with_series)
+                        with_series=with_series, alpha=alpha, sigma=sigma)
 
 
 def _fills_toward(context: dict, values: NDArray[np.float64], config: BacktestConfig):
@@ -359,16 +601,21 @@ def _schedule(context: dict, config: BacktestConfig) -> int:
     if not context["days_given"]:
         raise ValueError(f"cost_model={config.cost_model!r} works orders over execution_days, so it "
                          "needs days labelling each decision's trading day")
-    per_day = float(np.median(np.bincount(context["day"])))
-    return int(round(days * per_day))
+    return _decisions_spanning(context, days=days)
 
 
 def _score_fills(context: dict, fills, config: BacktestConfig, *,
-                 with_series: bool = False) -> BacktestReport:
+                 with_series: bool = False, alpha: NDArray[np.float64] | None = None,
+                 sigma: NDArray[np.float64] | None = None) -> BacktestReport:
     """Mark the positions fills produced, and charge each fill's own cost."""
     positions = positions_from_fills(fills, drift=_drift(context, config)).values[:, :, 0]
     outcome_values = context["outcome_values"]
     valid = np.isfinite(positions) & np.isfinite(outcome_values)
+    if config.rebalance == "horizon":
+        # A held book earns its forward return ONCE, at the decision it was
+        # set: the decisions it is merely carried through are inside that same
+        # return, and booking them again would count it once per decision.
+        valid &= _formations(context)[:, None]
     gross = np.where(valid, positions * outcome_values, 0.0).sum(axis=1)
     quantity = fills.quantity[:, :, 0]
     traded = quantity != 0
@@ -376,13 +623,25 @@ def _score_fills(context: dict, fills, config: BacktestConfig, *,
         slippage = np.where(traded, (fills.price[:, :, 0] - fills.mid_price[:, :, 0])
                             / fills.mid_price[:, :, 0], 0.0)
     costs = (quantity * slippage).sum(axis=1)
+    fees = None
+    if config.fees:
+        # Fees are billed on the quantity each fill actually traded, beside
+        # its slippage rather than inside its price (see the execution
+        # module), so cost is still exactly slippage plus fees.
+        fees = fee_cost(quantity, _share_price(context, config), **config.fees).sum(axis=1)
+        costs = costs + fees
     return _report(context, config, gross, costs, np.abs(quantity), positions,
-                   with_series=with_series)
+                   with_series=with_series, alpha=alpha, sigma=sigma, fees=fees)
 
 
 def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_asset,
-            values, *, with_series: bool) -> BacktestReport:
-    """Annualize a profit path and summarize it, with the IC where there is a forecast."""
+            values, *, with_series: bool, alpha: NDArray[np.float64] | None = None,
+            sigma: NDArray[np.float64] | None = None, fees=None) -> BacktestReport:
+    """Annualize a profit path and summarize it, with the IC where there is a forecast.
+
+    ``fees`` is the per-decision part of ``costs`` that is fees, folded into
+    periods the same way, or None when the configuration charges none.
+    """
     mu, spread, day = context["mu"], context["spread"], context["day"]
     net = gross - costs
 
@@ -393,11 +652,23 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
             [series[order][a:b].sum() for a, b in zip(edges[:-1], edges[1:])]
         )
         gross, net, costs_series = fold(gross), fold(net), fold(costs)
+        fee_series = None if fees is None else fold(fees)
         # One label per folded period, in the same order as the folded series.
         period_labels = context["day_labels"][order][edges[:-1]]
         periods_per_year = 252.0
+    elif config.rebalance == "horizon":
+        # One period per held book: the decisions it is carried through are
+        # folded into the one at which it was set, which labels the period.
+        block = np.cumsum(_formations(context)) - 1
+        edges = np.flatnonzero(np.r_[True, block[1:] != block[:-1], True])
+        fold = lambda series: np.add.reduceat(series, edges[:-1])
+        gross, net, costs_series = fold(gross), fold(net), fold(costs)
+        fee_series = None if fees is None else fold(fees)
+        period_labels = np.asarray(context["decisions"])[edges[:-1]]
+        periods_per_year = (len(edges) - 1) / max(len(np.unique(day)), 1) * 252.0
     else:
         costs_series = costs
+        fee_series = fees
         period_labels = np.asarray(context["decisions"])
         periods_per_year = (context["n_decisions"]
                             / max(len(np.unique(day)), 1)) * 252.0
@@ -413,6 +684,17 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         ic = grouped_rank_ic(np.where(screened, mu, np.nan), context["outcome_values"],
                              min_assets=2)
         ic_mean, ic_se = float(ic.mean), float(ic.standard_error)
+    # THE TC READS THE SAME SCREENED NAMES AS THE IC, so the two factors of the
+    # fundamental law are measured over one cross-section. The positions are
+    # the HELD ones, with roundoff residue zeroed under the same threshold as
+    # ``mean_names_held``: a book that returned to flat is flat, not a vector of
+    # ulps whose correlation with the forecast is noise. NaN is the module
+    # constant, not a fresh float, so two NaN reports compare equal as rows.
+    tc = np.nan
+    if mu is not None and alpha is not None and sigma is not None:
+        held = np.where(np.isfinite(values) & (np.abs(values) <= 1e-12), 0.0, values)
+        mean = transfer_coefficient(held, alpha, sigma, eligible=screened).mean
+        tc = float(mean) if np.isfinite(mean) else np.nan
     return BacktestReport(
         config=config, horizon=context["horizon"],
         information_coefficient=ic_mean,
@@ -428,10 +710,13 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         # A position is a holding above roundoff: a path of fills that returns
         # to flat leaves a weight of a few ulps, not a name held.
         mean_names_held=float((np.abs(values) > 1e-12).sum(axis=1).mean()),
+        transfer_coefficient=tc,
         series=PnLSeries(
             periods=period_labels.astype(str),
             gross=gross.copy(), net=net.copy(), cost=costs_series.copy(),
+            fee=None if fee_series is None else fee_series.copy(),
         ) if with_series else None,
+        mean_fee_bps=None if fee_series is None else float(np.nanmean(fee_series) * 1e4),
     )
 
 
@@ -454,7 +739,8 @@ def _check_axes(config: BacktestConfig, market: MarketData, source) -> None:
     if isinstance(source, ForwardReturns):
         check_config(config, market)
     else:
-        check_config(config.replace(universe="all"), market)
+        check_config(config.replace(universe="all", alpha=None, alpha_ic=None,
+                                    neutralize=None), market)
 
 
 def run_backtest(
@@ -482,8 +768,8 @@ def run_backtest(
     ``train``, the embeddings and realized returns to fit ``probe`` on (a
     default :class:`RidgeProbe` if not given), and also serve the
     ``embedding`` risk model. Below the forecast only the trading axes apply:
-    ``cost_model``, ``efq``, ``equity``, ``rebalance`` (weights only) and
-    ``annualization``.
+    ``cost_model``, ``efq``, ``equity``, the fees, ``rebalance`` (weights
+    only) and ``annualization``.
 
     A forecast must already be in the units the realized returns are in; a
     rank-unit forecast traded against a return-unit spread would make the cost
@@ -540,8 +826,11 @@ def run_backtest(
         context["efq"] = np.broadcast_to(_efq_array(efq), (context["n_decisions"], context["n_assets"]))
     if isinstance(source, ForwardReturns):
         sigma = _risk(context, config, history, realized, embeddings, horizon_index)
-        return _score(context, _weights(context, config, sigma), config,
-                      with_series=with_series)
+        if config.neutralize in ("beta", "beta_industry"):
+            _beta(context, history, realized)
+        weights, alpha = _book(context, config, sigma)
+        return _score(context, weights, config, with_series=with_series,
+                      alpha=alpha, sigma=sigma)
     if isinstance(source, PortfolioWeights):
         return _score(context, source.values[:, :, horizon_index], config,
                       with_series=with_series)
@@ -633,7 +922,10 @@ def sweep_configs(
     # book vary fastest -- as they do in enumerate_configs -- and merely
     # recomputes on an unlucky ordering rather than exhausting memory.
     risk_cache: dict[tuple, NDArray[np.float64]] = {}
-    book_cache: "OrderedDict[tuple, NDArray[np.float64]]" = OrderedDict()
+    # Each entry is a book AND the transformed forecast it was built from, so
+    # a reused book reports the transfer coefficient its first solve would.
+    book_cache: "OrderedDict[tuple, tuple[NDArray[np.float64], NDArray[np.float64]]]" = (
+        OrderedDict())
     reports = []
     for config in configs:
         try:
@@ -642,17 +934,20 @@ def sweep_configs(
                 risk_cache[risk_key] = _risk(
                     context, config, history, realized, embeddings, horizon_index
                 )
-            book_key = tuple(getattr(config, axis) for axis in _BOOK_AXES)
+            if config.neutralize in ("beta", "beta_industry"):
+                _beta(context, history, realized)
+            book_key = _book_key(config)
             if book_key in book_cache:
                 book_cache.move_to_end(book_key)
             else:
-                book_cache[book_key] = _weights(
+                book_cache[book_key] = _book(
                     context, config, risk_cache[risk_key]
                 )
                 if len(book_cache) > book_cache_size:
                     book_cache.popitem(last=False)
-            reports.append(_score(context, book_cache[book_key], config,
-                                  with_series=with_series))
+            weights, alpha = book_cache[book_key]
+            reports.append(_score(context, weights, config, with_series=with_series,
+                                  alpha=alpha, sigma=risk_cache[risk_key]))
         except Exception:
             if on_error == "raise":
                 raise

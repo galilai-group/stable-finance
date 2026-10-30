@@ -1,0 +1,49 @@
+{
+  "name": "e10_mv_converged",
+  "description": "E1b with the converged mean-variance solver (mv_solver='restart'): the same grid, every rebalance solved to tolerance instead of stopped at 400 iterations. The difference from E1b is the solver error in the published mean-variance results. About as long as E1b: 45-60 minutes on 4 cores.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [
+    300,
+    900,
+    3600
+  ],
+  "forecasts": {
+    "kind": "oracle",
+    "ic": [
+      0.01,
+      0.03,
+      0.1
+    ],
+    "noise": [
+      "tails",
+      "middle",
+      "random"
+    ],
+    "seed": 0
+  },
+  "configs": {
+    "base": {
+      "cost_model": "cross",
+      "risk_model": "shrunk_sample",
+      "universe": "all",
+      "annualization": "decisions",
+      "weighting": "mean_variance",
+      "mv_solver": "restart"
+    },
+    "grid": {
+      "selection": [
+        "all",
+        "decile"
+      ],
+      "efq": [
+        0.0,
+        0.7
+      ],
+      "rebalance": [
+        "every_decision",
+        "horizon"
+      ]
+    }
+  }
+}

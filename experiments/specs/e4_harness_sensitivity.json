@@ -1,0 +1,54 @@
+{
+  "name": "e4_harness_sensitivity",
+  "description": "One forecast, many harnesses: risk model, neutralization, Grinold alpha and the liquidity screen, to measure how far the harness alone moves net Sharpe, with deflated Sharpe and the probability of backtest overfitting across the grid.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [
+    900
+  ],
+  "forecasts": {
+    "kind": "oracle",
+    "ic": [
+      0.02,
+      0.05
+    ],
+    "noise": [
+      "random"
+    ],
+    "seed": 0
+  },
+  "configs": {
+    "base": {
+      "cost_model": "cross",
+      "annualization": "decisions",
+      "efq": 0.7,
+      "alpha_ic": 0.03,
+      "rebalance": "horizon"
+    },
+    "grid": {
+      "weighting": [
+        "signal",
+        "hrp",
+        "mean_variance"
+      ],
+      "risk_model": [
+        "shrunk_sample",
+        "ledoit_wolf",
+        "nonlinear_shrinkage"
+      ],
+      "neutralize": [
+        null,
+        "beta"
+      ],
+      "alpha": [
+        null,
+        "grinold"
+      ],
+      "universe": [
+        "all",
+        "tight_50pct"
+      ]
+    }
+  },
+  "config_chunks": 12
+}

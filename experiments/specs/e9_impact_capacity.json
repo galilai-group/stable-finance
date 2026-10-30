@@ -1,0 +1,61 @@
+{
+  "name": "e9_impact_capacity",
+  "description": "Capacity: the impact cost model (Frazzini, Israel and Moskowitz 2018, worked over the day) at book sizes of 0.1, 1, 10 and 100 million dollars against the cross-spread model, for oracles at IC 0.03 and 0.05, signal and HRP books held for the horizon. Needs the v2 cache (it supplies adv, a causal 20-day average daily dollar volume). About 2 tasks of 20 configurations: roughly 10 minutes.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [
+    900
+  ],
+  "cache": "v2",
+  "forecasts": {
+    "kind": "oracle",
+    "ic": [
+      0.03,
+      0.05
+    ],
+    "noise": [
+      "random"
+    ],
+    "seed": 0
+  },
+  "configs": {
+    "base": {
+      "risk_model": "shrunk_sample",
+      "universe": "all",
+      "annualization": "decisions",
+      "selection": "all",
+      "rebalance": "horizon",
+      "efq": 1.0
+    },
+    "grid": {
+      "weighting": [
+        "signal",
+        "hrp"
+      ],
+      "cost_model": [
+        "cross",
+        "impact"
+      ],
+      "equity": [
+        100000.0,
+        1000000.0,
+        10000000.0,
+        100000000.0
+      ]
+    },
+    "exclude": [
+      {
+        "cost_model": "cross",
+        "equity": 100000.0
+      },
+      {
+        "cost_model": "cross",
+        "equity": 10000000.0
+      },
+      {
+        "cost_model": "cross",
+        "equity": 100000000.0
+      }
+    ]
+  }
+}

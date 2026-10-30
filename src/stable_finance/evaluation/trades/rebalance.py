@@ -23,19 +23,81 @@ so :func:`rebalance` toward the mean-variance target gives the weights
 than a target. The problem is convex and is solved by accelerated proximal
 gradient descent, whose proximal step is the trade rule itself: move toward
 the target unless the cost of the move exceeds what it buys.
+
+``risk_aversion`` may be one scalar or one value per decision. A per-decision
+``lambda_t`` lets a caller calibrate the trade-off from data available at each
+decision instead of from the whole panel; each decision's solve then uses its
+own ``lambda_t``, step size included, and a scalar is the constant special case.
+
+There are two solvers, and the choice is numerical, never a modelling one: both
+aim at the same unique optimum (the objective is strongly convex whenever
+``Sigma`` is positive definite). The default, ``solver=None``, is FISTA with a
+fixed iteration budget ``max_iter``. On a real month of about 650 names with a
+covariance whose condition number is near 1900 that budget is spent on every
+decision: FISTA's momentum makes it oscillate around the optimum of a strongly
+convex problem rather than settle, so the capped answer is an approximation
+whose error carries forward, because each decision starts from the last. It is
+kept, unchanged, because every published number was computed with it.
+
+``solver="restart"`` runs to the step tolerance instead. It is the same
+accelerated proximal gradient method with the adaptive restart of O'Donoghue
+and Candes (2015, "Adaptive restart for accelerated gradient schemes", Found.
+Comput. Math. 15:715-732): whenever the step just taken points against the
+generalized gradient, the momentum has carried the iterate past the valley
+floor and is reset. That one test recovers the linear rate an accelerated
+method has on a strongly convex problem without anyone having to supply the
+strong-convexity constant, which a shrunk covariance does not advertise. It
+also works in a metric scaled by each name's variance -- a diagonal (Jacobi)
+preconditioner, so each name takes a step sized to its own curvature rather
+than to the riskiest direction in the book. The scaled problem's condition
+number is that of the correlation matrix, about five times smaller than the
+covariance's on the real month, and the accelerated rate improves with its
+square root. The proximal step stays the per-name soft threshold, with each
+name's own step. Its iteration cap, :data:`RESTART_MAX_ITER` or ``max_iter`` if
+larger, is a safety net and not a budget: a run-to-tolerance solver capped
+low is the capped solver again. A solve that reaches it raises a
+:class:`~sklearn.exceptions.ConvergenceWarning`, and ``return_n_iter=True``
+reports every decision's iteration count.
+
+Measured on August 2020 (646 names, 1638 decisions, ``experiments.mv_solver``):
+the default spends all 400 iterations at every decision and lands up to 6e-3
+in weight (median 3e-4) from the optimum given the same previous book; the
+restart solver meets the tolerance at every decision in 167 to 497
+iterations, within 4e-8 of that optimum, in slightly less time in total.
 """
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from numpy.typing import ArrayLike
 from sklearn.base import BaseEstimator
-from sklearn.exceptions import NotFittedError
+from sklearn.exceptions import ConvergenceWarning, NotFittedError
 
 from stable_finance.dataset.market import MarketData, market_quantity, requires
+from stable_finance.evaluation.portfolio.construction import _per_decision_risk_aversion
 from stable_finance.evaluation.portfolio.contract import PortfolioWeights
 from stable_finance.evaluation.portfolio.risk import estimate_covariance
 from stable_finance.evaluation.returns.contract import ForwardReturns
+
+__all__ = [
+    "REBALANCE_SOLVERS",
+    "RESTART_MAX_ITER",
+    "MeanVarianceAllocator",
+    "allocate",
+    "rebalance",
+]
+
+#: The named alternatives to the default solver (``solver=None``, FISTA with a
+#: fixed budget). ``"restart"`` is accelerated proximal gradient with adaptive
+#: restart in a variance-scaled metric, run until the step falls below ``tol``.
+REBALANCE_SOLVERS = ("restart",)
+
+#: The least iteration cap the ``"restart"`` solver runs under. On the real
+#: month it converges in a few hundred iterations per decision; the cap exists
+#: only so a pathological input cannot loop for ever.
+RESTART_MAX_ITER = 20000
 
 
 def _soft_threshold(values: np.ndarray, threshold: np.ndarray) -> np.ndarray:
@@ -52,12 +114,17 @@ def _rebalance(
     step: float,
     max_iter: int,
     tol: float,
-) -> np.ndarray:
-    """Solve one rebalance with FISTA; the cost term is handled by its prox."""
+) -> tuple[np.ndarray, int]:
+    """Solve one rebalance with FISTA; the cost term is handled by its prox.
+
+    Returns the weights and the number of iterations run, which is
+    ``max_iter`` when the budget ran out.
+    """
     weights = previous.copy()
     momentum = previous.copy()
     t = 1.0
-    for _ in range(max_iter):
+    iterations = 0
+    for iterations in range(1, max_iter + 1):
         gradient = risk_aversion * (sigma @ momentum) - mu
         proposal = momentum - step * gradient
         # Proximal step for cost * |w - previous|: shrink the trade toward
@@ -69,7 +136,77 @@ def _rebalance(
         weights, t = updated, t_next
         if converged:
             break
-    return weights
+    return weights, iterations
+
+
+def _rebalance_restart(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    previous: np.ndarray,
+    cost: np.ndarray,
+    *,
+    risk_aversion: float,
+    step: np.ndarray,
+    max_iter: int,
+    tol: float,
+) -> tuple[np.ndarray, int, bool]:
+    """Solve one rebalance to tolerance: accelerated proximal gradient with restart.
+
+    ``step`` holds one step per name, ``1 / (lambda * L_D * d_i)`` with ``d``
+    the variance scaling and ``L_D`` the largest eigenvalue of the scaled
+    covariance, so ``diag(1 / step)`` dominates the Hessian ``lambda * Sigma``
+    and the quadratic model each step minimises lies above the objective,
+    which is what the convergence argument needs. In that metric the cost's
+    proximal step is still a soft threshold, at ``step_i * cost_i`` per name.
+
+    The restart test is O'Donoghue and Candes' gradient scheme: reset the
+    momentum when the generalized gradient ``(momentum - updated) / step``
+    has a positive inner product with the step just taken. It is chosen over
+    their function-value scheme because it needs no extra product with
+    ``Sigma`` and because, near the optimum, it compares quantities of the size
+    of the step rather than objective values that agree to machine precision.
+
+    Returns the weights, the iterations run, and whether the step fell below
+    ``tol`` within ``max_iter``.
+    """
+    weights = previous.copy()
+    momentum = previous.copy()
+    t = 1.0
+    for iteration in range(1, max_iter + 1):
+        gradient = risk_aversion * (sigma @ momentum) - mu
+        proposal = momentum - step * gradient
+        updated = previous + _soft_threshold(proposal - previous, step * cost)
+        change = updated - weights
+        if np.max(np.abs(change)) < tol:
+            return updated, iteration, True
+        if np.dot((momentum - updated) / step, change) > 0.0:
+            # The momentum overshot: restart from the current iterate.
+            t, momentum = 1.0, updated
+        else:
+            t_next = (1.0 + np.sqrt(1.0 + 4.0 * t * t)) / 2.0
+            momentum = updated + ((t - 1.0) / t_next) * change
+            t = t_next
+        weights = updated
+    return weights, max_iter, False
+
+
+def _check_solver(solver: str | None) -> None:
+    if solver is not None and solver not in REBALANCE_SOLVERS:
+        raise ValueError(f"solver={solver!r} is not None or one of {REBALANCE_SOLVERS}")
+
+
+def _variance_scaled_curvature(sigma: np.ndarray, largest: float) -> tuple[np.ndarray, float]:
+    """The restart solver's metric: each name's variance, and the scaled curvature.
+
+    A name with no variance keeps the unscaled metric (``largest``); any
+    positive scale is valid, since the step is derived from the scaled
+    matrix's own largest eigenvalue.
+    """
+    variance = np.diag(sigma)
+    scale = np.where(variance > 0, variance, largest)
+    root = np.sqrt(scale)
+    curvature = float(np.linalg.eigvalsh(sigma / np.outer(root, root)).max())
+    return scale, curvature
 
 
 def _broadcast_cost(
@@ -107,18 +244,26 @@ def _broadcast_initial(
     return array
 
 
-def _track(signal: np.ndarray, covariance: ArrayLike, *, risk_aversion: float, cost,
-           initial, max_iter: int, tol: float) -> np.ndarray:
-    """Every decision's rebalance, in order, from ``signal = risk_aversion * Sigma @ w*``.
+def _track(signal: np.ndarray, covariance: ArrayLike, *, risk_aversion: float | ArrayLike,
+           cost, initial, max_iter: int, tol: float, solver: str | None = None
+           ) -> tuple[np.ndarray, np.ndarray]:
+    """Every decision's rebalance, in order, from ``signal = lambda_t * Sigma @ w*``.
 
     ``signal`` is ``(n_decisions, n_assets, n_horizons)``: the forecast itself
     for :func:`allocate`, and the target's implied forecast for
     :func:`rebalance`. Decisions are solved in order, each from the weights
-    chosen at the previous one.
+    chosen at the previous one. ``risk_aversion`` is a scalar or one
+    ``lambda_t`` per decision; the proximal step ``1 / (lambda_t * L)``, with
+    ``L`` the covariance's largest eigenvalue, is that decision's own, since
+    the gradient's Lipschitz constant scales with ``lambda_t``.
+
+    ``solver="restart"`` scales that step per name by its variance (see
+    :func:`_rebalance_restart`). Returns the weights and each decision's
+    iteration count, ``(n_decisions, n_horizons)``.
     """
-    if risk_aversion <= 0:
-        raise ValueError("risk_aversion must be positive")
+    _check_solver(solver)
     n_decisions, n_assets, n_horizons = signal.shape
+    aversion = _per_decision_risk_aversion(risk_aversion, n_decisions)
     sigma = np.asarray(covariance, dtype=np.float64)
     if sigma.shape != (n_horizons, n_assets, n_assets):
         raise ValueError(
@@ -130,19 +275,41 @@ def _track(signal: np.ndarray, covariance: ArrayLike, *, risk_aversion: float, c
     costs = _broadcast_cost(cost, (n_decisions, n_assets))
     previous = _broadcast_initial(initial, (n_assets, n_horizons))
     weights = np.empty_like(signal)
+    iterations = np.zeros((n_decisions, n_horizons), dtype=np.int64)
+    cap = max(int(max_iter), RESTART_MAX_ITER)
+    unconverged = 0
     for horizon in range(n_horizons):
         largest = float(np.linalg.eigvalsh(sigma[horizon]).max())
         if largest <= 0:
             raise ValueError("covariance must have positive variance")
-        step = 1.0 / (risk_aversion * largest)
+        if solver == "restart":
+            scale, curvature = _variance_scaled_curvature(sigma[horizon], largest)
         held = previous[:, horizon]
         for decision in range(n_decisions):
-            held = _rebalance(
-                signal[decision, :, horizon], sigma[horizon], held, costs[decision],
-                risk_aversion=risk_aversion, step=step, max_iter=max_iter, tol=tol,
-            )
+            lam = float(aversion[decision])
+            if solver == "restart":
+                held, used, converged = _rebalance_restart(
+                    signal[decision, :, horizon], sigma[horizon], held, costs[decision],
+                    risk_aversion=lam, step=1.0 / (lam * curvature * scale),
+                    max_iter=cap, tol=tol,
+                )
+                unconverged += not converged
+            else:
+                held, used = _rebalance(
+                    signal[decision, :, horizon], sigma[horizon], held, costs[decision],
+                    risk_aversion=lam, step=1.0 / (lam * largest),
+                    max_iter=max_iter, tol=tol,
+                )
             weights[decision, :, horizon] = held
-    return weights
+            iterations[decision, horizon] = used
+    if unconverged:
+        warnings.warn(
+            f"the restart solver reached its cap of {cap} iterations before the step "
+            f"fell below tol={tol} on {unconverged} of {n_decisions * n_horizons} "
+            "decisions; their weights are approximate. Raise max_iter or tol.",
+            ConvergenceWarning, stacklevel=3,
+        )
+    return weights, iterations
 
 
 @requires("half_spread")
@@ -150,32 +317,49 @@ def rebalance(
     target: PortfolioWeights,
     covariance: ArrayLike,
     *,
-    risk_aversion: float = 1.0,
+    risk_aversion: float | ArrayLike = 1.0,
     cost: ArrayLike | MarketData | None = None,
     initial: ArrayLike | None = None,
     max_iter: int = 1000,
     tol: float = 1e-10,
-) -> PortfolioWeights:
+    solver: str | None = None,
+    return_n_iter: bool = False,
+) -> PortfolioWeights | tuple[PortfolioWeights, np.ndarray]:
     """The weights actually held, moving toward ``target`` only as far as cost allows.
 
     ``target`` is the frictionless holding at each decision, such as
     :func:`~stable_finance.evaluation.portfolio.construction.mean_variance_target`.
     ``covariance`` (``(n_horizons, n_assets, n_assets)``) prices the tracking
-    error and ``risk_aversion`` its weight against cost. ``cost`` broadcasts to
+    error and ``risk_aversion`` its weight against cost: one positive scalar,
+    or a 1-D array with one ``lambda_t`` per decision, which should match the
+    one the target was built with. ``cost`` broadcasts to
     ``(n_decisions, n_assets)``; NaN marks an asset that cannot be traded at
     that decision and holds its previous weight. ``initial`` broadcasts to
     ``(n_assets, n_horizons)`` and defaults to cash. A missing target is a
     target of zero. ``cost=None`` moves straight to the target.
+
+    ``solver=None`` is FISTA stopped after ``max_iter`` iterations or once the
+    largest weight change in an iteration falls below ``tol``, whichever is
+    first; ``solver="restart"`` runs accelerated proximal gradient with
+    adaptive restart until that change falls below ``tol``, under a cap of
+    ``max(max_iter, RESTART_MAX_ITER)`` (see the module docstring). With
+    ``return_n_iter=True`` the result is ``(weights, n_iter)``, ``n_iter``
+    holding the iterations each decision's solve ran, ``(n_decisions,
+    n_horizons)``: under the default solver a count equal to ``max_iter``
+    means the budget, not the tolerance, ended the solve.
     """
+    _check_solver(solver)
     cost = market_quantity(cost, "half_spread", stage=rebalance, like=target)
     sigma = np.asarray(covariance, dtype=np.float64)
     goal = np.nan_to_num(target.values, nan=0.0)
     if sigma.shape[0] != goal.shape[2]:
         raise ValueError("covariance must have one matrix per horizon")
-    signal = risk_aversion * np.einsum("hij,djh->dih", sigma, goal)
-    weights = _track(signal, sigma, risk_aversion=risk_aversion, cost=cost, initial=initial,
-                     max_iter=max_iter, tol=tol)
-    return PortfolioWeights(weights, target.decisions, target.assets, target.horizons)
+    aversion = _per_decision_risk_aversion(risk_aversion, goal.shape[0])
+    signal = aversion[:, None, None] * np.einsum("hij,djh->dih", sigma, goal)
+    weights, n_iter = _track(signal, sigma, risk_aversion=aversion, cost=cost,
+                             initial=initial, max_iter=max_iter, tol=tol, solver=solver)
+    held = PortfolioWeights(weights, target.decisions, target.assets, target.horizons)
+    return (held, n_iter) if return_n_iter else held
 
 
 @requires("half_spread")
@@ -183,19 +367,22 @@ def allocate(
     forecast: ForwardReturns,
     covariance: ArrayLike,
     *,
-    risk_aversion: float = 1.0,
+    risk_aversion: float | ArrayLike = 1.0,
     cost: ArrayLike | MarketData | None = None,
     initial: ArrayLike | None = None,
     max_iter: int = 1000,
     tol: float = 1e-10,
-) -> PortfolioWeights:
+    solver: str | None = None,
+    return_n_iter: bool = False,
+) -> PortfolioWeights | tuple[PortfolioWeights, np.ndarray]:
     """Forecasts to held weights in one solve: the mean-variance target, rebalanced toward.
 
     Equivalent to ``rebalance(mean_variance_target(forecast, ...), ...)``,
     solved from the forecast directly. Decisions are rebalanced in order, each
     starting from the weights chosen at the previous decision, so the whole
     path reflects the transaction-cost trade-off. ``covariance`` has shape
-    ``(n_horizons, n_assets, n_assets)``. ``cost`` broadcasts to
+    ``(n_horizons, n_assets, n_assets)``. ``risk_aversion`` is one positive
+    scalar or a 1-D array with one ``lambda_t`` per decision. ``cost`` broadcasts to
     ``(n_decisions, n_assets)``; NaN marks an asset that cannot be traded at
     that decision and holds its previous weight. ``initial`` broadcasts to
     ``(n_assets, n_horizons)`` and defaults to cash. A missing forecast is
@@ -205,12 +392,16 @@ def allocate(
     ``cost=None`` allocates frictionlessly. :class:`MarketData` in its place
     charges the quoted half-spread (EFQ 1) and must carry one; scale it
     yourself, or pass ``trading_cost(...)``, for any other execution model.
+
+    ``solver`` and ``return_n_iter`` are as in :func:`rebalance`.
     """
+    _check_solver(solver)
     cost = market_quantity(cost, "half_spread", stage=allocate, like=forecast)
     signal = np.nan_to_num(forecast.values, nan=0.0)
-    weights = _track(signal, covariance, risk_aversion=risk_aversion, cost=cost,
-                     initial=initial, max_iter=max_iter, tol=tol)
-    return PortfolioWeights(weights, forecast.decisions, forecast.assets, forecast.horizons)
+    weights, n_iter = _track(signal, covariance, risk_aversion=risk_aversion, cost=cost,
+                             initial=initial, max_iter=max_iter, tol=tol, solver=solver)
+    held = PortfolioWeights(weights, forecast.decisions, forecast.assets, forecast.horizons)
+    return (held, n_iter) if return_n_iter else held
 
 
 class MeanVarianceAllocator(BaseEstimator):
@@ -219,7 +410,8 @@ class MeanVarianceAllocator(BaseEstimator):
     ``fit`` estimates one asset covariance per horizon from a realized-return
     history; ``predict`` solves the cost-aware mean-variance problem at every
     decision of a forecast panel, starting from the current portfolio. Bring
-    your own covariance through :func:`allocate` to skip fitting.
+    your own covariance through :func:`allocate` to skip fitting. ``solver``
+    picks the numerical method, as in :func:`allocate`.
     """
 
     def __init__(
@@ -230,12 +422,14 @@ class MeanVarianceAllocator(BaseEstimator):
         min_samples: int = 2,
         max_iter: int = 1000,
         tol: float = 1e-10,
+        solver: str | None = None,
     ) -> None:
         self.risk_aversion = risk_aversion
         self.shrinkage = shrinkage
         self.min_samples = min_samples
         self.max_iter = max_iter
         self.tol = tol
+        self.solver = solver
 
     def fit(self, returns: ForwardReturns, y: None = None) -> "MeanVarianceAllocator":
         """Estimate the per-horizon covariance from realized returns."""
@@ -268,4 +462,5 @@ class MeanVarianceAllocator(BaseEstimator):
             initial=initial,
             max_iter=self.max_iter,
             tol=self.tol,
+            solver=self.solver,
         )

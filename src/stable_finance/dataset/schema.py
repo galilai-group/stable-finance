@@ -5,9 +5,10 @@ SCHEMA. What the columns of a market time series mean.
 A :class:`FeatureSchema` names the physical columns of a dense session and
 says, per column, how gaps are filled, how bars are aggregated to a coarser
 resolution, and which columns are normalized together. It also maps columns
-to ROLES -- ``mid``, ``vwap``, ``bid_price``, ``volume`` and so on -- which is
-how every target, view builder and execution input finds what it needs without
-knowing any dataset's column names.
+to ROLES -- ``mid``, ``vwap``, ``bid_price``, ``volume`` and so on, and the
+per-name attributes ``market_cap`` and ``industry`` -- which is how every
+target, view builder and execution input finds what it needs without knowing
+any dataset's column names.
 
 No role is required. A schema with only a ``mid`` column is a univariate
 price series, and it supports exactly the quantities a price series can
@@ -64,6 +65,17 @@ AGGREGATIONS = frozenset({"first", "last", "max", "min", "sum", "mean", "vwap"})
 #: from :meth:`FeatureSchema.from_roles`: (aggregation, fill, normalization
 #: group, log1p before normalizing). ``fill`` is ``ffill`` for a level that
 #: persists between observations and ``zero`` for a flow that did not happen.
+#:
+#: ``market_cap`` and ``industry`` describe the firm rather than its trading,
+#: and are constant within a day. ``industry`` is a numeric label (a
+#: Fama-French 49 number, a GICS code, anything that names groups), NaN where
+#: it is not known: only equality between codes means anything, as in the
+#: industry neutralization of
+#: :mod:`stable_finance.evaluation.portfolio.signals`. So it is never a
+#: weighted or summed quantity -- a coarser bar keeps the ``last`` code, a gap
+#: carries it forward -- it takes no log, and it is standardized in a group of
+#: its own, where a code that does not change within a view standardizes to
+#: zero rather than mixing with a magnitude.
 ROLE_DEFAULTS: dict[str, tuple[str, str, str, bool]] = {
     "mid": ("last", "ffill", "price", False),
     "open": ("first", "ffill", "price", False),
@@ -78,10 +90,12 @@ ROLE_DEFAULTS: dict[str, tuple[str, str, str, bool]] = {
     "volume": ("sum", "zero", "trade_size", True),
     "n_trades": ("sum", "zero", "trade_count", True),
     "market_cap": ("last", "ffill", "market_cap", True),
+    "industry": ("last", "ffill", "classification", False),
 }
 ROLES = tuple(ROLE_DEFAULTS)
 
-_GROUP_ORDER = ("price", "order_book_size", "trade_size", "trade_count", "market_cap")
+_GROUP_ORDER = ("price", "order_book_size", "trade_size", "trade_count", "market_cap",
+                "classification")
 
 
 class MissingRolesError(ValueError):
