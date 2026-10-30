@@ -26,6 +26,50 @@ runs the downstream adapters and metrics you ask for.
 
 ## Where things live
 
+Multi-horizon additions reuse the existing constructors:
+`combine_horizon_targets` combines their `(decision, asset, horizon)` targets
+into one current net book with fixed capital fractions. An optional
+`construct_joint_portfolio` exposes experimental cross-interval-risk planning.
+Neither trains a forecast model or changes the existing cost/execution path.
+See [the additive multi-horizon guide](docs/multi_horizon_extension.md) and
+`examples/multi_horizon.py` for a minimal native-pipeline example.
+
+`portfolio_exposure_report` checks the supplied final weight book for beta,
+industry exposure, concentration and declared constraint violations. It
+works on single-horizon, per-horizon and combined current targets without
+changing their weights. See [the exposure-report guide](docs/portfolio_exposure_report.md)
+and `examples/portfolio_exposure.py`.
+
+`solve_constrained_rebalance` tracks a supplied net target from current actual
+and pending holdings, with explicit beta, gross, net and name limits. Missing
+trading costs or untradable quotes freeze committed positions, and infeasibility
+is reported explicitly. `execution_attribution` and `paired_execution_attribution`
+allocate realized costs, P&L, turnover and beta changes by stock. See
+[the constrained-tracking guide](docs/constrained_trade_tracking.md) for
+actual-state accounting and the policy's capital-use limitations.
+
+`solve_return_risk_rebalance` retains the supplied original forecast reward
+and full interval-major covariance through the trades stage. It jointly
+reoptimizes all reference intervals, charges only the current net order and
+emits only the current book. `K=1` is the original single-horizon objective.
+See [the preserved-return-objective guide](docs/preserved_return_objectives.md)
+for the original objective handoff and its distinction from target tracking.
+
+To run that objective natively, call `run_backtest(forecast_panel, price_marks,
+objective=ReturnRiskBacktestSpec(...), execution_state=BacktestExecutionState(...))`.
+This explicit path carries original single/joint forecasts, causal risk,
+constraints and actual/pending physical execution state together. Omitting
+`objective` preserves the existing backtest behavior. See
+[the native integration guide](docs/native_return_risk_backtest.md) and the
+self-contained `examples/native_return_risk_backtest.py`.
+
+`FactorExposureConstraints` supplies named linear exposure budgets to the
+constrained single/joint portfolio path, trade solvers and native backtest.
+The same contract also reports target or actual factor exposures. Existing
+beta limits remain supported; supplied generic limits intersect them. See
+[the generic-factor guide](docs/generic_factor_constraints.md) and
+`examples/generic_factor_constraints.py` for a deterministic end-to-end example.
+
 ```text
 src/stable_finance/
   evaluation/              the pipeline, one package per stage
@@ -34,11 +78,12 @@ src/stable_finance/
                            streamed) and oracle forecasts
     portfolio/             stage 3: the target portfolio, as if trading were free;
                            risk.py (risk management: universe screens and the risk
-                           model) and construction.py (selection and weighting, or
-                           the mean-variance target)
+                           model), signals.py (alpha refinement and neutralization)
+                           and construction.py (selection and weighting, or the
+                           mean-variance target)
     trades/                stage 4: trading policies, how far to move given costs;
-                           rebalance and trade rules, and rl/ reserved for learned
-                           policies
+                           rebalance and trade rules, and rl/ for learned policies
+                           (parametric.py, the first)
     scoring/               stage 5: how good each output is; ic.py (forecast IC),
                            pnl.py (positions and P&L), sharpe.py (Sharpe, EFQ curves)
     config.py, backtest.py the harness: one named configuration, entered at any level
@@ -169,6 +214,24 @@ the positive semidefinite cone. A NaN cost marks an asset that cannot be
 traded at that decision, so it holds its previous weight; a NaN forecast is a
 zero expected return that still pays risk and cost.
 
+`trades.rl` holds policies learned for their net-of-cost performance rather
+than written by hand. The first, `ParametricPolicy`, follows Brandt,
+Santa-Clara and Valkanov (2009) with a learned partial-adjustment rate
+(DeMiguel et al., 2020): the target is a dollar-neutral blend `X_t @ theta`
+of characteristics (forecasts at several horizons, say), the held book moves
+a fraction `eta` of the way there each decision, and `theta` and `eta` are
+chosen by full-batch gradient ascent on mean net return minus a variance
+penalty, from a fixed start for a fixed number of steps, so a fit is
+deterministic.
+
+```python
+from stable_finance import ParametricPolicy
+
+policy = ParametricPolicy(gross_exposure=2.0, risk_aversion=5.0).fit(
+    train_forecasts, train_returns, cost=train_market)
+held = policy.predict(test_forecasts, cost=test_market)    # PortfolioWeights
+```
+
 Orders are the weight changes along a target path; fills are what executed:
 
 ```python
@@ -260,6 +323,25 @@ shrunk towards the cross-sectional mean by `scale`, which defaults to `|ic|`
 dispersion, which a cost-aware allocator or `edge_to_cost` reads as an edge
 `1 / IC` times too large; `scale=1.0` gives it anyway.
 
+`ic` may be one value per horizon, as a real forecast decays with the
+horizon. `persistence=k` replays the same draws for `k` consecutive
+decisions (restarting each day when `days` is given), so the same rank
+positions stay wrong while the truth underneath them moves; each decision's
+IC keeps its distribution, and only the dependence across decisions changes.
+
+`copula_forecast` is a different model rather than a fourth mode: each name
+carries its own error, an AR(1) series across decisions with half-life
+`half_life` (restarting each day), mixed with the normal score of its
+realized rank through a Gaussian copula. Errors belong to a name rather than
+to a rank position, which is how a slow real signal is wrong, and the IC is
+hit in expectation with the same `1 / sqrt(n - 1)` scatter as `random`.
+
+```python
+from stable_finance import copula_forecast
+
+forecast = copula_forecast(realized, [0.03, 0.02, 0.01], half_life=12, days=days, seed=0)
+```
+
 ## The harness is a configuration, not a constant
 
 A Sharpe ratio is not a property of a forecast. It is a property of a forecast
@@ -296,10 +378,10 @@ predictors.
 |---|---|
 | `universe` | `all`, `tight_50pct`, `tight_25pct` — a cross-sectional screen on each name's own quoted half-spread |
 | `selection` | `all`, `quintile`, `decile`, `decile_long_only` — how much of the ranking to trade |
-| `weighting` | `mean_variance` (cost-aware, path-dependent), `equal`, `inverse_vol`, `min_var`, `erc`, `rank` |
-| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `embedding` — the last forecasts correlations from the encoder's own representation |
+| `weighting` | `mean_variance` (cost-aware, path-dependent), `equal`, `inverse_vol`, `min_var`, `erc`, `rank`, `signal` (proportional to the forecast's distance from the median), `min_var_qp` (the long-only minimum-variance optimum `min_var` approximates), `hrp` (hierarchical risk parity) |
+| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `nonlinear_shrinkage` (Ledoit and Wolf, 2020), `embedding` — the last forecasts correlations from the encoder's own representation |
 | `cost_model` | `mid`, `cross` — free, or the name's own quoted half-spread times `efq` |
-| `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it |
+| `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it; `horizon` is outside the default space (see below) |
 | `annualization` | `decisions`, `daily` — whether every decision is an independent period |
 
 `efq` is the continuous cost axis, and `trading_cost` takes it as `multiple`.
@@ -319,6 +401,85 @@ point rather than reporting one portfolio several times: a book that ignores
 the covariance appears under one risk model, and equal-risk-contribution on a
 diagonal model is inverse-volatility, so it is not also counted as its own
 option.
+
+`enumerate_configs` sweeps any `BacktestConfig` field given a list or tuple
+of options and pins any field given one value, so a setting outside the
+default space is swept the same way, as in
+`enumerate_configs(neutralize=(None, "beta"), rebalance=("every_decision", "horizon"))`.
+Two such settings are unset by default, so the default space and every label
+in it are unchanged:
+
+| Setting | Options |
+|---|---|
+| `alpha` | `"grinold"` or `"grinold_rank"`, with `alpha_ic` — rescale the forecast to `alpha_ic * sigma * z` before construction, `z` the cross-sectional z-score or, for `grinold_rank`, the Gaussian rank score |
+| `neutralize` | `"beta"`, `"industry"`, `"beta_industry"` — residualise the forecast on those exposures before construction |
+
+### Signal transforms
+
+A forecast and the portfolio built from it need not say the same thing.
+`refine_alpha` puts a forecast in return units with Grinold's (1994) rule,
+`alpha = IC * sigma * z`: a probe fit against a rank target, or any score, is
+not in the units of a covariance or a spread, and mean-variance sizing and
+the edge-to-cost rules compare the forecast with both. `neutralize` takes the
+per-decision cross-sectional residual of the forecast on an intercept and the
+chosen exposures, so the book cannot express a market or industry bet the
+forecast never meant to make. Beta is estimated from the risk history against
+the equal-weighted mean of the panel (`estimate_beta`), so it needs no index
+and runs on any data. The industry is a column role, `industry`, a numeric
+code per name like `market_cap`; Market-1T supplies it as the Fama-French 49
+code through `market_from_days(..., industry_map=...)`, reading the map that
+`sf-industry-map` writes. The IC is always measured on the
+raw forecast: the transforms change what the portfolio expresses, not what
+the model predicted.
+
+```python
+from stable_finance import BacktestConfig, refine_alpha, neutralize
+
+config = BacktestConfig(alpha="grinold", alpha_ic=0.05, neutralize="beta_industry")
+alpha = refine_alpha(scores, volatility, ic=0.05, score="gauss_rank")
+```
+
+### Scoring a long-horizon forecast
+
+Every decision books its forward return, `w_t . r(t, t + h)`. That is right
+when the horizon equals the spacing between decisions. When it is longer,
+consecutive returns overlap and each move is counted about `h / spacing`
+times. A 3600-second forecast on a 300-second grid would be counted twelve
+times over, while its turnover is charged once. `rebalance="horizon"` scores
+such a forecast without the overlap: each book is set once per horizon
+(restarting each day), carried until the next, and its forward return is
+booked once. The harness reads the horizon from the forecast and the spacing
+from the decisions, which must say when they are: epoch seconds, as
+`evaluation_inputs` writes them, or Market-1T's `"date|anchor"` labels. It is
+not the default, so existing results do not move; use it whenever the horizon
+is longer than the decision spacing. It is refused with `holding="drift"`,
+which already carries each position on one-step returns.
+
+```python
+report = run_backtest(forecast, realized, market=market, days=days,
+                      config=config.replace(rebalance="horizon"))
+```
+
+The mean-variance allocator sizes its book with one risk aversion per
+decision, from the forecasts up to that decision. A forecast made later never
+resizes a book already held.
+
+### How much of the forecast reached the book
+
+`BacktestReport.transfer_coefficient` is Clarke, de Silva and Thorley's
+(2002) transfer coefficient, the cosine between the risk-weighted positions
+`Sigma^(1/2) w` and the risk-adjusted forecast `Sigma^(-1/2) alpha`, averaged
+over decisions: 1 for frictionless mean-variance on its own forecast, and
+lower as selection, constraints and costs take the book away from it.
+`transfer_coefficient(weights, alpha, covariance)` computes it on any book,
+and it is NaN for a run entered below the forecast level.
+
+`scoring.stats` holds the statistics for comparing many backtests, all in
+closed form: `probabilistic_sharpe` and `min_track_record` (Bailey and López
+de Prado, 2012), `deflated_sharpe` for the best of `n_trials` (2014), `pbo`,
+the probability of backtest overfitting by combinatorially symmetric
+cross-validation over every split (Bailey et al., 2017), and
+`sharpe_difference`, a HAC test of two Sharpe ratios (Ledoit and Wolf, 2008).
 
 ## Is the forecast worth its spread?
 
@@ -529,6 +690,7 @@ refuses with `MissingRolesError` when a column is absent:
 | fills through the book (`cost_model="book"`) | `book_bid_price`, `book_bid_size`, `book_ask_price`, `book_ask_size` |
 | the impact model (`cost_model="impact"`) | `adv`, average daily dollar volume |
 | the stock-specific impact model (`cost_model="impact_stock"`) | `adv`, `market_cap`, `idio_vol`, `market_vol`, `time_trend` |
+| industry neutralization (`neutralize="industry"` or `"beta_industry"`) | `industry` |
 | limit orders, any model but `impact` | `window_best_buy` and `window_best_sell`, and a decision price |
 | `cross_spread_sharpe` | `bid_price` and `ask_price` |
 
@@ -641,7 +803,7 @@ no price, and the return is NaN rather than a guess.
 
 **Roles decide what is possible downstream.** The roles are `mid`, `open`,
 `high`, `low`, `close`, `vwap`, `volume`, `n_trades`, `bid_price`,
-`ask_price`, `bid_size`, `ask_size` and `market_cap`. None is required. Every target family
+`ask_price`, `bid_size`, `ask_size`, `market_cap` and `industry`. None is required. Every target family
 and every stage declares the roles it needs. A univariate series gets returns
 and frictionless portfolios, and a backtest that charges the spread is
 refused with `MissingRolesError` naming the missing columns. Bars without
@@ -737,6 +899,9 @@ Use `uv` exclusively:
 uv sync
 uv run pytest
 ```
+
+The constrained joint/trade examples and their tests require the numerical
+extra: run `uv sync --extra joint` before `uv run pytest` for the full suite.
 
 ## Migration plan
 

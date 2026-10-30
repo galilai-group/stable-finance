@@ -81,7 +81,9 @@ ADV = "adv"
 #: dataset role, in the market's currency.
 CHARACTERISTICS = ("idio_vol", "market_vol", "time_trend")
 
-#: Quantities a stage can require of the market: every dataset role, the
+#: Quantities a stage can require of the market: every dataset role -- which
+#: includes the per-name ``market_cap`` and ``industry`` (a numeric group
+#: label, see :data:`~stable_finance.dataset.schema.ROLE_DEFAULTS`) -- the
 #: half-spread over mid (quoted, or estimated from bars), average daily
 #: dollar volume, the characteristics, depth, and the execution-window
 #: extremes.

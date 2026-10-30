@@ -23,6 +23,11 @@ so :func:`rebalance` toward the mean-variance target gives the weights
 than a target. The problem is convex and is solved by accelerated proximal
 gradient descent, whose proximal step is the trade rule itself: move toward
 the target unless the cost of the move exceeds what it buys.
+
+``risk_aversion`` may be one scalar or one value per decision. A per-decision
+``lambda_t`` lets a caller calibrate the trade-off from data available at each
+decision instead of from the whole panel; each decision's solve then uses its
+own ``lambda_t``, step size included, and a scalar is the constant special case.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from sklearn.base import BaseEstimator
 from sklearn.exceptions import NotFittedError
 
 from stable_finance.dataset.market import MarketData, market_quantity, requires
+from stable_finance.evaluation.portfolio.construction import _per_decision_risk_aversion
 from stable_finance.evaluation.portfolio.contract import PortfolioWeights
 from stable_finance.evaluation.portfolio.risk import estimate_covariance
 from stable_finance.evaluation.returns.contract import ForwardReturns
@@ -107,18 +113,20 @@ def _broadcast_initial(
     return array
 
 
-def _track(signal: np.ndarray, covariance: ArrayLike, *, risk_aversion: float, cost,
-           initial, max_iter: int, tol: float) -> np.ndarray:
-    """Every decision's rebalance, in order, from ``signal = risk_aversion * Sigma @ w*``.
+def _track(signal: np.ndarray, covariance: ArrayLike, *, risk_aversion: float | ArrayLike,
+           cost, initial, max_iter: int, tol: float) -> np.ndarray:
+    """Every decision's rebalance, in order, from ``signal = lambda_t * Sigma @ w*``.
 
     ``signal`` is ``(n_decisions, n_assets, n_horizons)``: the forecast itself
     for :func:`allocate`, and the target's implied forecast for
     :func:`rebalance`. Decisions are solved in order, each from the weights
-    chosen at the previous one.
+    chosen at the previous one. ``risk_aversion`` is a scalar or one
+    ``lambda_t`` per decision; the proximal step ``1 / (lambda_t * L)``, with
+    ``L`` the covariance's largest eigenvalue, is that decision's own, since
+    the gradient's Lipschitz constant scales with ``lambda_t``.
     """
-    if risk_aversion <= 0:
-        raise ValueError("risk_aversion must be positive")
     n_decisions, n_assets, n_horizons = signal.shape
+    aversion = _per_decision_risk_aversion(risk_aversion, n_decisions)
     sigma = np.asarray(covariance, dtype=np.float64)
     if sigma.shape != (n_horizons, n_assets, n_assets):
         raise ValueError(
@@ -134,12 +142,13 @@ def _track(signal: np.ndarray, covariance: ArrayLike, *, risk_aversion: float, c
         largest = float(np.linalg.eigvalsh(sigma[horizon]).max())
         if largest <= 0:
             raise ValueError("covariance must have positive variance")
-        step = 1.0 / (risk_aversion * largest)
         held = previous[:, horizon]
         for decision in range(n_decisions):
+            lam = float(aversion[decision])
             held = _rebalance(
                 signal[decision, :, horizon], sigma[horizon], held, costs[decision],
-                risk_aversion=risk_aversion, step=step, max_iter=max_iter, tol=tol,
+                risk_aversion=lam, step=1.0 / (lam * largest),
+                max_iter=max_iter, tol=tol,
             )
             weights[decision, :, horizon] = held
     return weights
@@ -150,7 +159,7 @@ def rebalance(
     target: PortfolioWeights,
     covariance: ArrayLike,
     *,
-    risk_aversion: float = 1.0,
+    risk_aversion: float | ArrayLike = 1.0,
     cost: ArrayLike | MarketData | None = None,
     initial: ArrayLike | None = None,
     max_iter: int = 1000,
@@ -161,7 +170,9 @@ def rebalance(
     ``target`` is the frictionless holding at each decision, such as
     :func:`~stable_finance.evaluation.portfolio.construction.mean_variance_target`.
     ``covariance`` (``(n_horizons, n_assets, n_assets)``) prices the tracking
-    error and ``risk_aversion`` its weight against cost. ``cost`` broadcasts to
+    error and ``risk_aversion`` its weight against cost: one positive scalar,
+    or a 1-D array with one ``lambda_t`` per decision, which should match the
+    one the target was built with. ``cost`` broadcasts to
     ``(n_decisions, n_assets)``; NaN marks an asset that cannot be traded at
     that decision and holds its previous weight. ``initial`` broadcasts to
     ``(n_assets, n_horizons)`` and defaults to cash. A missing target is a
@@ -172,8 +183,9 @@ def rebalance(
     goal = np.nan_to_num(target.values, nan=0.0)
     if sigma.shape[0] != goal.shape[2]:
         raise ValueError("covariance must have one matrix per horizon")
-    signal = risk_aversion * np.einsum("hij,djh->dih", sigma, goal)
-    weights = _track(signal, sigma, risk_aversion=risk_aversion, cost=cost, initial=initial,
+    aversion = _per_decision_risk_aversion(risk_aversion, goal.shape[0])
+    signal = aversion[:, None, None] * np.einsum("hij,djh->dih", sigma, goal)
+    weights = _track(signal, sigma, risk_aversion=aversion, cost=cost, initial=initial,
                      max_iter=max_iter, tol=tol)
     return PortfolioWeights(weights, target.decisions, target.assets, target.horizons)
 
@@ -183,7 +195,7 @@ def allocate(
     forecast: ForwardReturns,
     covariance: ArrayLike,
     *,
-    risk_aversion: float = 1.0,
+    risk_aversion: float | ArrayLike = 1.0,
     cost: ArrayLike | MarketData | None = None,
     initial: ArrayLike | None = None,
     max_iter: int = 1000,
@@ -195,7 +207,8 @@ def allocate(
     solved from the forecast directly. Decisions are rebalanced in order, each
     starting from the weights chosen at the previous decision, so the whole
     path reflects the transaction-cost trade-off. ``covariance`` has shape
-    ``(n_horizons, n_assets, n_assets)``. ``cost`` broadcasts to
+    ``(n_horizons, n_assets, n_assets)``. ``risk_aversion`` is one positive
+    scalar or a 1-D array with one ``lambda_t`` per decision. ``cost`` broadcasts to
     ``(n_decisions, n_assets)``; NaN marks an asset that cannot be traded at
     that decision and holds its previous weight. ``initial`` broadcasts to
     ``(n_assets, n_horizons)`` and defaults to cash. A missing forecast is
