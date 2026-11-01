@@ -1,0 +1,18 @@
+{
+  "name": "e5_real_signals",
+  "description": "Real, cheap intraday forecasts (15-minute reversal, ridge and LASSO on twelve causal features, fit on July and applied to August) through the same constructions as the oracles, to place them on the oracle's IC-to-Sharpe map.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [300, 900, 1800],
+  "forecasts": {"kind": "file", "paths": ["experiments/results/signals/reversal_15m.npz",
+                                          "experiments/results/signals/ridge.npz",
+                                          "experiments/results/signals/lasso.npz"]},
+  "configs": {
+    "base": {"cost_model": "cross", "risk_model": "shrunk_sample", "universe": "all",
+             "annualization": "decisions"},
+    "grid": {"weighting": ["equal", "signal", "hrp", "min_var_qp", "mean_variance"],
+             "selection": ["all", "decile"],
+             "efq": [0.0, 0.7],
+             "rebalance": ["every_decision", "horizon"]}
+  }
+}

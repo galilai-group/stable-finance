@@ -24,6 +24,13 @@ mds = [
 hf = [
     "huggingface-hub>=0.30",
 ]
+# For the scripts under experiments/: result tables and figures. The library
+# itself never imports these.
+experiments = [
+    "matplotlib>=3.9",
+    "pandas>=2.3.0",
+    "pyarrow>=17.0",
+]
 
 [project.scripts]
 # The data-preparation CLIs, in pipeline order. Each reads its default paths
