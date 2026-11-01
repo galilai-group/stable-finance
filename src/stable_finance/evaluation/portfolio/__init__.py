@@ -13,6 +13,7 @@ from stable_finance.evaluation.portfolio.construction import (
 from stable_finance.evaluation.portfolio.contract import (
     PortfolioWeights,
 )
+from stable_finance.evaluation.portfolio.multihorizon import combine_horizon_targets
 from stable_finance.evaluation.portfolio.risk import (
     RISK_MODEL_REQUIRES,
     RISK_MODELS,
@@ -55,6 +56,7 @@ __all__ = [
     "alpha_from_rule",
     "apply_screen",
     "apply_signal",
+    "combine_horizon_targets",
     "diagonal_covariance",
     "embedding_covariance",
     "estimate_beta",

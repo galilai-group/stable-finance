@@ -170,6 +170,26 @@ the positive semidefinite cone. A NaN cost marks an asset that cannot be
 traded at that decision, so it holds its previous weight; a NaN forecast is a
 zero expected return that still pays risk and cost.
 
+`combine_horizon_targets` mixes the per-horizon optimal portfolios at each
+decision using fixed capital fractions, returning one `PortfolioWeights` book:
+
+```python
+from stable_finance import combine_horizon_targets
+
+components = mean_variance_target(forecast, sigma, risk_aversion=5.0)
+target = combine_horizon_targets(
+    components, capital_weights=[0.5, 0.5], target_horizon=300,
+)
+report = run_backtest(target, realized_5m, market=market)
+```
+
+Fractions follow the source horizon order and default to equal weights.
+Opposing positions cancel before trading; unused gross exposure is not
+restored. Missing weights raise; an explicit zero book reserves capital as
+cash. `target_horizon` declares the output scoring interval (or `TO_CLOSE`),
+so supply matching realized returns. Source horizons do not prescribe holding
+periods, and their overlapping outcome labels are not combined into P&L.
+
 `trades.rl` holds policies learned for their net-of-cost performance rather
 than written by hand. The first, `ParametricPolicy`, follows Brandt,
 Santa-Clara and Valkanov (2009) with a learned partial-adjustment rate
