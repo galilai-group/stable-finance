@@ -3,7 +3,7 @@
 The noised oracle says what a forecast of a given IC is worth; these say what
 IC cheap, well-known intraday signals actually have on Market-1T, so the real
 models can be placed on the oracle's IC-to-Sharpe map. No GPU and no learned
-representation: the features are the ones ``data.py`` caches, all read from
+representation: the features are the ones ``month_cache.py`` caches, all read from
 rows at or before the decision --
 
 * short-term reversal: minus the mid-quote return over the past 5, 15 and

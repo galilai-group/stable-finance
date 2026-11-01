@@ -58,11 +58,6 @@ def _horizon_panel(panel: sf.ForwardReturns, horizons) -> sf.ForwardReturns:
                              np.asarray(horizons))
 
 
-def _common_assets(*panels):
-    common = sorted(set.intersection(*(set(p.assets.astype(str)) for p in panels)))
-    return np.asarray(common)
-
-
 def _restrict(panel: sf.ForwardReturns, assets) -> sf.ForwardReturns:
     index = {a: i for i, a in enumerate(panel.assets.astype(str))}
     take = [index[a] for a in assets]
