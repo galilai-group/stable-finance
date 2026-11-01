@@ -217,3 +217,164 @@ def test_rebalance_and_allocate_reject_a_malformed_risk_aversion(bad, message):
         rebalance(target, sigma, risk_aversion=bad)
     with pytest.raises(ValueError, match=message):
         allocate(forecast, sigma, risk_aversion=bad)
+
+
+# Optional signed factor budgets use the existing allocator and trade path.
+def test_omitted_factors_keep_the_existing_fista_path_bitwise(monkeypatch):
+    import importlib
+    module = importlib.import_module("stable_finance.evaluation.trades.rebalance")
+    forecast, sigma, cost = problem(seed=7)
+    expected = allocate(forecast, sigma, cost=cost).values
+    def unexpected(*args, **kwargs):
+        raise AssertionError("the factor solver must not run without supplied factors")
+    monkeypatch.setattr(module, "_factor_rebalance", unexpected)
+    np.testing.assert_array_equal(allocate(forecast, sigma, cost=cost,
+        factor_loadings=None, factor_lower=None, factor_upper=None).values, expected)
+    target = mean_variance_target(forecast, sigma)
+    expected_tracking = rebalance(target, sigma, cost=cost).values
+    np.testing.assert_array_equal(rebalance(target, sigma, cost=cost,
+        factor_loadings=None, factor_lower=None, factor_upper=None).values, expected_tracking)
+
+
+def test_single_asset_cost_band_and_factor_bounds_have_the_scalar_optimum():
+    forecast = ForwardReturns([[[.03]], [[-.02]], [[.03]]], [0, 1, 2], ["A"], [300])
+    weights = allocate(forecast, [[[.1]]], risk_aversion=2., cost=.001,
+        factor_loadings=[[1.]], factor_lower=.02, factor_upper=.05)
+    np.testing.assert_allclose(weights.values[:, 0, 0], [.05, .02, .05], atol=1e-10)
+
+
+def test_multiple_factors_include_asymmetric_and_dependent_equalities():
+    forecast = ForwardReturns([[[.02], [-.02]]], [0], ["A", "B"], [300])
+    loadings = np.array([[1., 1., 2.], [0., 1., 2.]])
+    weights = allocate(forecast, [np.eye(2)*.1], risk_aversion=2., cost=.001,
+        factor_loadings=loadings, factor_lower=[-.01, 0., 0.],
+        factor_upper=[.01, 0., 0.]).values[0, :, 0]
+    np.testing.assert_allclose(weights, [.01, -.01], atol=1e-9)
+
+
+def test_factor_units_do_not_change_the_optimized_portfolio():
+    forecast = ForwardReturns([[[.02], [-.02]]], [0], ["A", "B"], [300])
+    results = []
+    for scale in (1e-12, 1., 1e12):
+        results.append(allocate(forecast, [np.eye(2)*.1], cost=.001,
+            factor_loadings=np.array([[1.], [0.]])*scale,
+            factor_lower=-.01*scale, factor_upper=.01*scale).values)
+    np.testing.assert_allclose(results, np.broadcast_to(results[0], (3, 1, 2, 1)), atol=1e-10)
+
+
+def test_positive_factor_floor_is_enforced_even_with_no_forecast():
+    forecast = ForwardReturns([[[0.]]], [0], ["A"], [300])
+    constrained = allocate(forecast, [[[.1]]], cost=.01,
+        factor_loadings=[[1.]], factor_lower=.02, factor_upper=np.inf)
+    np.testing.assert_allclose(constrained.values, .02, atol=1e-10)
+
+
+def test_frozen_holdings_reduce_the_remaining_exposure_budget():
+    forecast = ForwardReturns([[[.01], [.01]]], [0], ["A", "B"], [300])
+    constrained = allocate(forecast, [np.eye(2)*.1], initial=[[.03], [0.]],
+        cost=[[np.nan, .001]], factor_loadings=[[1.], [1.]],
+        factor_lower=0., factor_upper=0.)
+    assert constrained.values[0, 0, 0] == .03
+    np.testing.assert_allclose(constrained.values[0, 1, 0], -.03, atol=1e-10)
+
+
+def test_infeasible_frozen_exposure_reports_decision_and_horizon():
+    forecast = ForwardReturns([[[.01], [.01]]], [0], ["A", "B"], [300])
+    with pytest.raises(ValueError, match="decision 0, horizon 0:.*infeasible"):
+        allocate(forecast, [np.eye(2)*.1], initial=[[.2], [0.]], cost=[[np.nan, .001]],
+            factor_loadings=[[1.], [0.]], factor_lower=-.1, factor_upper=.1)
+
+
+def test_all_frozen_feasible_book_is_exact_and_needs_no_positive_free_risk():
+    forecast = ForwardReturns([[[.01], [-.01]]], [0], ["A", "B"], [300])
+    kwargs = dict(cost=np.inf, factor_loadings=[[1.], [1.]], factor_lower=0., factor_upper=0.)
+    held = allocate(forecast, [np.zeros((2, 2))], initial=[[.03], [-.03]], **kwargs)
+    np.testing.assert_array_equal(held.values[0, :, 0], [.03, -.03])
+    with pytest.raises(ValueError, match="all positions frozen"):
+        allocate(forecast, [np.zeros((2, 2))], initial=[[.03], [.03]], **kwargs)
+
+
+def test_factor_constraints_retain_raw_reward_per_decision_gamma_and_all_horizons():
+    import stable_finance as sf
+    forecast, sigma, cost = problem(seed=8)
+    gamma = np.linspace(1., 3., len(forecast.decisions))
+    loadings = np.array([[1., 1.], [0., 1.], [0., 1.], [0., 1.]])
+    kwargs = dict(risk_aversion=gamma, cost=cost, factor_loadings=loadings,
+                  factor_lower=[-.2, 0.], factor_upper=[.2, 0.])
+    direct = allocate(forecast, sigma, **kwargs)
+    target = mean_variance_target(forecast, sigma, risk_aversion=gamma)
+    tracking = rebalance(target, sigma, **kwargs)
+    np.testing.assert_allclose(tracking.values, direct.values, atol=1e-7)
+    report = sf.portfolio_exposure_report(direct, factor_loadings=loadings,
+        factor_names=["proxy_beta", "net"], factor_lower=[-.2, 0.], factor_upper=[.2, 0.])
+    assert np.all(report["constraint_status"] == "pass")
+    assert report["factor_exposure"].shape == (6, 1, 2)
+
+
+def test_allocator_predict_accepts_factor_limits_without_changing_fit_or_estimator_params():
+    returns = history(seed=10, n_assets=3)
+    estimator = MeanVarianceAllocator(risk_aversion=2.).fit(returns)
+    original_params = estimator.get_params().copy()
+    original_covariance = estimator.covariance_.copy()
+    forecast = ForwardReturns(np.full((2, 3, 2), .001), [0, 1], returns.assets, returns.horizons)
+    result = estimator.predict(forecast, factor_loadings=[[1.], [0.], [0.]],
+        factor_lower=-.01, factor_upper=.01)
+    np.testing.assert_allclose(result.values[:, 0], .01, atol=1e-8)
+    np.testing.assert_array_equal(estimator.covariance_, original_covariance)
+    assert estimator.get_params() == original_params
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(factor_lower=0.),
+    dict(factor_loadings=[[1.], [0.]], factor_lower=0.),
+    dict(factor_loadings=[[[1.], [0.]]], factor_lower=0., factor_upper=1.),
+    dict(factor_loadings=[[1.], [np.nan]], factor_lower=0., factor_upper=1.),
+    dict(factor_loadings=[[1.], [0.]], factor_lower=2., factor_upper=1.),
+    dict(factor_loadings=[[1.], [0.]], factor_lower=np.inf, factor_upper=np.inf),
+])
+def test_malformed_or_missing_factor_budgets_are_rejected(kwargs):
+    forecast = ForwardReturns([[[.01], [-.01]]], [0], ["A", "B"], [300])
+    with pytest.raises(ValueError, match="factor"):
+        allocate(forecast, [np.eye(2)], **kwargs)
+
+
+@pytest.mark.parametrize("sigma", [np.ones((2, 2)), np.array([[1., 2.], [2., 1.]]),
+                                   np.array([[1., .1], [0., 1.]])])
+def test_factor_path_rejects_nonconvex_or_unsupported_singular_covariance(sigma):
+    forecast = ForwardReturns([[[.01], [-.01]]], [0], ["A", "B"], [300])
+    with pytest.raises(ValueError, match="positive definite|symmetric"):
+        allocate(forecast, sigma[None], factor_loadings=[[1.], [1.]],
+                 factor_lower=0., factor_upper=0.)
+
+
+@pytest.mark.parametrize("tolerance", [1e-10, 1.])
+def test_numerical_success_cannot_bypass_primal_or_dual_verification(monkeypatch, tolerance):
+    from types import SimpleNamespace
+    import scipy.optimize
+    forecast = ForwardReturns([[[.01]]], [0], ["A"], [300])
+    monkeypatch.setattr(scipy.optimize, "minimize", lambda *args, **kwargs:
+        SimpleNamespace(x=np.zeros(3), success=True, message="invented success"))
+    with pytest.raises(RuntimeError, match="could not be verified"):
+        allocate(forecast, [[[.1]]], factor_loadings=[[1.]], factor_lower=.02,
+                 factor_upper=.03, tol=tolerance)
+
+
+def test_correlated_cost_and_factor_equalities_are_verified_past_objective_roundoff():
+    # The equality reduces w to [x, net-x]; the last factor's upper bound
+    # determines x. The optimum is analytic, without another optimizer.
+    mu = [.0017527815278021578, -.0002974795970127126]
+    sigma = np.array([[.0009139989376175733, .0008817618608741598],
+                      [.0008817618608741598, .001072717465987089]])
+    previous = np.array([-.16664010734686124, -.3923171380886157])
+    cost = [.0006447925051085614, .0008103968071411466]
+    loadings = np.array([[1., -.6480395980117798, .26982433278566864],
+                         [1., 1.3586196073598233, -1.2867258229920049]])
+    lower = [.04640079681626046, .08986286066340371, -.29091745504334676]
+    upper = [.04640079681626046, .3628374733832325, -.08184803846884012]
+    net = lower[0]
+    x = (upper[2]-loadings[1, 2]*net)/(loadings[0, 2]-loadings[1, 2])
+    forecast = ForwardReturns(np.array(mu)[None, :, None], [0], ["A", "B"], [300])
+    weights = allocate(forecast, sigma[None], risk_aversion=2.3,
+        initial=previous[:, None], cost=cost, factor_loadings=loadings,
+        factor_lower=lower, factor_upper=upper).values[0, :, 0]
+    np.testing.assert_allclose(weights, [x, net-x], atol=1e-11)

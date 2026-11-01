@@ -164,6 +164,44 @@ held = MeanVarianceAllocator(risk_aversion=5.0, shrinkage=0.1).fit(train_returns
     .predict(forecast, cost=half_spread, initial=current)
 ```
 
+`allocate`, `rebalance`, and `MeanVarianceAllocator.predict` optionally accept
+static factor loadings `(asset, factor)` and exposure bounds. Each decision
+and horizon satisfies `factor_lower <= loadings.T @ weights <= factor_upper`.
+The bounds are scalar or one per factor; both must be supplied, with `-inf`
+or `inf` for an open side. For example, a supplied beta column can be bounded:
+
+```python
+from stable_finance import portfolio_exposure_report
+
+limits = dict(factor_loadings=known_beta[:, None], factor_lower=-0.10, factor_upper=0.10)
+held = allocate(forecast, sigma, risk_aversion=5.0, cost=half_spread, **limits)
+# Or track a supplied target using its existing covariance and risk aversion.
+tracked = rebalance(target, sigma, risk_aversion=5.0, cost=half_spread, **limits)
+diagnostics = portfolio_exposure_report(held, factor_names=["beta"], **limits)
+```
+
+Loadings must follow the asset order and be known before the evaluated
+decisions. The constrained solve retains the forecast reward and trading
+costs; missing costs freeze the previous modeled holding and still consume
+factor budget. It requires positive-definite risk on tradable assets and
+reports infeasibility or numerical failure explicitly. It adds no default
+net, gross or position limits. Omitting factor arguments keeps the original
+algorithm. `fit` and frictionless target construction are unchanged; a target
+already altered by other constraints does not identify the original forecast.
+
+The scoring report returns gross/net exposure, concentration, and supplied
+factor exposures, coverage and limit violations. Book metrics and status are
+`(decision, horizon)` arrays; factor diagnostics are `(decision, horizon, factor)`.
+Missing factor loadings on nonzero holdings give unknown exposure. Use the
+same reporter on `positions_from_fills(fills)` to inspect executed holdings
+separately: planned feasibility does not guarantee exposure after fills or
+price drift. Numerical feasibility is checked after dividing each factor
+column and its bounds by that column's largest absolute loading (one for a
+zero column), with a tolerance of `1e-8` in weight units. Reporting preserves
+raw exposures and violations and supplies the corresponding `factor_tolerance`
+thresholds, so changing a factor's units does not change its status. The
+existing backtest and execution paths are unchanged.
+
 `estimate_covariance` is the fitted estimator's public core: a pairwise sample
 covariance over finite observations, shrunk toward its diagonal and clipped to
 the positive semidefinite cone. A NaN cost marks an asset that cannot be
