@@ -43,6 +43,7 @@ __all__ = [
     "estimate_risk",
     "ledoit_wolf_covariance",
     "liquidity_screen",
+    "nonlinear_shrinkage_covariance",
 ]
 
 
@@ -134,6 +135,122 @@ def ledoit_wolf_covariance(
     return out
 
 
+_SQRT5 = np.sqrt(5.0)
+
+
+def _analytical_shrinkage(
+    centered: NDArray[np.float64], n_effective: int
+) -> NDArray[np.float64]:
+    """Ledoit and Wolf's (2020) closed form on an already centred panel.
+
+    A line-by-line port of the authors' ``analytical_shrinkage.m``: the
+    sample spectrum is smoothed with an Epanechnikov kernel whose bandwidth
+    is proportional to each eigenvalue (``h = n^(-1/3)``), and each eigenvalue
+    is replaced by the oracle value that the kernel estimates of the spectral
+    density and its Hilbert transform imply (their equations 4.3 and C.4-C.8).
+    Eigenvectors are the sample's, untouched.
+    """
+    p = centered.shape[1]
+    n = n_effective
+    sample = centered.T @ centered / n
+    eigenvalues, eigenvectors = np.linalg.eigh((sample + sample.T) / 2)
+    order = np.argsort(eigenvalues, kind="stable")
+    eigenvalues, eigenvectors = eigenvalues[order], eigenvectors[:, order]
+    # Only the top min(p, n) eigenvalues are informative; when p > n the rest
+    # are structurally zero and get their own closed form below. A relative
+    # floor keeps the kernel bandwidths positive where rounding (or the
+    # zero-filled panel) leaves an informative eigenvalue at or below zero.
+    lam = eigenvalues[max(0, p - n):]
+    largest = float(lam.max())
+    if largest <= 0:
+        raise ValueError("returns have no variance")
+    lam = np.maximum(lam, 1e-12 * largest)
+
+    h = n ** (-1.0 / 3.0)
+    bandwidth = h * lam[np.newaxis, :]  # H[i, j] = h * lambda_j
+    x = (lam[:, np.newaxis] - lam[np.newaxis, :]) / bandwidth
+    density = (3 / 4 / _SQRT5) * np.mean(
+        np.maximum(1 - x**2 / 5, 0.0) / bandwidth, axis=1
+    )
+    # The kernel's Hilbert transform has a log singularity at |x| = sqrt(5),
+    # where its (1 - x^2/5) factor vanishes; the reference code drops the log
+    # term there, which is what zeroing it does.
+    edge = np.isclose(np.abs(x), _SQRT5)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_term = np.log(np.abs((_SQRT5 - x) / (_SQRT5 + x)))
+    log_term = np.where(edge, 0.0, log_term)
+    hilbert = (-3 / 10 / np.pi) * x + (3 / 4 / _SQRT5 / np.pi) * (
+        1 - x**2 / 5
+    ) * log_term
+    hilbert = np.mean(hilbert / bandwidth, axis=1)
+
+    ratio = p / n
+    if p <= n:
+        shrunk = lam / (
+            (np.pi * ratio * lam * density) ** 2
+            + (1 - ratio - np.pi * ratio * lam * hilbert) ** 2
+        )
+    else:
+        hilbert_null = (
+            (1 / np.pi)
+            * (
+                3 / 10 / h**2
+                + 3 / 4 / _SQRT5 / h * (1 - 1 / 5 / h**2)
+                * np.log((1 + _SQRT5 * h) / (1 - _SQRT5 * h))
+            )
+            * np.mean(1 / lam)
+        )
+        null = 1 / (np.pi * (p - n) / n * hilbert_null)
+        informative = lam / (np.pi**2 * lam**2 * (density**2 + hilbert**2))
+        shrunk = np.concatenate([np.full(p - n, null), informative])
+    return (eigenvectors * shrunk) @ eigenvectors.T
+
+
+def nonlinear_shrinkage_covariance(
+    history: ForwardReturns, *, min_samples: int = 2
+) -> NDArray[np.float64]:
+    """Sample eigenvectors with each eigenvalue shrunk by its own amount.
+
+    Linear shrinkage (:func:`ledoit_wolf_covariance`) pulls every sample
+    eigenvalue toward the grand mean by ONE data-chosen intensity, which is
+    the best a single number can do but still too little for the extreme
+    eigenvalues and too much for the bulk. Nonlinear shrinkage keeps the
+    sample eigenvectors and replaces each eigenvalue by an estimate of the
+    variance the portfolio along that eigenvector will actually realize, so
+    the correction is largest exactly where estimation error is. Ledoit and
+    Wolf (2020), "Analytical nonlinear shrinkage of large-dimensional
+    covariance matrices", Annals of Statistics 48(5), give that estimate in
+    closed form -- a kernel estimate of the sample spectral density and its
+    Hilbert transform -- so it costs one eigendecomposition rather than the
+    numerical inversion of the earlier QuEST estimator, and it is defined
+    when there are more assets than decisions.
+
+    The panel is centred with each asset's own mean, so the effective sample
+    size is one less than the number of decisions, as in the authors' code
+    for demeaned data. The closed form needs at least 12 of them: below that
+    the kernel bandwidth ``n^(-1/3)`` is too wide for the null-eigenvalue
+    term to be defined.
+
+    MISSING OBSERVATIONS ARE ZERO-FILLED AFTER CENTERING, which biases a
+    sparsely observed asset's covariance toward zero. The presence screen in
+    :func:`stable_finance.dataset.universe.presence_screen` is what keeps that bias small; without one,
+    a name quoted on a handful of decisions would look riskless.
+    """
+    n_decisions, n_assets, n_horizons = history.values.shape
+    n_effective = n_decisions - 1
+    if n_effective < 12:
+        raise ValueError(
+            f"nonlinear shrinkage needs at least 13 decisions; got {n_decisions}"
+        )
+    out = np.empty((n_horizons, n_assets, n_assets), dtype=np.float64)
+    for horizon in range(n_horizons):
+        _, centered, _ = _observed_moments(
+            history.values[:, :, horizon], min_samples
+        )
+        out[horizon] = _project_psd(_analytical_shrinkage(centered, n_effective))
+    return out
+
+
 def embedding_covariance(
     history: ForwardReturns,
     embeddings: Embeddings,
@@ -208,6 +325,8 @@ def estimate_risk(
         )
     if name == "ledoit_wolf":
         return ledoit_wolf_covariance(history, min_samples=min_samples)
+    if name == "nonlinear_shrinkage":
+        return nonlinear_shrinkage_covariance(history, min_samples=min_samples)
     if name == "embedding":
         if embeddings is None:
             raise ValueError("the 'embedding' risk model needs embeddings")
@@ -218,7 +337,9 @@ def estimate_risk(
 
 
 #: The risk models a backtest configuration may name.
-RISK_MODELS = ("diagonal", "shrunk_sample", "ledoit_wolf", "embedding")
+RISK_MODELS = (
+    "diagonal", "shrunk_sample", "ledoit_wolf", "nonlinear_shrinkage", "embedding",
+)
 
 #: What each risk model needs of the market: nothing, since all of them are
 #: estimated from returns (``embedding`` also needs the embeddings, which are

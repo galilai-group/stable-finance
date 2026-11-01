@@ -74,7 +74,8 @@ and horizons at one-minute windows.
 WHAT IS NOT HERE. Extended hours (the dense mosaic is the regular session
 only, and so is this). Risk-factor channels, which stay in
 ``1Hz_risk_factors``. The industry map, which is monthly and lives beside the
-mosaic. Nothing consults the MDS index at read time: a consumer of this
+mosaic (``ingest.build_industry_map``); :func:`market_from_days` joins it
+onto the decisions on request. Nothing consults the MDS index at read time: a consumer of this
 layout does not need ``streaming`` installed.
 
 EVALUATION INPUTS. Evaluation inputs read from the dataset's stores, independent of any model.
@@ -1018,10 +1019,40 @@ def _closes_and_dollars(record: DayRecord) -> tuple[np.ndarray, np.ndarray]:
     return closes, dollars
 
 
+def industry_codes(industry_map: str | Path, dates: ArrayLike,
+                   assets: ArrayLike) -> NDArray[np.float64]:
+    """``(len(dates), len(assets))`` industry code of each name in each date's month.
+
+    ``industry_map`` is the parquet ``ingest.build_industry_map`` writes: one
+    row per (``month`` YYYY-MM, ``ticker``) with its Fama-French 49 code
+    ``ff49``. Each date reads its month's code, as a float; a name the map
+    does not list that month, or lists with a null code, is NaN.
+    """
+    import pandas as pd
+
+    months = np.asarray([str(d)[:7] for d in np.asarray(dates).tolist()])
+    assets = np.asarray(assets).astype(str)
+    wanted = sorted(set(months.tolist()))
+    table = pd.read_parquet(industry_map, columns=["month", "ticker", "ff49"],
+                            filters=[("month", "in", wanted)])
+    month_of = {m: i for i, m in enumerate(wanted)}
+    asset_of = {a: i for i, a in enumerate(assets.tolist())}
+    rows = table["month"].astype(str).map(month_of)
+    cols = table["ticker"].astype(str).map(asset_of)
+    keep = (rows.notna() & cols.notna()).to_numpy()
+    if table.loc[keep, ["month", "ticker"]].duplicated().any():
+        raise ValueError(f"{industry_map}: a ticker has two industry codes in one month")
+    by_month = np.full((len(wanted), len(assets)), np.nan)
+    by_month[rows[keep].to_numpy(dtype=np.int64), cols[keep].to_numpy(dtype=np.int64)] = (
+        table["ff49"][keep].to_numpy(dtype=np.float64, na_value=np.nan))
+    return by_month[[month_of[m] for m in months.tolist()]]
+
+
 def market_from_days(days, *, anchors: ArrayLike | None = None,
                      roles: tuple[str, ...] | None = None, lookback: int = 0,
                      delay_seconds: int = 5, depth_seconds: int = 5,
-                     window_seconds: int | None = None) -> MarketData:
+                     window_seconds: int | None = None,
+                     industry_map: str | Path | None = None) -> MarketData:
     """The market a day store recorded, as :class:`MarketData`, by role.
 
     ``days`` are day-record paths or :class:`~stable_finance.dataset.datasets.market1t.daystore.DayRecord`
@@ -1057,6 +1088,14 @@ def market_from_days(days, *, anchors: ArrayLike | None = None,
       returns in the window (see
       :func:`~stable_finance.dataset.characteristics.trailing_from_days`).
     * ``time_trend``, always: the paper's months since June 1926.
+    * ``industry``, with ``industry_map``: the parquet written by
+      :func:`~stable_finance.dataset.datasets.market1t.ingest.build_industry_map`
+      (``month``, ``ticker``, ``ff49``). Each decision reads its name's
+      Fama-French 49 code for the decision's month, as a float, and NaN for
+      a name the map does not label that month (see :func:`industry_codes`).
+      This is what the industry neutralizations need. The map dates a code
+      by the fiscal year end it was reported for, not by its filing, so a
+      (rare) change of industry can show a few months early.
 
     Market cap is not in the store, so ``impact_stock`` needs a
     ``market_cap`` column added by the caller.
@@ -1078,6 +1117,9 @@ def market_from_days(days, *, anchors: ArrayLike | None = None,
             raise ValueError(f"{record.date}: schema differs from {records[0].date}")
     wanted = tuple(schema.role_map) if roles is None else tuple(roles)
     schema.require(*wanted, purpose="market_from_days")
+    if industry_map is not None and "industry" in wanted:
+        raise ValueError("the store already has an industry column; "
+                         "pass industry_map only for a store without one")
     quoted = schema.has("bid_price", "ask_price")
     sized = quoted and schema.has("bid_size", "ask_size")
     assets = np.asarray(sorted({str(t) for r in records for t in r.tickers}))
@@ -1154,6 +1196,8 @@ def market_from_days(days, *, anchors: ArrayLike | None = None,
     if lookback:
         for name in ("adv", "idio_vol", "market_vol"):
             columns[name] = np.stack(extra[name])
+    if industry_map is not None:
+        columns["industry"] = industry_codes(industry_map, [d for d, _ in labels], assets)
     return MarketData(columns, decisions, assets)
 
 

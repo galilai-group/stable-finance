@@ -1,9 +1,11 @@
-# The mathematics of `oracle_forecast`
+# The mathematics of `oracle_forecast` and `copula_forecast`
 
 `oracle_forecast` turns realized returns into a forecast whose rank IC is known
 in advance, so that portfolio construction and trade calculation can be tested
 against a forecast with no unknowns of its own. This note derives everything
-the implementation relies on. Throughout, $n$ is the number of names with a
+the implementation relies on (§§1–6), and then the separate generator
+`copula_forecast`, whose errors belong to the names rather than to rank
+positions (§7). Throughout, $n$ is the number of names with a
 finite realized return in one `(decision, horizon)` cross-section; every
 quantity below is recomputed from that $n$ for every cross-section.
 
@@ -218,6 +220,8 @@ reassigned according to the degraded ranking, so the forecast is in return
 units and its ranking is the only thing that was changed. A tiny strictly
 increasing offset is added so the forecast carries no ties of its own, since
 a tie would average two forecast ranks and move the IC off target.
+(`copula_forecast` has no exact target to protect and adds no offset; see
+§7.)
 
 Those values are then shrunk towards the cross-sectional mean by `scale`,
 defaulting to $|\rho^\star|$. An unshrunk oracle has the full dispersion of
@@ -228,7 +232,157 @@ $\alpha = \mathrm{IC} \times \sigma \times \text{score}$: the forecast size a
 forecaster who believed its own IC would produce. Any positive scale leaves
 the ranking, and hence the IC, unchanged.
 
-## 6. Reference
+## 6. Per-horizon targets and persistent errors
+
+**Per-horizon IC.** A real forecast's IC decays with horizon, so `ic` may be a
+vector $\rho^\star_h$ with one target per horizon. Nothing in §§1–5 couples
+horizons: each `(decision, horizon)` cross-section is degraded with its own
+$\rho^\star_h$ and, by default, scale $|\rho^\star_h|$. The random draws come
+from one stream consumed decision-major, horizon-minor, exactly as for a
+scalar target, so a constant vector reproduces the scalar result bit for bit.
+
+**Persistence.** By default the degradation of decision $d$ is a fresh
+random permutation $\pi_d$ of rank positions, independent across decisions.
+With `persistence=k` decisions are grouped into blocks -- $b = \lfloor d/k
+\rfloor$, or, given `days`, runs of at most $k$ decisions that restart at
+every change of day label -- and every random draw for decision $d$ at
+horizon $h$ comes from a generator seeded with $(\text{root}, h, b)$, i.e.
+`np.random.default_rng([root, h, b])`, where `root` is the integer `seed`, or
+one integer drawn from `np.random.default_rng(seed)` when `seed` is a
+generator or `None`. Every decision of a block replays the same draws, so:
+
+* under `random`, $\pi_d = \pi_b$ for every $d$ in the block -- the map from
+  realized rank to forecast rank is identical -- provided the decisions have
+  the same $n$ and no ties (with ties the factor $\rho^\star \sqrt{S_fS_r} /
+  C_{\max}$ and hence the round sizes of §3 vary with the decision);
+* under `tails` and `middle` the mirror pairs are already a fixed function
+  of rank position, so only the `scatter` draw is shared: one standardized
+  Gaussian $z_b$ per block, target $\rho^\star + z_b/\sqrt{n-1}$.
+
+`persistence=None` and `persistence=1` keep the single shared stream and are
+the default behaviour exactly.
+
+*What is guaranteed.* Marginally nothing changes: $\pi_b$ has the law $\pi_d$
+had, so each decision's IC has the mean and $1/(n-1)$ variance of §4. What
+changes is the joint law across decisions. Without ties the IC of a rank
+permutation does not depend on the values permuted, so under `random` the IC
+is *constant* within a block, and the block mean of the IC has variance
+$1/(n-1)$ rather than $1/(k(n-1))$: the decision-to-decision scatter no
+longer averages away. Measured by rank position, the error $e_d(j) =
+\pi_d(j) - j$ is identical within a block (correlation $1$), against about
+$(1-\rho^\star)/2$ between independent draws, which share only their common
+pull towards the middle, $\mathbb E[\pi(j) - j] \approx (1-\rho^\star)(\bar
+f - j)$.
+
+*What is not guaranteed.* The errors persist in rank space, not by name. A
+name $i$ with realized rank $r_{d,i}$ has forecast rank $\pi_b(r_{d,i})$, and
+under `random` $\pi_b$ is far from smooth: two adjacent rank positions are
+sent to unrelated places. The forecast is therefore autocorrelated across
+decisions only in so far as names keep exactly their realized rank. On 200
+names with `ic=0.05` and `persistence=10`, the forecast's lag-one rank
+autocorrelation is
+
+| realized rank autocorrelation | `persistence=None` | `persistence=10` |
+|---|---|---|
+| 0.945 | 0.01 | 0.04 |
+| 0.988 | 0.01 | 0.08 |
+| 0.998 | 0.00 | 0.20 |
+| 1 (frozen within block) | 0.01 | 0.91 |
+
+`tails` and `middle` move names in contiguous runs of rank positions, so
+their forecasts already inherit most of the truth's persistence without
+`persistence` (0.6–0.9 in the same experiment) and gain a few hundredths
+from it. Persistence is thus a model of a forecast whose *rank-position
+errors* and *IC* are sticky; on its own it does not turn a fast `random`
+oracle into a slowly-moving forecast, and a study of turnover should check
+the forecast's own autocorrelation rather than assume it. A forecast whose
+errors persist by name is what `copula_forecast` (§7) generates.
+
+## 7. A separate generator: `copula_forecast`
+
+Everything above degrades a ranking by exchanging rank positions, so its
+errors belong to rank positions. §6 showed what that means for persistence:
+the object that repeats is a permutation $\pi_b$ of positions, and a name
+keeps its error only while it keeps its realized rank. A real forecast's
+errors belong to the *name*: a stale view of a stock stays wrong about that
+stock however the market reorders around it. `copula_forecast` generates
+such errors with a different model and different parameters -- a half-life
+rather than a block length, an IC hit in expectation rather than steered --
+which is why it is a function of its own rather than a fourth `noise`.
+
+**The model.** In each cross-section let $z_i = \Phi^{-1}(r_i/(n+1))$ be the
+normal score of name $i$'s realized average rank. The forecast score is
+
+$$
+s_i = c\, z_i + \sqrt{1-c^2}\; e_i ,
+$$
+
+with $e_i$ standard-normal noise owned by name $i$, and the forecast is the
+ranking of $s$. A bivariate normal with Pearson correlation $c$ has
+Spearman correlation $\tfrac{6}{\pi}\arcsin(c/2)$, so
+
+$$
+c = 2 \sin\!\left(\frac{\pi \rho^\star}{6}\right)
+$$
+
+gives rank IC $\rho^\star$ in expectation. $z$ is a fixed grid of normal
+quantiles rather than a Gaussian sample, and a sample Spearman correlation is
+biased by $O(1/n)$, so the expectation falls short of $\rho^\star$ by a
+relative amount of order $1/n$: measured, about 8% at $n = 30$, 2% at
+$n = 120$ and 0.5% at $n = 400$. No decision is steered, so each decision's
+IC scatters with standard deviation about $(1 - \rho^{\star 2})/\sqrt{n-1}$,
+which at the ICs real forecasts have is the $1/\sqrt{n-1}$ of §4. $\rho^\star$
+may be negative; $|\rho^\star| = 1$ is excluded, since $c = \pm 1$ leaves
+no noise at all (`oracle_forecast(noise="tails")` gives the perfect and the
+fully reversed ranking).
+
+**Half-life.** With `half_life=k` each name's noise is an AR(1) across
+decisions,
+
+$$
+e_{d,i} = \phi\, e_{d-1,i} + \sqrt{1-\phi^2}\; \eta_{d,i},
+\qquad \phi = 2^{-1/k},
+\qquad \eta_{d,i} \sim \mathcal N(0, 1) \text{ i.i.d.}
+$$
+
+It is stationary with unit variance, so a single decision's IC has the law
+above whatever $k$ is. The correlation of a name's noise $j$ decisions apart
+is $\phi^j = 2^{-j/k}$, which halves every $k$ decisions. On realized
+returns independent across decisions, $\operatorname{Corr}(s_{d,i},
+s_{d+1,i}) = (1-c^2)\phi$, and the forecast's lag-one rank
+autocorrelation is close to it (120 names, 1,000 decisions):
+
+| `half_life` | `ic` | $(1-c^2)\phi$ | measured |
+|---|---|---|---|
+| `None` | 0.05 | 0 | 0.01 |
+| 12 | 0.05 | 0.941 | 0.934 |
+| 12 | 0.3 | 0.851 | 0.843 |
+
+against 0.08 for rank-space persistence on realized returns whose own rank
+autocorrelation is 0.99 (§6). When the realized ranking itself persists,
+the $c z$ term adds to this. `half_life=None` sets $\phi = 0$: fresh
+noise at every decision. `half_life=math.inf` sets $\phi = 1$ and freezes
+each name's noise. Given `days`, every name's noise restarts from a fresh
+$\mathcal N(0,1)$ draw at each change of day label, so no error is carried
+over a night. A name whose realized return is missing gets no forecast, but
+its noise keeps evolving, so the error is still its own when it returns.
+
+**Values and ties.** The realized values of the cross-section, sorted, are
+handed out in score order -- the name with the $i$-th smallest score gets
+the $i$-th smallest realized return -- and then shrunk towards the mean by
+`scale` as in §5. No offset is added: where the realized returns are tied,
+the forecast values at the corresponding score ranks are tied too, and the
+rank IC scores them with average ranks exactly as it scores the tied
+outcomes. §5's offset exists to keep `tails` and `middle` on an exact target;
+the copula has none to protect.
+
+**Randomness.** Horizon $h$ draws all of its noise from
+`np.random.default_rng([root, h])`, with `root` as in §6: the stationary
+start, then one innovation per decision. Errors are independent across
+horizons, and a horizon's forecast does not depend on how many horizons
+there are.
+
+## 8. Reference
 
 | Quantity | Formula |
 |---|---|
@@ -241,9 +395,14 @@ the ranking, and hence the IC, unchanged.
 | Disjoint pairs | $\mathbb E[\rho_k] = 1 - 2k/(n-1)$; $k = (1-\rho^\star)(n-1)/2$ |
 | Round of $m$ disjoint random pairs | multiplies $\mathbb E[C]$ by $1 - 2m/(n-1)$ exactly |
 | Per-decision scatter | $\mathrm{Var}(\rho_d) \approx 1/(n-1)$, Gaussian |
-| Default value scale | $|\rho^\star|$ (Grinold) |
+| Default value scale | $|\rho^\star|$ (Grinold), per horizon |
+| Persistent block generator | `default_rng([root, h, b])`; marginal IC law unchanged |
+| `copula_forecast` score | $s = c z + \sqrt{1-c^2}\,e$, $c = 2\sin(\pi\rho^\star/6)$ |
+| `copula_forecast` noise | AR(1), $\phi = 2^{-1/\text{half\_life}}$; restarts at each new day |
+| `copula_forecast` lag-one autocorrelation, i.i.d. returns | $\approx (1-c^2)\phi$ |
+| `copula_forecast` generator | `default_rng([root, h])` |
 
-## 7. Empirical checks
+## 9. Empirical checks
 
 Synthetic $t_3$ returns, 4,000 decisions per row, `random` mode. The $n$
 values are just the two sizes tried; the formulas take $n$ from the data.
