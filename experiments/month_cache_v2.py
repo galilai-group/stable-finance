@@ -340,8 +340,7 @@ def build_day(date: str, out: Path, *, root: str | Path | None = None) -> tuple[
                  features=features,
                  **{q: market.get(q).astype(np.float32) for q in QUANTITIES},
                  **{k: v[:, columns] for k, v in extra.items()})
-    record._features = None
-    del record, market
+    del record, market                     # releases the memmap of the unpacked day
     unpacked = Path(day) / FEATURES
     if unpacked.is_file():
         unpacked.unlink()
