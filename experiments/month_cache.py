@@ -154,8 +154,7 @@ def build_day(date: str, out: Path) -> Path:
              realized=realized.values.astype(np.float32),
              features=features,
              **{q: market.get(q).astype(np.float32) for q in QUANTITIES})
-    record._features = None
-    del record, market
+    del record, market                     # releases the memmap of the unpacked day
     unpacked = Path(day) / FEATURES
     if unpacked.is_file():
         unpacked.unlink()
