@@ -38,7 +38,8 @@ advance, and prints PASS, FAIL or SKIP with the numbers behind it:
   lower it; the forecast shifted by one day (yesterday's move at the same
   time) must give about nothing.
 * COST IDENTITY. From every saved series: net is exactly gross minus cost, and
-  each row's break-even EFQ is recomputed from its own series.
+  each row's break-even EFQ is recomputed from its own series, with how many
+  rows each covers.
 * LATENCY. With a v2 cache, one book at execution delays of 0, 1, 5 and 30
   seconds. A delay only swaps the quotes an order meets (returns still start
   at the decision), so gross must not move with it. Whether waiting costs
@@ -489,30 +490,54 @@ def invariance_at_one(results: Path) -> dict:
 
 
 def cost_identity(results: Path) -> dict:
-    """net == gross - cost in every saved series; break-even recomputed from it."""
+    """net == gross - cost in every saved series; break-even recomputed from it, with coverage.
+
+    The identity holds by construction -- the harness computes net as gross
+    less cost -- so what it checks is that each saved series is its row's.
+    The break-even is recomputed for every row that has one (a cost model
+    that charges, a positive EFQ, a finite break-even) except those that
+    charge fees, whose break-even takes the fee out of the cost first, from a
+    fee path the series does not save. A row says it charges fees by a
+    finite ``mean_fee_bps``: in a run that also has fee rows the column is
+    NaN, not None, on the rest, and testing for None skipped every one of
+    them. How many rows each test covered is reported beside its error.
+    """
     import pandas as pd
 
-    worst_identity, worst_breakeven, checked = 0.0, 0.0, 0
+    worst_identity, worst_breakeven = 0.0, 0.0
+    coverage = {"rows": 0, "with_series": 0, "breakeven_rows": 0, "breakeven_checked": 0,
+                "breakeven_skipped_fees": 0, "breakeven_skipped_not_finite": 0}
     for run in sorted(p for p in results.iterdir() if (p / "series.npz").is_file()):
         rows = pd.read_parquet(run / "rows.parquet")
         series = np.load(run / "series.npz")
         for row in rows.itertuples(index=False):
+            coverage["rows"] += 1
             if row.row_id not in series.files:
                 continue
+            coverage["with_series"] += 1
             gross, net, cost = series[row.row_id]
             worst_identity = max(worst_identity, float(np.nanmax(np.abs(net - (gross - cost)))))
+            if row.cost_model == "mid" or not row.efq > 0:
+                continue
+            coverage["breakeven_rows"] += 1
+            fee = _scalar(getattr(row, "mean_fee_bps", None))
+            if not _missing(fee):
+                coverage["breakeven_skipped_fees"] += 1
+                continue
             breakeven = getattr(row, "breakeven_efq", np.nan)
-            if row.cost_model != "mid" and row.efq > 0 and np.isfinite(breakeven) \
-                    and getattr(row, "mean_fee_bps", None) is None:
-                again = sf.breakeven_efq(gross, cost / row.efq)
-                if np.isfinite(again):
-                    worst_breakeven = max(worst_breakeven, abs(float(again) - breakeven))
-            checked += 1
-    if not checked:
+            if not np.isfinite(breakeven):
+                coverage["breakeven_skipped_not_finite"] += 1
+                continue
+            again = float(sf.breakeven_efq(gross, cost / row.efq))
+            # A finite break-even the row's own series cannot reproduce is an error too.
+            worst_breakeven = max(worst_breakeven, abs(again - breakeven)
+                                  if np.isfinite(again) else float("inf"))
+            coverage["breakeven_checked"] += 1
+    if not coverage["with_series"]:
         return _result("cost identity", "SKIP", reason="no saved series")
     status = "PASS" if worst_identity < 1e-12 and worst_breakeven < 1e-9 else "FAIL"
     return _result("cost identity", status, worst_net_minus_gross_plus_cost=worst_identity,
-                   worst_breakeven_error=worst_breakeven, rows_checked=checked)
+                   worst_breakeven_error=worst_breakeven, **coverage)
 
 
 # ── checks that run backtests ──────────────────────────────────────────────

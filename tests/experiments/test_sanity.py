@@ -195,3 +195,41 @@ def test_exact_ic_invariance_keeps_placements_and_horizons_apart(tmp_path):
                                                    "0.1": -127.5})
     assert curve["relative_range"] == pytest.approx(2.5 / 126.25)
     assert result["max_relative_range"] == pytest.approx(0.02 / 1.01)
+
+
+def _cost_run(results, breakeven_error=0.0):
+    rng = np.random.default_rng(3)
+    gross = rng.normal(1e-4, 1e-4, 50)
+    cost = np.abs(rng.normal(0.7e-4, 0.1e-4, 50))
+    breakeven = float(sf.breakeven_efq(gross, cost / 0.7))
+    nan = float("nan")
+    rows = [  # mid; crossing without fees (fee column NaN); with fees; no finite break-even
+        {"row_id": "mid", "cost_model": "mid", "efq": 0.0, "breakeven_efq": nan,
+         "mean_fee_bps": nan},
+        {"row_id": "cross", "cost_model": "cross", "efq": 0.7,
+         "breakeven_efq": breakeven + breakeven_error, "mean_fee_bps": nan},
+        {"row_id": "fees", "cost_model": "cross", "efq": 0.7, "breakeven_efq": nan,
+         "mean_fee_bps": 2.5},
+        {"row_id": "flat", "cost_model": "cross", "efq": 0.7, "breakeven_efq": nan,
+         "mean_fee_bps": nan},
+        {"row_id": "unsaved", "cost_model": "cross", "efq": 0.7, "breakeven_efq": nan,
+         "mean_fee_bps": nan},
+    ]
+    _write_rows(results, "run", rows)
+    series = {r["row_id"]: np.stack([gross, gross - cost, cost]) for r in rows[:4]}
+    np.savez(results / "run" / "series.npz", **series)
+
+
+def test_cost_identity_checks_a_row_whose_fee_column_is_nan_and_reports_coverage(tmp_path):
+    _cost_run(tmp_path)
+    result = sanity.cost_identity(tmp_path)
+    assert result["status"] == "PASS"
+    assert (result["rows"], result["with_series"], result["breakeven_rows"]) == (5, 4, 3)
+    assert result["breakeven_checked"] == 1
+    assert result["breakeven_skipped_fees"] == 1 and result["breakeven_skipped_not_finite"] == 1
+
+
+def test_cost_identity_fails_a_break_even_its_series_does_not_reproduce(tmp_path):
+    _cost_run(tmp_path, breakeven_error=1e-6)
+    result = sanity.cost_identity(tmp_path)
+    assert result["status"] == "FAIL" and result["worst_breakeven_error"] == pytest.approx(1e-6)
