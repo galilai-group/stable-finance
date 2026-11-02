@@ -20,12 +20,20 @@ same characteristics:
 
 For the features, each characteristic enters the blend with the sign of its
 rank IC on the training month, so the baseline is not hurt by a feature that
-predicts with the opposite sign. Every book is treated the same at the
-session boundary: a decision without a forecast (the last ones of a day,
-whose horizon runs past the close) keeps the book it has, as the learned
-policy does, and no book earns the overnight return, which is not in the
-data. The fit runs to convergence (up to ``MAX_ITER`` iterations), and the
-report gives the objective path's last change.
+predicts with the opposite sign. As in the policy, a name enters a baseline
+only at decisions where every one of its characteristics is observed, and
+the rest are aimed at zero. At a decision where no name is (for the features
+09:30-09:55, before the 30-minute windows fill; for the oracle the last hour,
+from 15:00, whose 60-minute horizon runs past the close) the policy has no
+target: it aims at zero and moves ``eta`` of the way there, so with the small
+learned ``eta`` it sheds only that fraction of its book per decision. A
+baseline's target there is its previous one, carried: the rebuilt and held
+books keep what they hold, and the learned-eta book keeps moving toward its
+last target. The two treatments are close but not identical: over the
+features' six opening decisions the policy keeps ``(1 - eta)^6`` of its book,
+a rebuilt baseline all of its own. No book earns the overnight return, which
+is not in the data. The fit runs to convergence (up to ``MAX_ITER``
+iterations), and the report gives the objective path's last change.
 
 Two characteristic sets:
 
@@ -133,21 +141,27 @@ def _spearman(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
+def active_names(X: np.ndarray) -> np.ndarray:
+    """``(decisions, assets)``: names with every characteristic observed, as ParametricPolicy reads them."""
+    return np.isfinite(X).all(axis=2)
+
+
 def signal_book(X: np.ndarray, gross: float = 2.0, signs: np.ndarray | None = None) -> np.ndarray:
     """The signal-weighted, dollar-neutral book on the (sign-aligned) equal blend of X.
 
-    A decision with no characteristic at all keeps the previous book, as the
-    learned policy does, rather than going flat.
+    Only the policy's active names (every characteristic observed) are
+    scored; the others get zero weight. A decision with no active name, where
+    the policy has no target, keeps the previous book rather than going flat.
     """
     if signs is not None:
         X = X * signs
-    blend = np.nanmean(X, axis=2)
-    missing = ~np.isfinite(blend).any(axis=1)
-    blend = blend - np.nanmean(blend, axis=1, keepdims=True)
-    blend = np.nan_to_num(blend)
+    active = active_names(X)
+    blend = np.where(active, np.where(active[:, :, None], X, 0.0).mean(axis=2), 0.0)
+    centre = blend.sum(axis=1, keepdims=True) / np.maximum(active.sum(axis=1, keepdims=True), 1)
+    blend = np.where(active, blend - centre, 0.0)
     total = np.abs(blend).sum(axis=1, keepdims=True)
     book = np.where(total > 0, gross * blend / np.where(total > 0, total, 1), 0.0)
-    return carry(book, missing)
+    return carry(book, ~active.any(axis=1))
 
 
 def held(weights: np.ndarray, days: np.ndarray, every: int) -> np.ndarray:
