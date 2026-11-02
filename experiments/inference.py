@@ -1081,7 +1081,8 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
         "best_dsr_all_trials": per_row[ids[best]]["dsr_daily_all_trials"],
         "units": ("*_per_day: Sharpe of daily P&L, not annualized (the DSR compares "
                   "best_sharpe_per_day with hurdle_per_day); best_sharpe_daily and *_annual: "
-                  f"the same Sharpe times sqrt({DAYS_A_YEAR:g}); variances per day squared")}
+                  f"the same Sharpe times sqrt({DAYS_A_YEAR:g}); sharpe_var_*: variances of "
+                  "that per-day Sharpe, in its units squared (not annualized)")}
 
     # Probability of backtest overfitting over blocks of days, distinct
     # configurations only: a copy would take a rank of its own.
