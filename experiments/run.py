@@ -43,6 +43,13 @@ harness, and a spec that names none of them runs exactly as before:
 of its own (the inputs differ, so it cannot share a sweep), and every row
 carries the keys the spec names, which also enter its ``row_id``.
 
+``"skip_open": true`` drops each day's first decision (09:30:00) from the
+evaluation and from the risk history. The opening cross's quotes are stale and
+wide -- the half-spread there is several times any other decision's -- so a
+spec can ask whether a result is an artifact of trading into the open. The
+universe is chosen before the drop, so a run with and without the open scores
+the same names, and every row of such a run carries ``skip_open``.
+
 Beside ``series.npz`` (each row's gross, net and cost per period) the run
 writes ``periods.npz``, the label of every one of those periods, so the
 day and time of day of each period can be read back afterwards
@@ -102,6 +109,30 @@ def _restrict(panel: sf.ForwardReturns, assets) -> sf.ForwardReturns:
     index = {a: i for i, a in enumerate(panel.assets.astype(str))}
     take = [index[a] for a in assets]
     return sf.ForwardReturns(panel.values[:, take], panel.decisions, np.asarray(assets),
+                             panel.horizons)
+
+
+def _after_open(decisions) -> np.ndarray:
+    """The decisions that are not their day's first, in their order.
+
+    Labels are ``"<date>|<seconds after the open>"``; the first decision of a
+    day is the one with the smallest offset that day, so a day whose opening
+    decision is missing loses its earliest one instead of none.
+    """
+    labels = np.asarray(decisions).astype(str)
+    days = np.asarray([d.split("|", 1)[0] for d in labels])
+    offsets = np.asarray([int(d.split("|", 1)[1]) for d in labels])
+    first = {}
+    for i, (day, offset) in enumerate(zip(days, offsets)):
+        if day not in first or offset < offsets[first[day]]:
+            first[day] = i
+    drop = set(first.values())
+    return labels[[i for i in range(len(labels)) if i not in drop]]
+
+
+def _drop_open(panel: sf.ForwardReturns) -> sf.ForwardReturns:
+    keep = np.isin(panel.decisions.astype(str), _after_open(panel.decisions))
+    return sf.ForwardReturns(panel.values[keep], panel.decisions[keep], panel.assets,
                              panel.horizons)
 
 
@@ -216,8 +247,12 @@ def assemble_inputs(spec: dict, evaluation: dict, history: dict,
                                              spec.get("adv_days", ADV_DAYS))
     market = sf.MarketData(market_columns, realized.decisions, assets)
     features = evaluation["features"][:, take]
-    return {"realized": realized, "history": past, "market": market, "days": evaluation["days"],
-            "features": features, "feature_names": evaluation["feature_names"]}
+    inputs = {"realized": realized, "history": past, "market": market, "days": evaluation["days"],
+              "features": features, "feature_names": evaluation["feature_names"]}
+    if spec.get("skip_open"):
+        inputs = restrict_decisions(inputs, _after_open(realized.decisions))
+        inputs["history"] = _drop_open(past)
+    return inputs
 
 
 def load_inputs(spec: dict, variant: dict | None = None) -> dict:
@@ -496,6 +531,8 @@ def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0,
     for report in reports:
         row = {"forecast": fspec["kind"], **{f"f_{k}": v for k, v in tag.items()}, **variant,
                "eval_horizon": horizon, **report.as_dict()}
+        if spec.get("skip_open"):
+            row["skip_open"] = True
         if report.config.cost_model != "mid":
             row["breakeven_efq"] = _breakeven(report.series, report.config.efq)
         row.update(_inference(report.series))
@@ -576,6 +613,16 @@ def _git_sha() -> str:
         return "unknown"
 
 
+def _git_state() -> dict:
+    """Whether the tree had uncommitted changes, and a hash of them, for the manifest."""
+    here = Path(__file__).parent
+    try:
+        diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=here)
+    except (OSError, subprocess.CalledProcessError):
+        return {"dirty": None}
+    return {"dirty": bool(diff), "diff_sha256": hashlib.sha256(diff).hexdigest()[:16] if diff else None}
+
+
 def _chunk(configs: list, spec: dict, chunk: int) -> list:
     """One of ``config_chunks`` contiguous slices of a task's configurations.
 
@@ -606,6 +653,8 @@ def _task_key(spec: dict, fspec: dict, horizon: int, chunk: int = 0,
     if int(spec.get("config_chunks", 1)) > 1:
         payload.update(config_chunks=int(spec["config_chunks"]), chunk=chunk)
     payload.update({k: spec[k] for k in ("cache", "adv_days") if k in spec})
+    if spec.get("skip_open"):
+        payload.update(skip_open=True)
     if variant:
         payload.update(data=variant)
     # Named only when set, like the chunks: a checkpoint written without day
@@ -707,7 +756,7 @@ def run(spec_path: str, workers: int = 4) -> Path:
         _write_daily(out / "daily.npz", daily)
     periods.write(out / "periods.npz")
     manifest = {
-        "spec": spec, "git_sha": git_sha, "n_rows": len(rows), "n_tasks": len(tasks),
+        "spec": spec, "git_sha": git_sha, **_git_state(), "n_rows": len(rows), "n_tasks": len(tasks),
         "resumed_tasks": len(tasks) - len(pending),
         "wall_seconds_this_session": time.perf_counter() - t0,
         "task_seconds_total": float(sum(t["seconds"] for t in timings)),
