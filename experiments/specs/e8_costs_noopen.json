@@ -1,6 +1,6 @@
 {
   "name": "e8_costs_noopen",
-  "description": "e8_costs without the 09:30:00 decision (skip_open): returns, latency and fees once the opening cross, whose stale wide quotes dominate every latency comparison, is not traded. Needs the v2 cache and results/signals/reversal_15m.npz. About 12 tasks of 8 configurations: roughly 5 minutes.",
+  "description": "e8_costs without the 09:30:00 decision (skip_open): returns, latency and fees once the opening cross, whose stale wide quotes dominate every latency comparison, is not traded. Not paired with e8_costs: each day's grid starts at 09:35, so every held book is formed five minutes later, and the IC-0.03 oracle's noise is drawn afresh (one seed, so its rows differ from e8_costs' by a whole draw); the reversal signal keeps its values at every kept decision, so its rows are the closer comparison. Needs the v2 cache and results/signals/reversal_15m.npz. About 12 tasks of 8 configurations: roughly 5 minutes.",
   "eval_month": "2020-08",
   "history_month": "2020-07",
   "horizons": [

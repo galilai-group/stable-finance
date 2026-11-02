@@ -50,6 +50,18 @@ spec can ask whether a result is an artifact of trading into the open. The
 universe is chosen before the drop, so a run with and without the open scores
 the same names, and every row of such a run carries ``skip_open``.
 
+The two runs are not paired, though, so a difference between them is not the
+open's effect alone. Each day's grid starts at 09:35 instead, and a book held
+for its horizon is formed every k decisions from the day's first, so every
+holding window moves five minutes later (09:35, 09:50, ..., and the day's
+last formation, whose horizon runs past the close and so earns nothing, from
+15:45 to 15:50). An oracle draws its noise in sequence over the decisions it
+is given, so one decision fewer re-draws all of it (a forecast file keeps its
+values, but its books are formed at the new times). Run the same seeds as the
+run compared with, and read a difference in seed means against the two seed
+ranges (``experiments/appendix.py`` writes ``open_effect.csv`` for the
+break-even ICs).
+
 Every row of the ``impact`` cost model carries ``impact_floor``, the floor in
 basis points its cost carries (0 for none), a scalar a group can be keyed by;
 the ``impact`` column holds the whole coefficient tuple.
