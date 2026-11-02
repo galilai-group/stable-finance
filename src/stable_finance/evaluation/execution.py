@@ -180,11 +180,14 @@ COST_MODEL_REQUIRES: dict[str, tuple[str, ...]] = {
 IMPACT_COEFFICIENTS = (0.0, -0.53, 11.21)
 
 #: A fourth ``impact`` coefficient, when given, is a FLOOR in basis points:
-#: the cost per dollar is never below it. Below the calibration's 0.1% of
-#: daily volume the square root drives the fitted cost toward ``a`` (zero by
-#: default), which a real order -- paying at least part of the spread and a
-#: fee -- does not reach; a floor such as the quoted half-spread keeps a small
-#: book from looking free. Three coefficients mean no floor.
+#: every filled dollar pays at least it, whatever the schedule. Below the
+#: calibration's 0.1% of daily volume the square root drives the fitted cost
+#: toward ``a`` (zero by default), which a real order -- paying at least part
+#: of the spread and a fee -- does not reach; a floor such as the quoted
+#: half-spread keeps a small book from looking free. Under a schedule the
+#: impact is netted over each name's parent order but the floor is not (see
+#: :func:`_impact_fills`), so an order that shrinks or reverses its parent
+#: still pays it. Three coefficients mean no floor.
 
 
 class ImpactStockCoefficients(NamedTuple):
@@ -694,7 +697,9 @@ def impact_cost(size: ArrayLike, *, coefficients: tuple[float, float, float] | N
 
     The calibration starts at 0.1% of daily volume, and below it the curve
     falls toward ``a``. ``coefficients`` may carry a fourth value, a floor in
-    basis points that the cost never goes below (``(a, b, c, floor)``).
+    basis points that the cost never goes below (``(a, b, c, floor)``). This
+    is the cost of one order on its own; :func:`execute` charges the floor
+    on every filled dollar even where a schedule nets the impact.
     """
     a, b, c, *rest = IMPACT_COEFFICIENTS if coefficients is None else coefficients
     x = np.asarray(size, dtype=np.float64)
@@ -743,6 +748,13 @@ def _impact_fills(orders: Orders, market: MarketData, equity, schedule: int,
     parent in flight cancels the parent's unfilled slices, which are then
     not paid for; only what fills is charged.
 
+    A floor (the fourth ``impact`` coefficient) is not netted: the parent's
+    total is the curve alone, and each order's rate is then at least the
+    floor, so every dollar that fills pays it -- an order that shrinks or
+    reverses its parent, which adds no impact, included. With
+    ``schedule=0`` the parent is the order itself and this is
+    :func:`impact_cost` with the floor.
+
     What is outstanding in a name fills in equal slices over the ``schedule``
     decisions after the latest order, so one order ramps the position
     linearly. Every new order restarts that clock for the whole outstanding
@@ -766,6 +778,9 @@ def _impact_fills(orders: Orders, market: MarketData, equity, schedule: int,
     requested = np.nan_to_num(orders.values, nan=0.0)
     n_decisions, n_assets, n_horizons = requested.shape
     priced = np.isfinite(mid) & (mid > 0) & np.isfinite(adv) & (adv > 0)
+    floor = 0.0                                # per unit of weight, never netted
+    if model == "impact" and coefficients is not None and len(coefficients) == 4:
+        coefficients, floor = tuple(coefficients[:3]), coefficients[3] / 1e4
     if model == "impact_stock":
         traits = [market.get(name)[:, :, None] for name in ("market_cap", *CHARACTERISTICS)]
         priced &= np.all([np.isfinite(x[:, :, 0]) for x in traits], axis=0)
@@ -789,7 +804,7 @@ def _impact_fills(orders: Orders, market: MarketData, equity, schedule: int,
         return np.abs(weight) * cost(size)
     charge = np.maximum(total(parent) - total(prior), 0.0)     # fraction of equity
     with np.errstate(invalid="ignore", divide="ignore"):
-        rate = np.where(q != 0, charge / np.abs(q), 0.0)        # per unit of weight
+        rate = np.where(q != 0, np.maximum(charge / np.abs(q), floor), 0.0)   # per unit of weight
 
     quantity = np.zeros_like(q)
     price = np.full(q.shape, np.nan)

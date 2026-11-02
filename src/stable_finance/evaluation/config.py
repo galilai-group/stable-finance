@@ -166,8 +166,9 @@ class BacktestConfig:
     #: one day; ``0`` fills at the decision, the paper's own accounting.
     execution_days: float | None = None
     #: Coefficients for ``cost_model='impact'`` (three, ``(a, b, c)``, or
-    #: four, ``(a, b, c, floor)`` with a floor in basis points the cost per
-    #: dollar never goes below) or ``'impact_stock'`` (eleven, an
+    #: four, ``(a, b, c, floor)`` with a floor in basis points that every
+    #: filled dollar pays at least, whatever ``execution_days``) or
+    #: ``'impact_stock'`` (eleven, an
     #: :class:`~stable_finance.evaluation.execution.ImpactStockCoefficients`);
     #: ``None`` is the paper's U.S. calibration.
     impact: tuple | None = None
