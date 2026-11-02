@@ -9,9 +9,11 @@ This writes both from the finished runs:
   nothing is selected away);
 * ``lookup.csv``: for each construction (weighting and selection) and EFQ, the
   forecast IC at which net Sharpe crosses zero, interpolated in log IC between
-  the oracle ICs that bracket it, from the expected-IC run (E1x) when it
-  exists, else E1. NaN where the construction never or always pays across the
-  ICs run.
+  the oracle ICs that bracket it, from the dense break-even run
+  (``e1x_breakeven``) when it exists, else the expected-IC run (E1x), else E1.
+  The crossing is found on the seed-mean curve and, where the run has several
+  seeds, on each seed's own curve, whose range is reported beside it. NaN
+  where the construction never or always pays across the ICs run.
 
     uv run --extra experiments python -m experiments.appendix [--results DIR]
 """
@@ -54,7 +56,7 @@ def breakeven_ic(curve) -> float:
 def lookup(results: Path):
     import pandas as pd
 
-    for name in ("e1x_expected_ic", "e1_transfer_map"):
+    for name in ("e1x_breakeven", "e1x_expected_ic", "e1_transfer_map"):
         path = results / name / "rows.parquet"
         if path.is_file():
             rows = pd.read_parquet(path)
@@ -63,11 +65,23 @@ def lookup(results: Path):
         return None
     rows = rows[(rows["f_noise"] == "random") & (rows["efq"] > 0)]
     out = []
+    seeds = sorted(rows["f_seed"].unique()) if "f_seed" in rows else []
     for (weighting, selection, efq), part in rows.groupby(["weighting", "selection", "efq"]):
         curve = part.groupby("f_ic")["sharpe_net"].mean()
-        out.append({"source": name, "weighting": weighting, "selection": selection, "efq": efq,
-                    "breakeven_ic": breakeven_ic(curve),
-                    "net_sharpe_at_max_ic": float(curve.iloc[-1])})
+        record = {"source": name, "weighting": weighting, "selection": selection, "efq": efq,
+                  "breakeven_ic": breakeven_ic(curve),
+                  "net_sharpe_at_max_ic": float(curve.iloc[-1])}
+        if len(seeds) > 1:
+            each = np.array([breakeven_ic(part[part["f_seed"] == s].groupby("f_ic")["sharpe_net"].mean())
+                             for s in seeds])
+            crossed = each[np.isfinite(each)]
+            record.update(n_seeds=len(seeds), seeds_crossing=int(len(crossed)),
+                          breakeven_ic_min=float(crossed.min()) if len(crossed) else np.nan,
+                          breakeven_ic_max=float(crossed.max()) if len(crossed) else np.nan)
+        if "sharpe_daily_net" in part:
+            record["daily_net_sharpe_at_max_ic"] = float(
+                part.groupby("f_ic")["sharpe_daily_net"].mean().iloc[-1])
+        out.append(record)
     return pd.DataFrame(out)
 
 
