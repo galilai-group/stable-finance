@@ -293,3 +293,32 @@ def test_a_spec_can_set_the_grouping(tmp_path):
     assert [g["n_configs"] for g in report["groups"]] == [6, 6]
     # Gross is shared across EFQ but net is not, so all six are distinct.
     assert [g["distinct_models"] for g in report["groups"]] == [6, 6]
+
+
+def test_clustered_rate_widens_the_interval_when_rejections_come_together():
+    spread = np.tile([True] + [False] * 9, 10)                  # one hit in each cluster
+    bunched = np.r_[[True] * 10, [False] * 90]                  # all hits in one cluster
+    clusters = np.repeat(np.arange(10), 10)
+    rate, low, high = inference.clustered_rate(spread, clusters)
+    assert rate == 0.1 and (low, high) == inference.wilson_interval(10, 100)
+    rate, low_b, high_b = inference.clustered_rate(bunched, clusters)
+    assert rate == 0.1 and low_b < low and high_b > high + 0.15
+    # No rejection: each cluster counts as one trial, not a zero-width interval.
+    assert inference.clustered_rate(np.zeros(100, bool), clusters)[1:] == (
+        0.0, inference.wilson_interval(0, 10)[1])
+    assert np.isnan(inference.clustered_rate([True, False], [0, 0])[1])
+
+
+def test_size_check_counts_the_lowest_efq_once_and_clusters_by_group():
+    t = [3.0, 0.1, 0.2, 0.3, 3.0, 0.1, 0.2, 0.3]
+    table = pd.DataFrame({"row_id": list("abcdefgh"), "f_ic": [0.0] * 8,
+                          "efq": [0.0] * 4 + [0.7] * 4,
+                          "group": ["s0", "s0", "s1", "s1", "s0b", "s0b", "s1b", "s1b"],
+                          "sharpe_t_hac_mid": t, "sharpe_t_iid_mid": t,
+                          "sharpe_daily_t_hac_mid": t})
+    size = inference.size_check(table)
+    assert size["n_rows"] == 4 and size["efq"] == 0.0 and size["n_clusters"] == 2
+    assert size["reject_sharpe_daily_t_hac_mid"] == 0.25
+    low, high = size["interval_sharpe_daily_t_hac_mid"]
+    assert 0.0 < low < 0.25 and high > 0.5        # wider than Wilson on the four rows
+    assert high > inference.wilson_interval(1, 4)[1]
