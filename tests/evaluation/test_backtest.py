@@ -696,6 +696,98 @@ def test_a_held_book_restarts_at_each_day_and_reads_date_anchor_labels():
     assert report.n_periods == 10 * 3          # decisions 0, 3 and 6 of each day
 
 
+def held_world(unknown):
+    """``world()`` on Market-1T labels, with the realized return NaN where ``unknown``.
+
+    Eight decisions a day, 300 seconds apart: the 900-second horizon is three
+    decisions, so a held book is set at decisions 0, 3 and 6 of each day.
+    """
+    w = world()
+    labels = np.array([f"2020-08-{3 + d:02d}|{1800 + 300 * k}"
+                       for d in range(10) for k in range(8)])
+    realized = np.where(unknown[:, None], np.nan, w["realized"].values[:, :, 0])
+    return {"forecast": panel(w["forecast"].values, decisions=labels),
+            "realized": panel(realized, decisions=labels),
+            "history": panel(w["history"].values, decisions=labels),
+            "half_spread": w["half_spread"], "days": w["days"]}
+
+
+HELD = DEFAULT_BACKTEST.replace(weighting="equal", risk_model="diagonal",
+                                annualization="decisions", rebalance="horizon")
+
+
+def test_a_formation_whose_return_is_never_known_sets_a_flat_book():
+    # The last block of each day runs past the close, so its forward return
+    # is NaN for every name (the 15:45 book at 900 seconds). A forecast known
+    # there used to trade into a book that could never earn, and was charged
+    # for it. Its view there is now dropped, as an oracle's is (an oracle is
+    # unknown wherever the return is), so the book is set flat, closing the
+    # one before it.
+    k = np.tile(np.arange(8), 10)
+    late = k >= 6
+    setup = held_world(unknown=late)
+    mu = setup["forecast"].values[:, :, 0]
+    report = run_backtest(**setup, config=HELD, with_series=True)
+    blind = run_backtest(**{**setup, "forecast": panel(np.where(late[:, None], np.nan, mu),
+                                                      decisions=setup["forecast"].decisions)},
+                         config=HELD, with_series=True)
+    assert report.as_dict() == blind.as_dict()
+    np.testing.assert_array_equal(report.series.cost, blind.series.cost)
+
+    # What should have traded: the books set at 0 and 3, and nothing from 6 on.
+    weights = weight_book("equal", select_book("all", mu, np.ones(mu.shape, bool)), mu,
+                          np.eye(6), gross_exposure=HELD.gross_exposure)
+    held = np.where(late[:, None], 0.0, weights[np.arange(80) - k % 3])
+    traded = run_backtest(PortfolioWeights(held[:, :, None], setup["forecast"].decisions,
+                                           ASSETS, AXIS),
+                          setup["realized"], half_spread=setup["half_spread"],
+                          days=setup["days"], with_series=True,
+                          config=HELD.replace(rebalance="every_decision"))
+    assert report.n_periods == 10 * 3
+    book = np.cumsum(k % 3 == 0) - 1
+    np.testing.assert_allclose(report.series.cost, np.bincount(book, traded.series.cost),
+                               rtol=1e-12, atol=0)
+    # The flat book earns nothing and is charged exactly the closing trade.
+    six = np.flatnonzero(k == 6)
+    assert np.all(report.series.gross[2::3] == 0.0)
+    np.testing.assert_allclose(report.series.cost[2::3],
+                               (np.abs(held[six - 1]) * setup["half_spread"][six]).sum(axis=1),
+                               rtol=1e-12)
+    realized = setup["realized"].values[:, :, 0]
+    formed = (k == 0) | (k == 3)
+    np.testing.assert_allclose(np.delete(report.series.gross, np.s_[2::3]),
+                               (weights[formed] * realized[formed]).sum(axis=1),
+                               rtol=1e-12, atol=1e-15)
+
+
+def test_a_held_cost_aware_book_drops_its_view_where_the_return_is_never_known():
+    # The cost-aware allocator plans a path, so its held book is not set flat
+    # after the fact (a full exit and re-entry on a book meant to be kept);
+    # the forecast is dropped there before the path is solved, as an
+    # oracle's is. Rebalanced at every decision, the view is still used.
+    k = np.tile(np.arange(8), 10)
+    late = k >= 6
+    setup = held_world(unknown=late)
+    blind = {**setup, "forecast": panel(np.where(late[:, None], np.nan,
+                                                 setup["forecast"].values[:, :, 0]),
+                                        decisions=setup["forecast"].decisions)}
+    held = DEFAULT_BACKTEST.replace(annualization="decisions", rebalance="horizon", max_iter=20)
+    report = run_backtest(**setup, config=held, with_series=True)
+    oracle = run_backtest(**blind, config=held, with_series=True)
+    assert report.as_dict() == oracle.as_dict()
+    np.testing.assert_array_equal(report.series.cost, oracle.series.cost)
+    every = held.replace(rebalance="every_decision")
+    assert run_backtest(**setup, config=every).sharpe_net != run_backtest(**blind, config=every).sharpe_net
+    # A sweep keeps the book that dropped part of its view apart from the one
+    # that did not, though the two share every book axis.
+    configs = [every, held, every.replace(efq=0.5), held.replace(efq=0.5)]
+    swept = sweep_configs(setup["forecast"], setup["realized"], configs,
+                          half_spread=setup["half_spread"], history=setup["history"],
+                          days=setup["days"])
+    alone = [run_backtest(**setup, config=config) for config in configs]
+    assert [r.as_dict() for r in swept] == [r.as_dict() for r in alone]
+
+
 def test_horizon_rebalancing_needs_decision_times_and_one_step_drift_is_refused():
     w = world()
     named = np.array([f"d{i}" for i in range(80)])

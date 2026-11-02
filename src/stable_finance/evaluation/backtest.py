@@ -352,8 +352,24 @@ def _book(context: dict, config: BacktestConfig, sigma: NDArray[np.float64]
     only in ``neutralize`` would read each other's. Returned together, the pair
     is cached together, so the transfer coefficient a sweep reports is the one
     :func:`run_backtest` would.
+
+    A HELD BOOK HAS NO VIEW WHERE ITS RETURN IS NEVER KNOWN. A held book earns
+    its forward return once, at its formation, and at the last formations of
+    a day that return runs past the close and is NaN for every name: a book
+    set there earns nothing. Under ``rebalance="horizon"`` the forecast at
+    such a decision is therefore dropped before the book is built, exactly as
+    though it were an oracle's, which is NaN wherever the return is. A
+    path-independent rule then sets a flat book, closing the one before it;
+    the cost-aware allocator unwinds as risk and cost allow. No trade into a
+    book that cannot earn is made or charged, and the exit from the book
+    before it is charged as an oracle's always was. (Setting the HELD book
+    flat after the fact instead would force a mean-variance book, which
+    barely trades, through a full exit and re-entry.)
     """
     spread = context["spread"]
+    if _drops_forecast(context, config):
+        context = {**context, "mu": np.where(_no_outcome(context)[:, None], np.nan,
+                                             context["mu"])}
     mu = context["mu"]
 
     # THE SCREEN AND THE BOOK ARE DIFFERENT SETS. ``screened`` is what the
@@ -524,7 +540,9 @@ def _formations(context: dict) -> NDArray[np.bool_]:
 
     k is the forecast horizon in decisions. Blocks restart at each day, since
     a forward return does not run across the close; without ``days`` the
-    decisions are one run.
+    decisions are one run. A formation whose forward return is unknown for
+    every name still starts a period, but the forecast has no view there (see
+    :func:`_book`), so the period carries the unwinding of the book before it.
     """
     if "formed" not in context:
         if context["horizon"] <= 0:
@@ -538,6 +556,25 @@ def _formations(context: dict) -> NDArray[np.bool_]:
             index = index - np.maximum.accumulate(np.where(starts, index, 0))
         context["formed"] = index % every == 0
     return context["formed"]
+
+
+def _no_outcome(context: dict) -> NDArray[np.bool_]:
+    """The decisions at which no name's forward return is known."""
+    if "dead" not in context:
+        context["dead"] = ~np.isfinite(context["outcome_values"]).any(axis=1)
+    return context["dead"]
+
+
+def _drops_forecast(context: dict, config: BacktestConfig) -> bool:
+    """Whether this configuration's book is built with part of the forecast dropped.
+
+    True for a held book whose forecast has a view at a decision where no
+    forward return is known (see :func:`_book`); a forecast already unknown
+    at every such decision, as an oracle's is, has nothing to drop.
+    """
+    if config.rebalance != "horizon" or context["mu"] is None:
+        return False
+    return bool(np.isfinite(context["mu"][_no_outcome(context)]).any())
 
 
 def _hold_from(weights, formed):
@@ -936,7 +973,8 @@ def sweep_configs(
                 )
             if config.neutralize in ("beta", "beta_industry"):
                 _beta(context, history, realized)
-            book_key = _book_key(config)
+            # A held book that drops part of its forecast is a different book.
+            book_key = (*_book_key(config), ("drops_forecast", _drops_forecast(context, config)))
             if book_key in book_cache:
                 book_cache.move_to_end(book_key)
             else:
