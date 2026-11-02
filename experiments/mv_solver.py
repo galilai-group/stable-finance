@@ -58,7 +58,13 @@ import numpy as np
 import scipy.linalg as sla
 
 import stable_finance as sf
-from experiments.run import _breakeven, _inference, load_inputs, restrict_decisions
+from experiments.run import (
+    _breakeven,
+    _git_sha,
+    _inference,
+    load_inputs,
+    restrict_decisions,
+)
 from stable_finance.evaluation import backtest
 
 OUT = Path(__file__).resolve().parent / "results" / "mv_solver"
@@ -367,7 +373,7 @@ def main(argv=None) -> int:
                                           "seed": 0},
                "assets": len(inputs["realized"].assets),
                "decisions": len(inputs["realized"].decisions),
-               "restart_max_iter": sf.RESTART_MAX_ITER, "runs": []}
+               "restart_max_iter": sf.RESTART_MAX_ITER, "git_sha": _git_sha(), "runs": []}
     arrays = {}
     for efq in args.efq:
         run, run_arrays, records = run_efq(inputs, forecast, efq)
