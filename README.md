@@ -180,16 +180,21 @@ the positive semidefinite cone. A NaN cost marks an asset that cannot be
 traded at that decision, so it holds its previous weight; a NaN forecast is a
 zero expected return that still pays risk and cost.
 
-`trades.dynamic` holds three rules that trade less than all the way to the
+`trades.dynamic` holds two rules that trade less than all the way to the
 target, each a function of a target path and the book held:
 `partial_adjustment(target, rate)` moves a fixed fraction of the gap each
-decision; `no_trade_band(target, band, cost=half_spread)` holds a name until
-its target leaves a band (here a multiple of its cost) and then trades to the
-band's edge (Constantinides, 1986); `aim_portfolio(forecast, sigma,
-risk_aversion=..., cost_aversion=...)` is Garleanu and Pedersen's (2013) aim,
-which weights forecasts at several horizons by how slowly they decay. Their
-output is `PortfolioWeights`, scored by entering `run_backtest` at the
-weights level.
+decision, and `no_trade_band(target, band, cost_belief=half_spread)` holds a
+name until its target leaves a band (here a multiple of what the policy
+believes it costs to trade) and then trades to the band's edge (the form of
+Constantinides, 1986). The target can come from
+`portfolio.construction.aim_portfolio(forecast, sigma, risk_aversion=...,
+cost_aversion=...)`, the form of Garleanu and Pedersen's (2013) aim, which
+weights forecasts at several horizons by how slowly they decay. These are
+parametric policies: the rate, the band and the cost aversion are free
+parameters, not the papers' optimal values, and any cost they take is the
+policy's belief, never charged. What a book pays comes from the harness's
+cost models on its fills: the output is `PortfolioWeights`, scored by
+entering `run_backtest` at the weights level.
 
 `trades.rl` holds policies learned for their net-of-cost performance rather
 than written by hand. The first, `ParametricPolicy`, follows Brandt,
@@ -477,14 +482,15 @@ any cost model except `mid`, which stays the frictionless benchmark (use
 | `fee_per_share` | dollars per share traded, on either side, converted at each name's mid; needs a `mid` (or the bid and ask), and `check_config` refuses it without one |
 | `sec_fee_rate` | a fraction of the notional sold, on sales only |
 
-With the values in force in 2020 -- the Regulation NMS Rule 610 access-fee
-cap and the fiscal-2020 Section 31 rate, both exported:
+The values are facts of a sample, so they are passed in, not held by the
+library. For 2020 -- the Regulation NMS Rule 610 access-fee cap and the
+fiscal-2020 Section 31 rate:
 
 ```python
-from stable_finance import ACCESS_FEE_CAP_2020, SEC_FEE_RATE_FY2020, BacktestConfig
+from stable_finance import BacktestConfig
 
-config = BacktestConfig(fee_per_share=ACCESS_FEE_CAP_2020,   # $0.003 per share
-                        sec_fee_rate=SEC_FEE_RATE_FY2020)    # $22.10 per $1M sold
+config = BacktestConfig(fee_per_share=0.003,     # $ per share, the access-fee cap
+                        sec_fee_rate=22.10e-6)   # $22.10 per $1M sold
 report = run_backtest(forecast, realized, market=market, config=config)
 report.mean_fee_bps          # the part of mean_cost_bps that is fees
 ```

@@ -98,7 +98,6 @@ from stable_finance.evaluation.portfolio.contract import PortfolioWeights
 from stable_finance.evaluation.returns.contract import ForwardReturns
 
 __all__ = [
-    "ACCESS_FEE_CAP_2020",
     "COST_MODELS",
     "COST_MODEL_REQUIRES",
     "EFQ_DIRECT_ACCESS",
@@ -111,7 +110,6 @@ __all__ = [
     "IMPACT_COEFFICIENTS",
     "IMPACT_STOCK_COEFFICIENTS",
     "ImpactStockCoefficients",
-    "SEC_FEE_RATE_FY2020",
     "effective_half_spread",
     "execute",
     "fee_cost",
@@ -256,23 +254,6 @@ FEE_REQUIRES: dict[str, tuple[str, ...]] = {
     "fee_per_share": ("mid",),
     "sec_fee_rate": (),
 }
-
-#: The most an exchange could charge to take a protected quote in 2020, in
-#: dollars per share: Regulation NMS Rule 610(c), for quotes at or above
-#: $1.00 (below it the cap is 0.3% of the quote). Every lit venue priced its
-#: take fee at or just under it, so it is the fee a marketable order paid.
-#: The SEC cut the cap to $0.001 only in its 2024 amendments, so it is the
-#: right value for any sample from 2005 to 2024. About 1.5 bp per side on a
-#: $20 stock, the same order as the half-spread of a liquid name.
-ACCESS_FEE_CAP_2020 = 0.003
-
-#: The SEC's Section 31 fee for fiscal 2020, as a fraction of the dollars
-#: sold: $22.10 per million, in force from 18 February 2020 (SEC press
-#: release 2020-7). It is charged on sales only -- passed through by the
-#: exchanges to the selling broker -- so a long position pays it on the exit
-#: and a short on the entry.
-SEC_FEE_RATE_FY2020 = 22.10e-6
-
 
 def _efq_array(efq: ArrayLike, name: str = "efq") -> NDArray[np.float64]:
     """An EFQ as a float array, refused unless finite and non-negative."""
@@ -976,10 +957,12 @@ def fee_per_unit(price: ArrayLike | None = None, *, fee_bps: float | None = None
     and the scoring (:func:`fee_cost`) bills each sale the full rate when it
     happens.
 
-    With the 2020 values, on a $20 stock::
+    With 2020's values on a $20 stock -- the Regulation NMS Rule 610(c) access-fee
+    cap of $0.003 a share, which lit venues charged to take a quote, and the
+    SEC's fiscal-2020 Section 31 rate of $22.10 per million sold. They are
+    facts of a sample, so a caller passes them; the library holds none::
 
-        fee_per_unit(20.0, fee_per_share=ACCESS_FEE_CAP_2020,   # 0.003 $/share
-                     sec_fee_rate=SEC_FEE_RATE_FY2020)          # 22.10e-6
+        fee_per_unit(20.0, fee_per_share=0.003, sec_fee_rate=22.10e-6)
         # 0.003 / 20 + 22.10e-6 / 2 = 1.6105e-4, about 1.6 bp per unit traded
     """
     fee_bps, fee_per_share, sec_fee_rate = _fees(fee_bps, fee_per_share, sec_fee_rate)

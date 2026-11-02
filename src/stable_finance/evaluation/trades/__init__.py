@@ -1,7 +1,6 @@
 """Stage 4, target to trades: the trading policies. How far to move given costs, and whether a trade is worth making; hand-written rules, and in ``rl`` the learned policies."""
 
 from stable_finance.evaluation.trades.dynamic import (
-    aim_portfolio,
     no_trade_band,
     partial_adjustment,
 )
@@ -24,7 +23,6 @@ __all__ = [
     "RESTART_MAX_ITER",
     "MeanVarianceAllocator",
     "ParametricPolicy",
-    "aim_portfolio",
     "allocate",
     "edge_to_cost",
     "no_trade_band",

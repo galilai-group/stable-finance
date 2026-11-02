@@ -222,10 +222,9 @@ def test_embedding_risk_model_requires_embeddings():
         estimate_risk("embedding", world()["history"])
 
 
-def test_the_factor_model_is_selectable_but_not_swept():
-    assert "factor" in RISK_MODELS
-    assert "factor" not in CONFIG_SPACE["risk_model"]
-    assert {c.risk_model for c in enumerate_configs()} == set(CONFIG_SPACE["risk_model"])
+def test_the_sweep_takes_its_risk_models_from_the_one_list():
+    assert CONFIG_SPACE["risk_model"] == RISK_MODELS
+    assert {c.risk_model for c in enumerate_configs()} == set(RISK_MODELS)
     asked = enumerate_configs(risk_model=("factor",), weighting="min_var", efq=0.0,
                               universe="all", selection="all", rebalance="every_decision")
     assert [c.risk_model for c in asked] == ["factor"]

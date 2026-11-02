@@ -76,7 +76,6 @@ from stable_finance.evaluation.events import (
     event_inputs,
 )
 from stable_finance.evaluation.execution import (
-    ACCESS_FEE_CAP_2020,
     COST_MODEL_REQUIRES,
     COST_MODELS,
     EFQ_DIRECT_ACCESS,
@@ -89,7 +88,6 @@ from stable_finance.evaluation.execution import (
     Fills,
     ImpactStockCoefficients,
     Orders,
-    SEC_FEE_RATE_FY2020,
     effective_half_spread,
     execute,
     execution_requires,
@@ -120,6 +118,7 @@ from stable_finance.evaluation.portfolio import (
     WEIGHTING_REQUIRES,
     WEIGHTING_RULES,
     PortfolioWeights,
+    aim_portfolio,
     alpha_from_rule,
     apply_screen,
     apply_signal,
@@ -188,7 +187,6 @@ from stable_finance.evaluation.trades import (
     RESTART_MAX_ITER,
     MeanVarianceAllocator,
     ParametricPolicy,
-    aim_portfolio,
     allocate,
     edge_to_cost,
     no_trade_band,
@@ -200,7 +198,6 @@ from stable_finance.evaluation.trades import (
 )
 
 __all__ = [
-    "ACCESS_FEE_CAP_2020",
     "ADV",
     "ALLOCATORS",
     "ALPHA_RULES",
@@ -254,7 +251,6 @@ __all__ = [
     "RISK_MODELS",
     "RISK_MODEL_REQUIRES",
     "RidgeProbe",
-    "SEC_FEE_RATE_FY2020",
     "SELECTION_REQUIRES",
     "SELECTION_RULES",
     "SIGNAL_REQUIRES",

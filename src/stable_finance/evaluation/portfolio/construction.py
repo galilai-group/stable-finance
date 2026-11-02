@@ -48,6 +48,7 @@ __all__ = [
     "SELECTION_RULES",
     "WEIGHTING_REQUIRES",
     "WEIGHTING_RULES",
+    "aim_portfolio",
     "mean_variance_target",
     "select_book",
     "tail_selection",
@@ -774,3 +775,72 @@ def mean_variance_target(
         target[:, :, horizon] = (
             np.linalg.solve(sigma[horizon], mu[:, :, horizon].T).T / aversion[:, None])
     return PortfolioWeights(target, forecast.decisions, forecast.assets, forecast.horizons)
+
+
+def aim_portfolio(
+    forecast: ForwardReturns,
+    covariance: ArrayLike,
+    *,
+    risk_aversion: float | ArrayLike,
+    half_lives: ArrayLike | None = None,
+    cost_aversion: float = 0.0,
+    spacing: float | None = None,
+) -> PortfolioWeights:
+    """A target from forecasts at several horizons, each weighted by how long it lasts.
+
+    ``forecast`` holds expected returns over each of its horizons (seconds);
+    ``covariance`` is the ``(n_assets, n_assets)`` risk of one decision's
+    return. Each horizon's forecast is first put per decision, ``mu_h * spacing
+    / h``, with ``spacing`` the seconds between decisions (default: the
+    shortest horizon). In Garleanu and Pedersen's model a signal ``k`` that
+    mean-reverts at rate ``phi_k`` enters the aim portfolio as
+
+        aim_t = (risk_aversion * Sigma)^-1 sum_k mu_k,t / (1 + phi_k * a / gamma),
+
+    where ``a / gamma`` is trading cost relative to risk aversion
+    (``cost_aversion`` here) and ``phi_k = ln 2 / half_life_k`` with the
+    half-life in decisions. ``cost_aversion`` is the target's BELIEF about
+    cost, a free parameter: nothing charges it, and tuned on its own (apart
+    from a trading rate) it makes this the target of a parametric policy, not
+    the paper's optimal aim. ``half_lives`` defaults to each horizon in
+    decisions, ``h / spacing``: a forecast of the next hour has done its work
+    in an hour. With ``cost_aversion=0`` every signal counts fully and the aim
+    is the frictionless mean-variance portfolio of their sum; as trading gets
+    costlier the fast signals are shrunk most. With one horizon equal to the
+    spacing and no cost aversion it is exactly
+    :func:`~stable_finance.evaluation.portfolio.construction.mean_variance_target`.
+
+    A horizon whose forecast is NaN for a name contributes nothing for it; a
+    name with no forecast at any horizon has a NaN aim. ``risk_aversion`` is a
+    positive scalar or one value per decision. Returns weights on the
+    shortest horizon's axis.
+    """
+    mu = np.asarray(forecast.values, dtype=np.float64)
+    horizons = np.asarray(forecast.horizons, dtype=np.float64)
+    if np.any(horizons <= 0):
+        raise ValueError("aim_portfolio needs horizons of fixed, positive length")
+    step = float(horizons.min() if spacing is None else spacing)
+    if not np.isfinite(step) or step <= 0:
+        raise ValueError("spacing must be a positive number of seconds")
+    lives = horizons / step if half_lives is None else np.asarray(half_lives, dtype=np.float64)
+    if lives.shape != horizons.shape or not np.all(np.isfinite(lives) & (lives > 0)):
+        raise ValueError("half_lives must be one positive value per horizon")
+    if not np.isfinite(cost_aversion) or cost_aversion < 0:
+        raise ValueError("cost_aversion must be finite and non-negative")
+    sigma = np.asarray(covariance, dtype=np.float64)
+    n_decisions, n_assets, _ = mu.shape
+    if sigma.shape != (n_assets, n_assets):
+        raise ValueError(f"covariance must have shape {(n_assets, n_assets)}, got {sigma.shape}")
+    aversion = np.broadcast_to(np.asarray(risk_aversion, dtype=np.float64), (n_decisions,))
+    if not np.all(np.isfinite(aversion) & (aversion > 0)):
+        raise ValueError("risk_aversion must be finite and positive")
+
+    persistence = 1.0 / (1.0 + np.log(2.0) / lives * cost_aversion)
+    per_decision = mu * (step / horizons)
+    combined = np.nansum(per_decision * persistence, axis=2)
+    known = np.isfinite(mu).any(axis=2)
+    weights = np.linalg.solve(sigma, np.where(known, combined, 0.0).T).T / aversion[:, None]
+    weights = np.where(known, weights, np.nan)
+    shortest = int(np.argmin(horizons))
+    return PortfolioWeights(weights[:, :, None], forecast.decisions, forecast.assets,
+                            [forecast.horizons[shortest]])
