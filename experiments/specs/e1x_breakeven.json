@@ -1,0 +1,58 @@
+{
+  "name": "e1x_breakeven",
+  "description": "Break-even ICs with seed intervals: E1x's random-error oracle on a dense IC grid {0.04, ..., 0.10} under five seeds, every construction on the whole cross-section and the deciles, at EFQ 0, 0.7 and 1.0, held for the 15-minute horizon. appendix.py reads it for lookup.csv. 35 tasks of 30 configurations: roughly 25 minutes on 4 cores.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [
+    900
+  ],
+  "forecasts": {
+    "kind": "oracle",
+    "ic": [
+      0.04,
+      0.05,
+      0.06,
+      0.07,
+      0.08,
+      0.09,
+      0.1
+    ],
+    "noise": [
+      "random"
+    ],
+    "seed": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "configs": {
+    "base": {
+      "cost_model": "cross",
+      "risk_model": "shrunk_sample",
+      "universe": "all",
+      "annualization": "decisions",
+      "rebalance": "horizon"
+    },
+    "grid": {
+      "weighting": [
+        "equal",
+        "rank",
+        "signal",
+        "hrp",
+        "min_var_qp"
+      ],
+      "selection": [
+        "all",
+        "decile"
+      ],
+      "efq": [
+        0.0,
+        0.7,
+        1.0
+      ]
+    }
+  }
+}

@@ -165,7 +165,9 @@ class BacktestConfig:
     #: measured in decisions from the ``days`` labels. ``None`` is the paper's
     #: one day; ``0`` fills at the decision, the paper's own accounting.
     execution_days: float | None = None
-    #: Coefficients for ``cost_model='impact'`` (three, ``(a, b, c)``) or
+    #: Coefficients for ``cost_model='impact'`` (three, ``(a, b, c)``, or
+    #: four, ``(a, b, c, floor)`` with a floor in basis points that every
+    #: filled dollar pays at least, whatever ``execution_days``) or
     #: ``'impact_stock'`` (eleven, an
     #: :class:`~stable_finance.evaluation.execution.ImpactStockCoefficients`);
     #: ``None`` is the paper's U.S. calibration.
@@ -263,11 +265,14 @@ class BacktestConfig:
             raise ValueError("execution_days must be a non-negative number")
         if self.impact is not None:
             values = tuple(self.impact)
-            wanted = 11 if self.cost_model == "impact_stock" else 3
-            if len(values) != wanted or not all(isinstance(v, (int, float)) and np.isfinite(v)
-                                                for v in values):
-                raise ValueError(f"impact must be {wanted} finite coefficients for "
-                                 f"cost_model={self.cost_model!r}")
+            wanted = (11,) if self.cost_model == "impact_stock" else (3, 4)
+            if len(values) not in wanted or not all(isinstance(v, (int, float)) and np.isfinite(v)
+                                                    for v in values):
+                raise ValueError(f"impact must be {' or '.join(map(str, wanted))} finite "
+                                 f"coefficients for cost_model={self.cost_model!r}")
+            if len(values) == 4 and values[3] < 0:
+                raise ValueError("the impact floor (the fourth coefficient) is in basis points "
+                                 "and cannot be negative")
             object.__setattr__(self, "impact", tuple(float(v) for v in values))
         if self.alpha is not None and self.alpha not in ALPHA_RULES:
             raise ValueError(f"alpha={self.alpha!r} is not one of {ALPHA_RULES}")

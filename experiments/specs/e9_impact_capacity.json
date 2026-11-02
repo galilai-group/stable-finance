@@ -1,6 +1,6 @@
 {
   "name": "e9_impact_capacity",
-  "description": "Capacity: the impact cost model (Frazzini, Israel and Moskowitz 2018, worked over the day) at book sizes of 0.1, 1, 10 and 100 million dollars against the cross-spread model, for oracles at IC 0.03 and 0.05, signal and HRP books held for the horizon. Needs the v2 cache (it supplies adv, a causal 20-day average daily dollar volume). About 2 tasks of 20 configurations: roughly 10 minutes.",
+  "description": "Capacity: the impact cost model (Frazzini, Israel and Moskowitz 2018) at book sizes of 0.1, 1, 10 and 100 million dollars, against crossing the spread at EFQ 0.7 and 1.0 ($1M), for random-error oracles at IC 0.03 and 0.05 under ten seeds, signal and HRP books held for the horizon, with 2020 fees (Reg NMS take fee 0.003 USD/share, SEC Section 31 at 22.10e-6 on sales) on every row. The impact model is run as calibrated and with a 3 bp cost floor (impact=(0, -0.53, 11.21, 3)), since the e9 orders sit far below the calibration's 0.1% of daily volume, and over an execution_days sweep {0, 3/78, 0.25, 1}: the schedule restarts at every order, so a long schedule holds only part of a fast target. The floor is flat, while the 09:30 open's quoted half-spread averages about 32 bp: there the impact arm still fills near the mid while the cross arm pays the open's spread, so part of the cross-versus-impact gap is the open. Compare constructions only within one book size, schedule, floor, cost model and EFQ: inference's default groups split the scoring settings that vary (cost_model, equity, execution_days) beside the forecast, seed, IC, horizon and EFQ, and the spec adds the floor (inference.group_add, on the scalar impact_floor column every impact row carries). The floor is charged on every filled dollar, so it is not netted away at longer schedules. Needs the v2 cache. 20 tasks of 68 configurations: roughly 30 minutes on 4 cores.",
   "eval_month": "2020-08",
   "history_month": "2020-07",
   "horizons": [
@@ -16,7 +16,18 @@
     "noise": [
       "random"
     ],
-    "seed": 0
+    "seed": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ]
   },
   "configs": {
     "base": {
@@ -25,7 +36,8 @@
       "annualization": "decisions",
       "selection": "all",
       "rebalance": "horizon",
-      "efq": 1.0
+      "fee_per_share": 0.003,
+      "sec_fee_rate": 2.21e-05
     },
     "grid": {
       "weighting": [
@@ -36,11 +48,30 @@
         "cross",
         "impact"
       ],
+      "efq": [
+        0.7,
+        1.0
+      ],
       "equity": [
         100000.0,
         1000000.0,
         10000000.0,
         100000000.0
+      ],
+      "execution_days": [
+        0.0,
+        0.0385,
+        0.25,
+        1.0
+      ],
+      "impact": [
+        null,
+        [
+          0.0,
+          -0.53,
+          11.21,
+          3.0
+        ]
       ]
     },
     "exclude": [
@@ -55,7 +86,37 @@
       {
         "cost_model": "cross",
         "equity": 100000000.0
+      },
+      {
+        "cost_model": "cross",
+        "execution_days": 0.0385
+      },
+      {
+        "cost_model": "cross",
+        "execution_days": 0.25
+      },
+      {
+        "cost_model": "cross",
+        "execution_days": 1.0
+      },
+      {
+        "cost_model": "cross",
+        "impact": [
+          0.0,
+          -0.53,
+          11.21,
+          3.0
+        ]
+      },
+      {
+        "cost_model": "impact",
+        "efq": 0.7
       }
+    ]
+  },
+  "inference": {
+    "group_add": [
+      "impact_floor"
     ]
   }
 }

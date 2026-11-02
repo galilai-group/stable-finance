@@ -1,0 +1,59 @@
+{
+  "name": "e7_factor_oracle_pca",
+  "description": "E7 with principal-component neutralization (neutralize='pca3', the three directions factor_forecast puts its errors in) beside beta, under eight seeds: does removing the whole error factor structure restore the Sharpe the factor errors cost? Factor oracles at IC 0.03 with 0, 30% and 60% factor share. 24 tasks of 24 configurations: roughly 20 minutes on 4 cores.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [
+    900
+  ],
+  "forecasts": {
+    "kind": "factor",
+    "ic": [
+      0.03
+    ],
+    "n_factors": 3,
+    "factor_share": [
+      0.0,
+      0.3,
+      0.6
+    ],
+    "seed": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ]
+  },
+  "configs": {
+    "base": {
+      "cost_model": "cross",
+      "universe": "all",
+      "annualization": "decisions",
+      "selection": "all",
+      "rebalance": "horizon"
+    },
+    "grid": {
+      "weighting": [
+        "signal",
+        "hrp"
+      ],
+      "neutralize": [
+        null,
+        "beta",
+        "pca3"
+      ],
+      "risk_model": [
+        "shrunk_sample",
+        "factor"
+      ],
+      "efq": [
+        0.0,
+        0.7
+      ]
+    }
+  }
+}

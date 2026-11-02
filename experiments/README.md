@@ -70,6 +70,7 @@ A spec opts in with three keys; a spec without them runs exactly as before
 | `cache` | `"v1"`, `"v2"`; v2 adds an `adv` market column, the mean daily dollar volume over the `adv_days` (default 20) days strictly before each decision's day, history month included | `"v1"` |
 | `returns` | `"vwap"` (the store's), `"mid"` (v2's midquote returns, for the risk history too; same universe either way) | `"vwap"` |
 | `latency` | `0` (the decision's quote), `1`, `5`, `30` seconds to the touch an order meets; 1 and 30 need v2 | `5` |
+| `skip_open` | `true` drops each day's first decision (09:30:00, the opening cross, whose quotes are stale and wide) from the evaluation and the risk history; the universe is chosen before the drop, and every row carries `skip_open`. Not paired with the run that keeps the open: the grid starts at 09:35, so every holding window moves five minutes later, and an oracle's noise is drawn afresh | `false` |
 
 `returns` and `latency` may be lists: each combination becomes a task axis, and
 rows carry the keys the spec names.
@@ -90,6 +91,11 @@ rows carry the keys the spec names.
 | `e8_costs` | Cost realism on cache v2: midquote vs VWAP returns, 1/5/30 s latency, 2020 fees, for an oracle and the real reversal signal |
 | `e9_impact_capacity` | Capacity: the impact model at $0.1M-$100M against the cross-spread model (cache v2 supplies `adv`) |
 | `e10_mv_converged` | E1b with the converged mean-variance solver (`mv_solver="restart"`): the solver error in the published mean-variance results |
+| `e1x_breakeven` | Break-even ICs with seed intervals: the random-error oracle on a dense IC grid 0.04-0.10 under five seeds; `appendix.py` reads it for `lookup.csv` |
+| `e1x_breakeven_noopen` | The same without the opening decision (`skip_open`), on the same five seeds; unpaired (books five minutes later, fresh oracle noise), so `appendix.py`'s `open_effect.csv` reads each shift against the two seed ranges |
+| `e7_factor_oracle_pca` | E7 with principal-component neutralization (`neutralize="pca3"`) and eight seeds: does removing the error factor structure restore the Sharpe? |
+| `e8_costs_noopen` | E8 without the opening decision: latency, returns and fees once the opening cross is not traded; unpaired with E8 like every `skip_open` run, and its oracle is one seed |
+| `e11_placebo_mcs` | Test size: IC-0 copula oracles under 200 seeds, so the rejection rates of the t test, SPA, MCS and DSR can be measured |
 
 A spec names the evaluation month, the risk-history month, the horizons, the
 forecasts and a grid of `BacktestConfig` settings. `"rebalance": "horizon"`

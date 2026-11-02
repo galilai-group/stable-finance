@@ -9,9 +9,16 @@ This writes both from the finished runs:
   nothing is selected away);
 * ``lookup.csv``: for each construction (weighting and selection) and EFQ, the
   forecast IC at which net Sharpe crosses zero, interpolated in log IC between
-  the oracle ICs that bracket it, from the expected-IC run (E1x) when it
-  exists, else E1. NaN where the construction never or always pays across the
-  ICs run.
+  the oracle ICs that bracket it, from the dense break-even run
+  (``e1x_breakeven``) when it exists, else the expected-IC run (E1x), else E1.
+  The crossing is found on the seed-mean curve and, where the run has several
+  seeds, on each seed's own curve, whose range is reported beside it. NaN
+  where the construction never or always pays across the ICs run;
+* ``lookup_noopen.csv`` and ``open_effect.csv``, when ``e1x_breakeven_noopen``
+  has run: the same lookup without the opening decision, and the two side by
+  side. The runs are not paired -- a ``skip_open`` run forms its books five
+  minutes later and draws fresh oracle noise -- so a shift in a break-even is
+  read against the two seed ranges (``ranges_overlap``), not on its own.
 
     uv run --extra experiments python -m experiments.appendix [--results DIR]
 """
@@ -51,10 +58,16 @@ def breakeven_ic(curve) -> float:
     return float("nan")
 
 
-def lookup(results: Path):
+#: The runs ``lookup.csv`` is read from: the first of them that has finished.
+LOOKUP_SOURCES = ("e1x_breakeven", "e1x_expected_ic", "e1_transfer_map")
+#: ``e1x_breakeven`` without the opening decision, for ``lookup_noopen.csv``.
+NOOPEN_SOURCE = "e1x_breakeven_noopen"
+
+
+def lookup(results: Path, sources: tuple[str, ...] = LOOKUP_SOURCES):
     import pandas as pd
 
-    for name in ("e1x_expected_ic", "e1_transfer_map"):
+    for name in sources:
         path = results / name / "rows.parquet"
         if path.is_file():
             rows = pd.read_parquet(path)
@@ -63,12 +76,49 @@ def lookup(results: Path):
         return None
     rows = rows[(rows["f_noise"] == "random") & (rows["efq"] > 0)]
     out = []
+    seeds = sorted(rows["f_seed"].unique()) if "f_seed" in rows else []
     for (weighting, selection, efq), part in rows.groupby(["weighting", "selection", "efq"]):
         curve = part.groupby("f_ic")["sharpe_net"].mean()
-        out.append({"source": name, "weighting": weighting, "selection": selection, "efq": efq,
-                    "breakeven_ic": breakeven_ic(curve),
-                    "net_sharpe_at_max_ic": float(curve.iloc[-1])})
+        record = {"source": name, "weighting": weighting, "selection": selection, "efq": efq,
+                  "breakeven_ic": breakeven_ic(curve),
+                  "net_sharpe_at_max_ic": float(curve.iloc[-1])}
+        if len(seeds) > 1:
+            each = np.array([breakeven_ic(part[part["f_seed"] == s].groupby("f_ic")["sharpe_net"].mean())
+                             for s in seeds])
+            crossed = each[np.isfinite(each)]
+            record.update(n_seeds=len(seeds), seeds_crossing=len(crossed),
+                          breakeven_ic_min=float(crossed.min()) if len(crossed) else np.nan,
+                          breakeven_ic_max=float(crossed.max()) if len(crossed) else np.nan)
+        if "sharpe_daily_net" in part:
+            record["daily_net_sharpe_at_max_ic"] = float(
+                part.groupby("f_ic")["sharpe_daily_net"].mean().iloc[-1])
+        out.append(record)
     return pd.DataFrame(out)
+
+
+def open_effect(with_open, without_open):
+    """The break-evens with and without the opening decision, side by side.
+
+    ``breakeven_ic_shift`` is the seed-mean break-even without the open less
+    the one with it. The two runs draw their oracle noise independently and
+    form their books at different times of day, so the shift carries the
+    noise of both: ``ranges_overlap`` says whether the two seed ranges
+    overlap, and a shift inside overlapping ranges is not attributed to the
+    open. NaN there when either run has no seed range.
+    """
+    keys = ["weighting", "selection", "efq"]
+    columns = [c for c in ("breakeven_ic", "breakeven_ic_min", "breakeven_ic_max",
+                           "seeds_crossing", "n_seeds")
+               if c in with_open and c in without_open]
+    merged = with_open[keys + columns].merge(without_open[keys + columns], on=keys,
+                                             suffixes=("", "_noopen"))
+    merged["breakeven_ic_shift"] = merged["breakeven_ic_noopen"] - merged["breakeven_ic"]
+    if "breakeven_ic_min" in columns:
+        lo, hi = merged["breakeven_ic_min"], merged["breakeven_ic_max"]
+        lo2, hi2 = merged["breakeven_ic_min_noopen"], merged["breakeven_ic_max_noopen"]
+        known = lo.notna() & hi.notna() & lo2.notna() & hi2.notna()
+        merged["ranges_overlap"] = ((lo <= hi2) & (lo2 <= hi)).where(known)
+    return merged
 
 
 def main(argv=None) -> int:
@@ -89,6 +139,13 @@ def main(argv=None) -> int:
     if ics is not None and not ics.empty:
         ics.to_csv(out / "lookup.csv", index=False)
         print(ics.to_string(index=False, float_format=lambda v: f"{v:.4g}"))
+    noopen = lookup(results, (NOOPEN_SOURCE,))
+    if noopen is not None and not noopen.empty:
+        noopen.to_csv(out / "lookup_noopen.csv", index=False)
+        if ics is not None and not ics.empty and ics["source"].iloc[0] == LOOKUP_SOURCES[0]:
+            effect = open_effect(ics, noopen)
+            effect.to_csv(out / "open_effect.csv", index=False)
+            print(effect.to_string(index=False, float_format=lambda v: f"{v:.4g}"))
     return 0
 
 
