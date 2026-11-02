@@ -179,6 +179,13 @@ COST_MODEL_REQUIRES: dict[str, tuple[str, ...]] = {
 #: at 2.4%). The calibration covers 0.1% to 13% of daily volume.
 IMPACT_COEFFICIENTS = (0.0, -0.53, 11.21)
 
+#: A fourth ``impact`` coefficient, when given, is a FLOOR in basis points:
+#: the cost per dollar is never below it. Below the calibration's 0.1% of
+#: daily volume the square root drives the fitted cost toward ``a`` (zero by
+#: default), which a real order -- paying at least part of the spread and a
+#: fee -- does not reach; a floor such as the quoted half-spread keeps a small
+#: book from looking free. Three coefficients mean no floor.
+
 
 class ImpactStockCoefficients(NamedTuple):
     """The stock-specific impact model: Table VII column (10), and where its level is pinned.
@@ -684,14 +691,19 @@ def impact_cost(size: ArrayLike, *, coefficients: tuple[float, float, float] | N
     and negative (not significant), so far beyond that range the fitted curve
     would turn down. The cost is held at its peak from there on: an order
     past the calibration never gets cheaper for being larger.
+
+    The calibration starts at 0.1% of daily volume, and below it the curve
+    falls toward ``a``. ``coefficients`` may carry a fourth value, a floor in
+    basis points that the cost never goes below (``(a, b, c, floor)``).
     """
-    a, b, c = IMPACT_COEFFICIENTS if coefficients is None else coefficients
+    a, b, c, *rest = IMPACT_COEFFICIENTS if coefficients is None else coefficients
     x = np.asarray(size, dtype=np.float64)
     if (x < 0).any():
         raise ValueError("size is unsigned")
     if b < 0 < c:
         x = np.minimum(x, (c / (2 * b)) ** 2)
-    return (a + b * x + c * np.sqrt(x)) / 1e4
+    cost = (a + b * x + c * np.sqrt(x)) / 1e4
+    return np.maximum(cost, rest[0] / 1e4) if rest else cost
 
 
 def impact_stock_cost(size: ArrayLike, market_cap: ArrayLike, idio_vol: ArrayLike,
@@ -733,7 +745,12 @@ def _impact_fills(orders: Orders, market: MarketData, equity, schedule: int,
 
     What is outstanding in a name fills in equal slices over the ``schedule``
     decisions after the latest order, so one order ramps the position
-    linearly. ``schedule=0`` fills at the decision, which is the paper's own
+    linearly. Every new order restarts that clock for the whole outstanding
+    amount, so a book re-ordered at every decision approaches its target
+    geometrically, a fraction ``1 / schedule`` of the gap per decision: with
+    the paper's one-day schedule and five-minute decisions it holds only a
+    small share of a fast-moving target (``execution_days`` sets the
+    schedule). ``schedule=0`` fills at the decision, which is the paper's own
     accounting (full position at the arrival price, charged the formula).
     Slices past the last decision are never filled, and a decision with no
     mid fills nothing and leaves the rest for the decisions after it.

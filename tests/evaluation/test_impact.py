@@ -45,6 +45,25 @@ def test_the_formula_reproduces_the_papers_realized_us_costs():
         impact_cost(-1.0)
 
 
+def test_a_fourth_coefficient_floors_the_cost_below_the_calibration():
+    """Below 0.1% of daily volume the curve falls toward a; a floor (bps) holds it up."""
+    tiny = [1e-4, 0.01, 2.4]
+    plain = impact_cost(tiny) * 1e4
+    floored = impact_cost(tiny, coefficients=(*IMPACT_COEFFICIENTS, 3.0)) * 1e4
+    assert plain[0] < 0.2 and floored[0] == pytest.approx(3.0) and floored[1] == pytest.approx(3.0)
+    assert floored[2] == pytest.approx(plain[2])               # above the floor, unchanged
+    q = np.zeros((D, A, 1)); q[3, 1, 0] = 1e-4
+    fills = execute(_orders(q), _market(), model="impact", equity=EQUITY, schedule=0,
+                    impact=(*IMPACT_COEFFICIENTS, 3.0))
+    assert fills.price[3, 1, 0] == pytest.approx(100 * (1 + 3e-4))
+    assert sf.BacktestConfig(cost_model="impact", equity=1e6,
+                             impact=(0, -0.53, 11.21, 3)).impact == (0.0, -0.53, 11.21, 3.0)
+    with pytest.raises(ValueError, match="floor"):
+        sf.BacktestConfig(cost_model="impact", equity=1e6, impact=(0, -0.53, 11.21, -1))
+    with pytest.raises(ValueError, match="3 or 4"):
+        sf.BacktestConfig(cost_model="impact", equity=1e6, impact=(0, 1))
+
+
 def test_instant_execution_is_the_papers_accounting():
     """schedule=0: the full position at the decision, charged the formula."""
     q = np.zeros((D, A, 1)); q[3, 1, 0] = 0.05                 # $50k, 0.05% of $100M ADV
