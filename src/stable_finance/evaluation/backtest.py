@@ -175,10 +175,12 @@ class BacktestReport:
     ``annualization="daily"``. ``mean_turnover`` is the two-way traded weight
     -- the sum over names of the absolute change in weight, in units of
     equity -- per decision, or per held book under ``rebalance="horizon"``,
-    whatever the annualization. Under the default ``annualization="decisions"``
+    whatever the annualization. Under ``annualization="decisions"`` (which
+    every experiment spec sets; the configuration's default is ``"daily"``)
     the two share a basis, so ``mean_cost_bps / mean_turnover`` is the cost
-    per unit traded. ``mean_gross_exposure`` and ``mean_names_held`` are
-    means over decisions.
+    per unit traded; under ``"daily"`` the cost is per day and the turnover
+    is not. ``mean_gross_exposure`` and ``mean_names_held`` are means over
+    decisions.
     """
 
     config: BacktestConfig
