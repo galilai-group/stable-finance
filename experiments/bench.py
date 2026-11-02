@@ -7,7 +7,8 @@ called through the library's public functions -- ``estimate_risk``,
 ``select_book`` and ``weight_book``, ``mean_variance_target`` and
 ``rebalance``, ``run_backtest`` -- so the numbers are what a caller of those
 functions pays. Run it on an otherwise idle machine: the numbers are
-wall-clock.
+wall-clock. Each stage is timed ``REPEATS`` times and reported as the median
+with the fastest and slowest beside it, and the report records the commit.
 
     uv run --extra experiments python -m experiments.bench
 """
@@ -28,23 +29,28 @@ from pathlib import Path
 import numpy as np
 
 import stable_finance as sf
-from experiments.run import load_inputs
+from experiments.run import _git_sha, load_inputs
 
 OUT = Path(__file__).resolve().parent / "results" / "bench"
 SPEC = {"eval_month": "2020-08", "history_month": "2020-07", "horizons": [900]}
 GROSS, EFQ = 2.0, 0.7
+REPEATS = 3
 
 
 def measure(work):
-    """Wall-clock seconds of an untraced run, then the peak of a traced one.
+    """Wall-clock seconds of REPEATS untraced runs, then the peak of a traced one.
 
     tracemalloc slows Python-level loops several-fold, so timing under it
     would overstate exactly the rules (HRP, the active set) that loop in
     Python; the two are measured on separate runs of the same work.
     """
-    t0 = time.perf_counter()
-    result = work()
-    seconds = time.perf_counter() - t0
+    times = []
+    for _ in range(REPEATS):
+        t0 = time.perf_counter()
+        result = work()
+        times.append(time.perf_counter() - t0)
+    seconds = {"median": float(np.median(times)), "min": float(min(times)),
+               "max": float(max(times))}
     tracemalloc.start()
     work()
     _, peak = tracemalloc.get_traced_memory()
@@ -103,7 +109,10 @@ def main() -> int:
                                                history=history, days=days, config=config))
     seconds["whole harness run (signal)"], peak["whole harness run (signal)"] = s, mb
     report = {"decisions": len(realized.decisions), "assets": len(realized.assets),
-              "seconds": seconds, "peak_mb": peak}
+              "git_sha": _git_sha(), "repeats": REPEATS,
+              "seconds": {k: v["median"] for k, v in seconds.items()},
+              "seconds_range": {k: [v["min"], v["max"]] for k, v in seconds.items()},
+              "peak_mb": peak}
     (OUT / "bench.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=1))
     return 0
