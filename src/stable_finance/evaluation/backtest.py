@@ -71,7 +71,7 @@ from stable_finance.evaluation.portfolio.construction import (
 )
 from stable_finance.evaluation.portfolio.risk import apply_screen, estimate_risk
 from stable_finance.evaluation.portfolio.signals import (
-    alpha_from_rule, apply_signal, estimate_beta,
+    alpha_from_rule, apply_signal, estimate_beta, estimate_loadings,
 )
 from stable_finance.evaluation.returns.contract import ForwardReturns
 from stable_finance.evaluation.returns.probes import RidgeProbe
@@ -312,6 +312,13 @@ def _beta(context, history, realized) -> NDArray[np.float64]:
     return context["beta"]
 
 
+def _loadings(context, history, realized) -> NDArray[np.float64]:
+    """Each name's principal-component loadings at the scored horizon, estimated once per run."""
+    if "loadings" not in context:
+        context["loadings"] = estimate_loadings(_history_panel(context, history, realized))[0]
+    return context["loadings"]
+
+
 def _signal(context: dict, config: BacktestConfig, sigma, screened) -> NDArray[np.float64]:
     """The forecast the book is built from, after the configured transforms.
 
@@ -327,6 +334,7 @@ def _signal(context: dict, config: BacktestConfig, sigma, screened) -> NDArray[n
             config.neutralize, mu, eligible=screened,
             beta=context.get("beta"),
             industry=market.get("industry") if market.has("industry") else None,
+            loadings=context.get("loadings"),
         )
     if config.alpha is not None:
         mu = alpha_from_rule(config.alpha, mu, np.sqrt(np.maximum(np.diag(sigma), 0.0)),
@@ -828,6 +836,8 @@ def run_backtest(
         sigma = _risk(context, config, history, realized, embeddings, horizon_index)
         if config.neutralize in ("beta", "beta_industry"):
             _beta(context, history, realized)
+        if config.neutralize == "pca3":
+            _loadings(context, history, realized)
         weights, alpha = _book(context, config, sigma)
         return _score(context, weights, config, with_series=with_series,
                       alpha=alpha, sigma=sigma)
@@ -936,6 +946,8 @@ def sweep_configs(
                 )
             if config.neutralize in ("beta", "beta_industry"):
                 _beta(context, history, realized)
+            if config.neutralize == "pca3":
+                _loadings(context, history, realized)
             book_key = _book_key(config)
             if book_key in book_cache:
                 book_cache.move_to_end(book_key)

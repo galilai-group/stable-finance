@@ -753,6 +753,13 @@ def test_beta_neutralization_runs_on_any_market():
     assert np.isfinite(report.sharpe_mid)
 
 
+def test_principal_component_neutralization_runs_on_any_market():
+    w = world()
+    config = FRICTIONLESS.replace(neutralize="pca3", weighting="equal", risk_model="diagonal")
+    report = run_backtest(w["forecast"], w["realized"], history=w["history"], config=config)
+    assert np.isfinite(report.sharpe_mid)
+
+
 @pytest.mark.parametrize("rule", ["grinold", "grinold_rank"])
 def test_a_grinold_alpha_scales_the_forecast_but_not_the_information_coefficient(rule):
     w = world()
