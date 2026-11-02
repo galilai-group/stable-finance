@@ -22,6 +22,7 @@ from stable_finance import (
     sweep_configs,
     tail_selection,
     trading_cost,
+    transfer_coefficient,
     weight_book,
 )
 from stable_finance.evaluation import backtest as bt
@@ -934,6 +935,32 @@ def test_weights_have_no_forecast_and_so_no_transfer_coefficient():
     report = run_backtest(weights, w["realized"], config=FRICTIONLESS)
     assert np.isnan(report.transfer_coefficient)
     assert np.isnan(report.as_dict()["transfer_coefficient"])
+
+
+def test_a_held_book_is_scored_against_the_forecast_it_was_formed_on():
+    # A held book earns once, where it was set, so its TC is read there: the
+    # books set at decisions 0 and 3 of each day against those decisions'
+    # forecasts. Decision 6 sets no book (its forward return is unknown), and
+    # the decisions a book is carried through hold an older book than their
+    # forecast, which is what used to deflate the number.
+    k = np.tile(np.arange(8), 10)
+    setup = held_world(unknown=k >= 6)
+    report = run_backtest(**setup, config=HELD)
+    market = MarketData({"half_spread": setup["half_spread"]}, setup["forecast"].decisions, ASSETS)
+    context = bt._prepare(setup["forecast"], setup["realized"], market, setup["days"], 0)
+    sigma = bt._risk(context, HELD, setup["history"], setup["realized"], None, 0)
+    mu = setup["forecast"].values[:, :, 0]
+    weights = weight_book("equal", select_book("all", mu, np.ones(mu.shape, bool)), mu,
+                          sigma, gross_exposure=HELD.gross_exposure)
+    formed = (k == 0) | (k == 3)
+    expected = transfer_coefficient(weights[formed], mu[formed], sigma).mean
+    assert report.transfer_coefficient == pytest.approx(expected, rel=1e-9)
+    carried = np.where(k[:, None] >= 6, 0.0, weights[np.arange(80) - k % 3])
+    assert report.transfer_coefficient > transfer_coefficient(carried, mu, sigma).mean + 0.1
+    # Rebalanced at every decision, every decision is a book and is scored.
+    every = run_backtest(**setup, config=HELD.replace(rebalance="every_decision"))
+    assert every.transfer_coefficient == pytest.approx(
+        transfer_coefficient(weights, mu, sigma).mean, rel=1e-9)
 
 
 def test_a_sweep_reports_the_transfer_coefficient_each_run_would():

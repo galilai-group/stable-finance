@@ -149,7 +149,13 @@ class BacktestReport:
     model's units. It is measured against the transformed forecast rather than
     the raw one because the transforms are what the book was asked to express;
     the IC is what scores the raw forecast. Below the forecast level there is
-    no forecast to transfer, and it is NaN.
+    no forecast to transfer, and it is NaN. It is averaged over the decisions
+    at which the book earns -- the same time base as the profit path: every
+    decision, except under ``rebalance="horizon"``, where a held book earns
+    its return once, at the formation that set it, and so is scored there,
+    against the forecast it was formed on. A carried decision holds a book
+    formed on an earlier forecast and is not scored against a fresh one, nor
+    is a formation whose forward return is unknown, which sets no book.
 
     UNITS. ``mean_gross_return_bps`` and ``mean_cost_bps`` are means over the
     periods of the profit path, in basis points of equity: per decision, per
@@ -746,7 +752,12 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
     tc = np.nan
     if mu is not None and alpha is not None and sigma is not None:
         held = np.where(np.isfinite(values) & (np.abs(values) <= 1e-12), 0.0, values)
-        mean = transfer_coefficient(held, alpha, sigma, eligible=screened).mean
+        # A held book is scored where it was set, against the forecast it was
+        # set from: the decisions it is carried through hold an older book.
+        rows = (_formations(context) & ~_no_outcome(context)
+                if config.rebalance == "horizon" else slice(None))
+        mean = transfer_coefficient(held[rows], alpha[rows], sigma,
+                                    eligible=screened[rows]).mean
         tc = float(mean) if np.isfinite(mean) else np.nan
     return BacktestReport(
         config=config, horizon=context["horizon"],
