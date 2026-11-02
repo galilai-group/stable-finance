@@ -19,8 +19,16 @@ deterministic. Features are the month cache's causal features normal-scored
 per decision, plus order-flow imbalance over 60 and 300 seconds when a v2
 cache exists (``--ofi``); targets are forward returns demeaned across names.
 The evaluation is rank IC by horizon, with 95% intervals from a bootstrap
-over days, beside the month-ahead fit's (``results/signals/ic_table.json``)
-when that exists.
+over days, beside the month-ahead fit's when ``signals.py`` has written it.
+
+The month-ahead fit forecasts more rows than this one: it imputes a missing
+feature and so forecasts from 09:30, while this one forecasts only rows with
+every feature (10:00 on). Its IC is therefore recomputed here from its saved
+forecasts (``results/signals/{ridge,lasso}.npz``) on exactly the rows each
+walk-forward model forecasts, with the same estimator, and the paired
+difference (month-ahead minus walk-forward, per decision) gets its own
+day-bootstrap interval. The month-ahead table's own all-day IC is kept beside
+it as ``month_ahead_ic_all_rows``, which is not comparable.
 
     uv run --extra experiments python -m experiments.signals_wf [--window N] [--ofi]
 
@@ -259,6 +267,46 @@ def bootstrap_ci(ic: np.ndarray, days: np.ndarray) -> list[list[float]]:
     return [[float(a), float(b)] for a, b in zip(*np.percentile(boot, [2.5, 97.5], axis=0))]
 
 
+#: Each walk-forward model and the month-ahead model it is compared with.
+MONTH_AHEAD = {"ridge_wf": "ridge", "lasso_wf": "lasso"}
+
+
+def month_ahead(forecasts: dict, realized: np.ndarray, days: np.ndarray, decisions,
+                assets, folder: Path) -> dict:
+    """The month-ahead fit's IC on the rows each walk-forward model forecasts, and the paired gap.
+
+    ``folder`` holds ``signals.py``'s forecast files. A model whose file is
+    missing, or does not cover these decisions, assets and horizons, is left
+    out with the reason.
+    """
+    out = {}
+    for walk_forward, name in MONTH_AHEAD.items():
+        path = folder / f"{name}.npz"
+        if not path.is_file():
+            continue
+        saved = np.load(path, allow_pickle=False)
+        row = {str(d): i for i, d in enumerate(saved["decisions"].astype(str))}
+        column = {str(a): i for i, a in enumerate(saved["assets"].astype(str))}
+        wanted_rows = [row.get(str(d)) for d in np.asarray(decisions).astype(str)]
+        wanted_columns = [column.get(str(a)) for a in np.asarray(assets).astype(str)]
+        if (None in wanted_rows or None in wanted_columns
+                or list(saved["horizons"]) != list(HORIZONS)):
+            out[name] = {"skipped": f"{path.name} does not cover these decisions, assets "
+                                    "and horizons"}
+            continue
+        ours = forecasts[walk_forward]
+        theirs = saved["forecast"][wanted_rows][:, wanted_columns]
+        theirs = np.where(np.isfinite(ours), theirs, np.nan)
+        ic, ic_ours = rank_ics(theirs, realized), rank_ics(ours, realized)
+        gap = np.where(np.isfinite(ic) & np.isfinite(ic_ours), ic - ic_ours, np.nan)
+        out[name] = {"compared_with": walk_forward,
+                     "ic": [float(v) for v in np.nanmean(ic, axis=0)],
+                     "ic_ci": bootstrap_ci(ic, days),
+                     "minus_walk_forward": [float(v) for v in np.nanmean(gap, axis=0)],
+                     "minus_walk_forward_ci": bootstrap_ci(gap, days)}
+    return out
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--window", type=int, default=None,
@@ -310,9 +358,14 @@ def main(argv=None) -> int:
         table["ic_ci"][name] = bootstrap_ci(ic, days)
         np.savez(OUT / f"{name}.npz", forecast=cube, assets=data["assets"],
                  horizons=np.asarray(HORIZONS), decisions=decisions)
-    month_ahead = OUT.parent / "signals" / "ic_table.json"
-    if month_ahead.is_file():
-        table["month_ahead_ic"] = json.loads(month_ahead.read_text()).get("ic", {})
+    folder = OUT.parent / "signals"
+    table["month_ahead"] = month_ahead(forecasts, realized, days, decisions, data["assets"],
+                                       folder)
+    table["month_ahead_ic"] = {name: block["ic"] for name, block in table["month_ahead"].items()
+                               if "ic" in block}
+    if (folder / "ic_table.json").is_file():
+        table["month_ahead_ic_all_rows"] = json.loads(
+            (folder / "ic_table.json").read_text()).get("ic", {})
     table["seconds"] = time.perf_counter() - t0
     (OUT / "ic_table.json").write_text(json.dumps(table, indent=2))
     print("out-of-sample rank IC by horizon " + str(list(HORIZONS)))
@@ -320,8 +373,15 @@ def main(argv=None) -> int:
         cells = ", ".join(f"{v:.4f} [{lo:.4f}, {hi:.4f}]" for v, (lo, hi) in
                           zip(table["ic"][name], table["ic_ci"][name]))
         print(f"  {name}: {cells}")
-    for name, ics in table.get("month_ahead_ic", {}).items():
-        print(f"  {name} (month-ahead): " + ", ".join(f"{v:.4f}" for v in ics))
+    for name, block in table["month_ahead"].items():
+        if "skipped" in block:
+            print(f"  {name} (month-ahead): skipped, {block['skipped']}")
+            continue
+        print(f"  {name} (month-ahead, same rows): " + ", ".join(
+            f"{v:.4f}" for v in block["ic"]))
+        print(f"  {name} minus {block['compared_with']}: " + ", ".join(
+            f"{v:+.4f} [{lo:+.4f}, {hi:+.4f}]" for v, (lo, hi) in
+            zip(block["minus_walk_forward"], block["minus_walk_forward_ci"])))
     print(f"-> {OUT} ({table['seconds']:.0f} s)")
     return 0
 
