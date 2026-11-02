@@ -138,3 +138,33 @@ def test_row_forecast_reads_back_an_oracle_spec():
     assert type(spec["seed"]) is int
     assert run.forecast_specs({"forecasts": {"kind": "oracle", "ic": 0.03, "noise": "random",
                                              "seed": 2}})[0]["seed"] == spec["seed"]
+
+
+# ── latency ─────────────────────────────────────────────────────────────────
+
+
+def test_first_of_day_marks_each_days_opening_decision():
+    labels = ["2020-08-03|0000", "2020-08-03|0300", "2020-08-04|0000", "2020-08-04|0300",
+              "2020-08-04|0600"]
+    assert sanity._first_of_day(labels).tolist() == [True, False, True, False, False]
+
+
+def test_cost_and_sharpe_leave_the_open_out_of_every_number():
+    from types import SimpleNamespace
+
+    from experiments.run import _sharpe
+
+    rng = np.random.default_rng(0)
+    periods = np.array([f"2020-08-{d:02d}|{s:04d}" for d in range(3, 9) for s in (0, 300, 600)])
+    opening = sanity._first_of_day(periods)
+    cost = np.where(opening, 10e-4, 1e-4)
+    gross = rng.normal(2e-4, 1e-4, len(periods))
+    series = SimpleNamespace(periods=periods, gross=gross, net=gross - cost, cost=cost)
+    every = sanity._cost_and_sharpe(series, np.ones_like(opening))
+    rest = sanity._cost_and_sharpe(series, ~opening)
+    assert every["mean_cost_bps"] == pytest.approx(4.0)
+    assert rest["mean_cost_bps"] == pytest.approx(1.0)
+    daily = (gross - cost)[~opening].reshape(6, 2).sum(axis=1)
+    assert rest["sharpe_daily_net"] == pytest.approx(float(_sharpe(daily)))
+    daily = gross.reshape(6, 3).sum(axis=1)
+    assert every["sharpe_daily_gross"] == pytest.approx(float(_sharpe(daily)))

@@ -38,8 +38,13 @@ advance, and prints PASS, FAIL or SKIP with the numbers behind it:
   time) must give about nothing.
 * COST IDENTITY. From every saved series: net is exactly gross minus cost, and
   each row's break-even EFQ is recomputed from its own series.
-* LATENCY. With a v2 cache: gross Sharpe must not rise as the execution delay
-  grows from 0 to 30 seconds. Skipped without one.
+* LATENCY. With a v2 cache, one book at execution delays of 0, 1, 5 and 30
+  seconds. A delay only swaps the quotes an order meets (returns still start
+  at the decision), so gross must not move with it. Whether waiting costs
+  more is reported as mean cost per period and daily net Sharpe, with and
+  without each day's first decision, the 09:30:00 open, whose quotes are
+  wide for its first seconds; a delay that lowers cost is a FLAG. Skipped
+  without one.
 * DETERMINISM. One small task run twice, and with one and four BLAS threads,
   must give byte-identical rows.
 
@@ -537,25 +542,104 @@ def lookahead_canaries() -> dict:
                    lag_2=sharpe["lag 2"], one_day=sharpe["one day"])
 
 
-def latency_monotone() -> dict:
-    """With a v2 cache, gross Sharpe at efq 1 does not rise as the delay grows."""
-    from experiments.month_cache_v2 import month_path
+#: Execution delays the latency check compares, in seconds: the v2 cache's quotes.
+LATENCY_GRID = (0, 1, 5, 30)
+#: How far daily gross Sharpe may move with the delay, relative to no delay. A
+#: delay swaps only the execution quotes; gross moves only through the few
+#: fills a later quote finds missing.
+GROSS_TOLERANCE = 0.01
 
+
+def _first_of_day(labels) -> np.ndarray:
+    """Each day's first decision among ``"date|anchor"`` labels: the 09:30:00 open."""
+    day = np.char.partition(np.asarray(labels).astype(str), "|")[:, 0]
+    return np.r_[True, day[1:] != day[:-1]]
+
+
+def _cost_and_sharpe(series, keep: np.ndarray) -> dict:
+    """Mean cost per period (bps) and daily gross and net Sharpe over the periods kept."""
+    from experiments.run import _sharpe
+
+    day = np.char.partition(np.asarray(series.periods).astype(str), "|")[keep, 0]
+    _, index = np.unique(day, return_inverse=True)
+    daily = {k: np.bincount(index, weights=np.nan_to_num(getattr(series, k)[keep]))
+             for k in ("gross", "net")}
+    return {"mean_cost_bps": float(np.nanmean(series.cost[keep]) * 1e4),
+            "sharpe_daily_net": float(_sharpe(daily["net"])),
+            "sharpe_daily_gross": float(_sharpe(daily["gross"]))}
+
+
+def latency_monotone() -> dict:
+    """With a v2 cache: does a longer execution delay cost more? Gross must not move.
+
+    The book is the IC-0.03 random oracle's signal book over the whole
+    cross-section, crossing at EFQ 1 every five minutes, at each delay in
+    :data:`LATENCY_GRID`. A delay changes only the quotes an order meets:
+    the cost is the move of the mid over the delay plus EFQ times the spread
+    then, and the returns still start at the decision. So daily gross Sharpe
+    must agree across delays (a FAIL otherwise), and the cost carries the
+    whole effect. The earlier version ranked per-decision net Sharpe, which
+    on a negative mean grows more negative as its sd falls: it passed while
+    the delay was cutting both cost and the daily loss.
+
+    Mean cost per period and daily net Sharpe are reported with and without
+    each day's first decision, the 09:30:00 open, whose quoted spread
+    narrows by half in its first 30 seconds, with the open's share of the
+    cost a 30-second delay saves. A delay that lowers cost or raises daily
+    net Sharpe, with the open or without it, is a FLAG: waiting should not
+    pay on an informed book, and where it does it is the quotes at the
+    decision that need a look.
+    """
+    from experiments.month_cache_v2 import month_path
+    from experiments.run import load_all_inputs, variant_key
+
+    name = "latency (mean cost and daily net Sharpe at efq 1)"
     if not all(month_path(m).is_file() for m in ("2020-07", "2020-08")):
-        return _result("latency monotonicity", "SKIP", reason="no v2 cache for Jul/Aug 2020")
+        return _result(name, "SKIP", reason="no v2 cache for Jul/Aug 2020")
+    spec = {"eval_month": "2020-08", "history_month": "2020-07", "horizons": [300],
+            "cache": "v2", "latency": list(LATENCY_GRID)}
+    all_inputs = load_all_inputs(spec)
     config = sf.BacktestConfig(weighting="signal", selection="all", cost_model="cross", efq=1.0,
                                risk_model="diagonal", annualization="decisions")
-    sharpe = {}
-    for latency in (0, 1, 5, 30):
-        inputs = _month({"cache": "v2", "latency": latency})
+    numbers = {"with the open": {}, "without the open": {}}
+    open_cost, total_cost = {}, {}
+    for latency in LATENCY_GRID:
+        inputs = all_inputs[variant_key({"latency": latency})]
         forecast = sf.oracle_forecast(inputs["realized"], 0.03, noise="random", seed=0)
-        report = sf.run_backtest(forecast, inputs["realized"], market=inputs["market"],
-                                 history=inputs["history"], days=inputs["days"], config=config)
-        sharpe[str(latency)] = float(report.sharpe_net)
-    values = list(sharpe.values())
-    ok = all(b <= a + 1e-9 for a, b in pairwise(values))
-    return _result("latency monotonicity (net Sharpe at efq 1)", "PASS" if ok else "FAIL",
-                   sharpe_by_latency=sharpe)
+        series = sf.run_backtest(forecast, inputs["realized"], market=inputs["market"],
+                                 history=inputs["history"], days=inputs["days"], config=config,
+                                 with_series=True).series
+        opening = _first_of_day(series.periods)
+        for label, keep in (("with the open", np.ones_like(opening)),
+                            ("without the open", ~opening)):
+            numbers[label][latency] = _cost_and_sharpe(series, keep)
+        open_cost[latency] = float(np.nansum(series.cost[opening]))
+        total_cost[latency] = float(np.nansum(series.cost))
+    gross = [numbers["with the open"][lat]["sharpe_daily_gross"] for lat in LATENCY_GRID]
+    gross_change = max(abs(g / gross[0] - 1.0) for g in gross)
+    helps = {}
+    for label, by in numbers.items():
+        cost = [by[lat]["mean_cost_bps"] for lat in LATENCY_GRID]
+        sharpe = [by[lat]["sharpe_daily_net"] for lat in LATENCY_GRID]
+        helps[label] = (any(b < a for a, b in pairwise(cost))
+                        or any(b > a for a, b in pairwise(sharpe)))
+    first, last = LATENCY_GRID[0], LATENCY_GRID[-1]
+    saved = total_cost[first] - total_cost[last]
+    status = ("FAIL" if gross_change > GROSS_TOLERANCE
+              else "FLAG" if any(helps.values()) else "PASS")
+
+    def span(key: str, digits: int) -> str:
+        values = [numbers[label][lat][key] for label in numbers for lat in (first, last)]
+        return (f"{values[0]:.{digits}f} -> {values[1]:.{digits}f} at {first} -> {last} s "
+                f"(without the open {values[2]:.{digits}f} -> {values[3]:.{digits}f})")
+
+    return _result(name, status, mean_cost_bps=span("mean_cost_bps", 2),
+                   sharpe_daily_net=span("sharpe_daily_net", 0),
+                   open_share_of_saving=(open_cost[first] - open_cost[last]) / saved
+                   if saved else float("nan"),
+                   max_gross_change=gross_change,
+                   delay_helps_with_open=helps["with the open"],
+                   delay_helps_without_open=helps["without the open"], by_latency=numbers)
 
 
 TINY_SPEC = {
