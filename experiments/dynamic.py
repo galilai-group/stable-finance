@@ -36,6 +36,13 @@ rules tuned under ``fees`` are also scored, untuned, under the impact model
 v2 cache). The rate and the cost aversion of ``aim`` are tuned JOINTLY, on
 grids that extend past where the earlier optima sat.
 
+The 3 bp floor is the impact model's fourth coefficient, which
+``BacktestConfig`` accepts only from the runner fixes on (branch
+``fix-runner``, "Impact model: an optional cost floor"), so that branch has to
+be merged before this one. On a library without it the config refuses the
+floor; the impact block is then skipped, and the report records why
+(``impact_skipped``) rather than failing.
+
 ``holding_decisions`` is the conventional average holding period,
 ``2 x gross / turnover`` with turnover the sum of absolute weight changes (a
 round trip trades the position twice). ``--skip-open`` drops each day's first
@@ -55,6 +62,7 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, "1")
 
 import argparse
+import functools
 import json
 import sys
 import time
@@ -171,6 +179,30 @@ def aim(forecast: sf.ForwardReturns, month: dict, cost_aversion: float) -> sf.Po
                                unit.decisions, unit.assets, unit.horizons)
 
 
+def impact_unavailable() -> str | None:
+    """Why the impact variant cannot be scored with this library, or None when it can.
+
+    The variant's 3 bp floor is a fourth impact coefficient, which only a
+    library with the runner fixes accepts; without them ``config_for`` raises
+    and this returns the error's message.
+    """
+    try:
+        config_for("impact")
+    except ValueError as error:
+        return str(error)
+    return None
+
+
+def holding_decisions(mean_gross: float, mean_turnover: float) -> float:
+    """The conventional average holding period in decisions, ``2 x gross / turnover``.
+
+    Turnover is the sum of absolute weight changes, and a round trip trades a
+    position twice, once in and once out. A book that never trades holds
+    forever.
+    """
+    return float(2 * mean_gross / mean_turnover) if mean_turnover > 0 else float("inf")
+
+
 def config_for(costs: str) -> sf.BacktestConfig:
     base = sf.DEFAULT_BACKTEST.replace(cost_model="cross", efq=EFQ, annualization="decisions")
     if costs == "spread":
@@ -195,8 +227,7 @@ def evaluate(held: sf.PortfolioWeights, month: dict, costs: str = "spread") -> d
         breakeven = float("nan")
     out = {"sharpe_mid": float(net.sharpe_mid), "sharpe_net": float(net.sharpe_net),
            "mean_turnover": float(net.mean_turnover),
-           "holding_decisions": float(2 * net.mean_gross_exposure / net.mean_turnover)
-           if net.mean_turnover > 0 else float("inf"),
+           "holding_decisions": holding_decisions(net.mean_gross_exposure, net.mean_turnover),
            "breakeven_efq": float(breakeven), **_inference(series)}
     return out
 
@@ -241,11 +272,16 @@ def tune(forecast: sf.ForwardReturns, month: dict, costs: str, *, quick: bool = 
 
 
 def one_seed(seed: int, *, skip_open: bool, quick: bool) -> dict:
-    """Tune on July and score on August, for both forecasts and every cost setting."""
+    """Tune on July and score on August, for both forecasts and every cost setting.
+
+    The impact block is skipped, with the reason recorded, when the library
+    refuses the impact config (see :func:`impact_unavailable`).
+    """
     assets = common_assets()
     train = load(TRAIN, assets, skip_open=skip_open)
     test = load(EVALUATE, assets, sigma_from=train, skip_open=skip_open)
-    test_impact = with_adv(test, EVALUATE, TRAIN)
+    impact_skipped = impact_unavailable()
+    test_impact = None if impact_skipped else with_adv(test, EVALUATE, TRAIN)
     train_forecasts, test_forecasts = forecasts(train, seed), forecasts(test, seed)
     out = {}
     for name in test_forecasts:
@@ -258,19 +294,27 @@ def one_seed(seed: int, *, skip_open: bool, quick: bool) -> dict:
                 aim(test_forecasts[name], test, chosen["cost_aversion"]), chosen["aim_rate"])
             scores = {rule: evaluate(held, test, costs) for rule, held in rules.items()}
             out[name][costs] = {"tuned_on_train": chosen, "test": scores}
-            if costs == "fees":
+            if costs == "fees" and impact_skipped:
+                out[name]["impact"] = {"tuned_on_train": "fees", "skipped": impact_skipped}
+            elif costs == "fees":
                 out[name]["impact"] = {"tuned_on_train": "fees", "test": {
                     rule: evaluate(held, test_impact, "impact") for rule, held in rules.items()}}
     return {"seed": seed, "assets": len(assets), "forecasts": out}
 
 
 def summarize(seeds: list[dict]) -> dict:
-    """Per forecast, cost setting and rule: the seed mean, sd and range of each score."""
+    """Per forecast, cost setting and rule: the seed mean, sd and range of each score.
+
+    A cost setting that was skipped carries its reason instead of rules.
+    """
     out = {}
     first = seeds[0]["forecasts"]
     for name, settings in first.items():
         out[name] = {}
         for costs, block in settings.items():
+            if "test" not in block:
+                out[name][costs] = {"skipped": block["skipped"]}
+                continue
             out[name][costs] = {}
             for rule in block["test"]:
                 row = {}
@@ -298,16 +342,21 @@ def main(argv=None) -> int:
     t0 = time.perf_counter()
     OUT.mkdir(parents=True, exist_ok=True)
     seeds = list(range(args.seeds))
+    # one_seed's options are keyword-only, so they are bound here rather than
+    # passed to map as extra positional iterables.
+    run = functools.partial(one_seed, skip_open=args.skip_open, quick=args.quick)
     with ProcessPoolExecutor(max_workers=max(1, min(args.workers, len(seeds)))) as pool:
-        results = list(pool.map(one_seed, seeds, [args.skip_open] * len(seeds),
-                                [args.quick] * len(seeds)))
+        results = list(pool.map(run, seeds))
     report = {"train": TRAIN, "evaluate": EVALUATE, "assets": results[0]["assets"], "efq": EFQ,
               "horizons": list(ORACLE_HORIZONS), "ics": list(ORACLE_ICS),
               "skip_open": args.skip_open, "quick": args.quick, "seeds": seeds,
-              "fees": FEES, "impact": IMPACT,
+              "fees": FEES, "impact": IMPACT, "impact_skipped": impact_unavailable(),
               "summary": summarize(results), "by_seed": results}
     for name, settings in report["summary"].items():
         for costs, rules in settings.items():
+            if "skipped" in rules:
+                print(f"{name}, {costs}: skipped ({rules['skipped']})")
+                continue
             print(f"{name}, {costs}:")
             for rule, s in rules.items():
                 d = s["sharpe_daily_net"]
