@@ -27,8 +27,14 @@ configurations that saw the same forecast -- by default every
 book is built -- the daily net P&L is tested jointly:
 
 * the Hansen-Lunde-Nason (2011) Model Confidence Set at 90%: the
-  configurations statistically indistinguishable from the best, on the mean
-  daily loss (minus the net P&L);
+  configurations statistically indistinguishable from the best, twice, each
+  summary naming its loss: ``mcs_pnl`` on minus the day's net P&L (the
+  mean daily P&L, which the book running the most risk wins) and
+  ``mcs_sharpe`` on that loss over the configuration's full-sample standard
+  deviation (minus its daily Sharpe). Configurations with identical daily
+  P&L -- a setting that changed nothing -- are one model: each row names
+  the one it copies in ``duplicate_of``, and ``distinct_models``,
+  ``included_distinct`` and every share count distinct configurations;
 * Hansen's (2005) SPA test of whether ANY configuration beats a benchmark
   (default: rank weights on the whole cross-section), and Romano-Wolf (2005)
   StepM listing which do, with the family-wise error held at 5%;
@@ -130,6 +136,13 @@ TOD_BUCKET = 1800
 DAYS_A_YEAR = 252.0
 #: The most CSCV blocks the overfitting probability uses.
 PBO_MAX_BLOCKS = 16
+#: The losses a group's Model Confidence Sets rank configurations by, as each
+#: summary names them (``{pnl}`` is the series tested, net or mid).
+MCS_LOSSES = {
+    "pnl": "minus the day's {pnl} P&L: ranks by mean daily {pnl} P&L",
+    "sharpe": ("minus the day's {pnl} P&L over the configuration's full-sample sd: "
+               "ranks by daily {pnl} Sharpe"),
+}
 
 CONFIG_FIELDS = tuple(f.name for f in dataclasses.fields(sf.BacktestConfig))
 PNL = ("mid", "net")  # the series' first two rows: gross (marked at the mid) and net
@@ -613,6 +626,102 @@ def decision_grid(labels: dict) -> tuple[dict, float | None]:
     return grid, decision_spacing(np.asarray(union), days)
 
 
+def distinct_columns(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The distinct columns of a matrix: ``(first, representative)``.
+
+    ``first`` holds the index of each distinct column's first occurrence, in
+    ``np.unique``'s (sorted) order; ``representative[j]`` is the first column
+    equal to column ``j`` in every entry, ``j`` itself when it is the first.
+    Configurations with the same P&L -- a setting that changed nothing -- are
+    one model to the joint tests and are counted once.
+    """
+    _, first, inverse = np.unique(matrix, axis=1, return_index=True, return_inverse=True)
+    return first, first[np.ravel(inverse)]
+
+
+def scaled_losses(pnl: np.ndarray) -> np.ndarray:
+    """Minus each column of daily P&L over that column's full-sample standard deviation.
+
+    The mean of the scaled loss is minus the column's per-day Sharpe ratio,
+    so a confidence set on it ranks configurations by Sharpe rather than by
+    mean P&L, which the book running the most risk wins. The scale is
+    estimated once on the full sample and held fixed in the bootstrap, as
+    the SPA's studentization is, so the set ignores its sampling error. A
+    flat column (no P&L at all) has no Sharpe and scores zero loss.
+    """
+    sd = pnl.std(axis=0, ddof=1)
+    return np.where(sd > 0, -pnl / np.where(sd > 0, sd, 1.0), 0.0)
+
+
+def confidence_set(losses, block: int, reps: int, seed: int) -> tuple:
+    """Model Confidence Set p-values of the columns of ``losses`` (a frame), or None.
+
+    arch's ``R`` statistic up to :data:`MCS_R_LIMIT` columns and ``max``
+    beyond; a group the statistic cannot handle falls back to ``max``.
+    Returns ``(p-values by column name or None, method, errors)``.
+    """
+    from arch.bootstrap import MCS
+
+    method = "R" if losses.shape[1] <= MCS_R_LIMIT else "max"
+    errors = []
+    for attempt in dict.fromkeys((method, "max")):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                mcs = MCS(losses, size=MCS_SIZE, reps=reps, block_size=block, method=attempt,
+                          bootstrap="stationary", seed=seed)
+                mcs.compute()
+            return mcs.pvalues["Pvalue"], attempt, errors
+        except (IndexError, ValueError, np.linalg.LinAlgError) as error:
+            errors.append(f"{attempt}: {error}")
+    return None, method, errors
+
+
+def mcs_by_loss(loss: np.ndarray, ids: list[str], first: np.ndarray, representative: np.ndarray,
+                *, block: int, reps: int, seed: int) -> tuple[dict, dict]:
+    """One confidence set over a group's distinct configurations, on one loss.
+
+    ``loss`` is ``(days, configurations)``; ``first`` and ``representative``
+    come from :func:`distinct_columns` on the group's P&L. The set is run on
+    the representatives alone. Two that the loss itself cannot tell apart (a
+    vol-scaled loss equates P&L series that are multiples of each other) are
+    tested once and share a p-value. A duplicate mirrors its
+    representative's p-value and membership, but every count and share in
+    the summary is over distinct configurations. Returns the summary and
+    ``{row id: (p-value, in the set)}``; no rows when the statistic failed.
+    """
+    import pandas as pd
+
+    tied_first, tied = distinct_columns(loss[:, first])
+    owner = first if len(tied_first) == len(first) else first[tied]
+    models = list(dict.fromkeys(owner.tolist()))
+    summary = {"size": MCS_SIZE, "n_configs": len(ids), "distinct_models": len(first)}
+    if len(models) < 2:
+        pvalues = {m: 1.0 for m in models}
+        summary["skipped"] = ("every configuration has the same P&L" if len(first) < 2
+                              else "the loss cannot tell the configurations apart")
+    else:
+        frame = pd.DataFrame(loss[:, models], columns=[ids[m] for m in models])
+        found, summary["method"], errors = confidence_set(frame, block, reps, seed)
+        if errors:
+            summary["errors"] = errors
+        if found is None:
+            summary["skipped"] = "the MCS statistic failed on this group"
+            return summary, {}
+        pvalues = {m: float(found.loc[ids[m]]) for m in models}
+        if len(models) < len(first):
+            summary["tied_by_loss"] = len(first) - len(models)
+    by_distinct = {int(f): pvalues[int(o)] for f, o in zip(first, owner)}
+    included = [ids[f] for f in sorted(by_distinct) if by_distinct[f] > MCS_SIZE]
+    summary.update(included=included, included_distinct=len(included),
+                   share_distinct=len(included) / len(first))
+    rows = {}
+    for j, r in enumerate(ids):
+        value = by_distinct[int(representative[j])]
+        rows[r] = (value, value > MCS_SIZE)
+    return summary, rows
+
+
 def studentized_differences(benchmark: np.ndarray, models: np.ndarray,
                             block: int) -> np.ndarray:
     """``(L_benchmark - L_model) / omega``, the loss differentials Hansen's SPA tests.
@@ -717,12 +826,13 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
     judged on the same days.
     """
     import pandas as pd
-    from arch.bootstrap import MCS, SPA, StepM
+    from arch.bootstrap import SPA, StepM
 
     ids = [r for r in group["row_id"] if r in daily]
     summary: dict = {"n_configs": len(ids)}
     per_row: dict = {r: {} for r in ids}
     if len(ids) < 2:
+        summary["distinct_models"] = len(ids)
         summary["skipped"] = "fewer than two configurations with daily P&L"
         return summary, per_row
     full = np.stack([daily[r][which] for r in ids], axis=1)
@@ -730,6 +840,15 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
     pnl = full[common]
     n = len(pnl)
     summary["n_days"] = int(n)
+    # Configurations with the same daily P&L (a setting that changed nothing)
+    # are one model: the MCS's pairwise statistic divides by their
+    # zero-variance difference, and counting each copy would inflate every
+    # count. The first configuration with that P&L represents it; a
+    # duplicate names it in duplicate_of and mirrors its results.
+    first, representative = distinct_columns(pnl)
+    summary["distinct_models"] = len(first)
+    for j, r in enumerate(ids):
+        per_row[r]["duplicate_of"] = None if representative[j] == j else ids[representative[j]]
     if n < 4:
         summary["skipped"] = f"only {n} common days"
         return summary, per_row
@@ -737,42 +856,16 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
     summary["block"] = {"stationary": block_sb, "circular": block_cb, **block_info}
     losses = pd.DataFrame(-pnl, columns=ids)
 
-    # Model Confidence Set: the configurations indistinguishable from the best.
-    # Configurations with the same daily P&L (a setting that changed nothing)
-    # are one model to it, since its pairwise statistic divides by their
-    # zero-variance difference; each duplicate takes its representative's
-    # p-value. A group the statistic still cannot handle falls back to the
-    # max statistic, and failing that is reported as skipped.
-    _, first, inverse = np.unique(pnl, axis=1, return_index=True, return_inverse=True)
-    distinct = [ids[i] for i in first]
-    method = "R" if len(distinct) <= MCS_R_LIMIT else "max"
-    pvalues = None
-    if len(distinct) >= 2:
-        for attempt in dict.fromkeys((method, "max")):
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)
-                    mcs = MCS(losses[distinct], size=MCS_SIZE, reps=reps, block_size=block_sb,
-                              method=attempt, bootstrap="stationary", seed=seed)
-                    mcs.compute()
-                pvalues, method = mcs.pvalues["Pvalue"], attempt
-                break
-            except (IndexError, ValueError, np.linalg.LinAlgError) as error:
-                summary.setdefault("mcs_errors", []).append(f"{attempt}: {error}")
-    if len(distinct) < 2:
-        summary["mcs"] = {"size": MCS_SIZE, "skipped": "every configuration has the same P&L",
-                          "included": list(ids)}
-        for r in ids:
-            per_row[r]["mcs_pvalue"], per_row[r]["in_mcs"] = 1.0, True
-    elif pvalues is None:
-        summary["mcs"] = {"size": MCS_SIZE, "skipped": "the MCS statistic failed on this group"}
-    else:
-        for j, r in enumerate(ids):
-            value = float(pvalues.loc[distinct[int(np.ravel(inverse)[j])]])
-            per_row[r]["mcs_pvalue"] = value
-            per_row[r]["in_mcs"] = bool(value > MCS_SIZE)
-        summary["mcs"] = {"size": MCS_SIZE, "method": method, "distinct_models": len(distinct),
-                          "included": [r for r in ids if per_row[r]["in_mcs"]]}
+    # Model Confidence Sets: the configurations indistinguishable from the
+    # best, by mean P&L and by Sharpe (a vol-scaled loss), each over the
+    # distinct configurations.
+    pnl_name = PNL[which]
+    for kind, loss in (("pnl", -pnl), ("sharpe", scaled_losses(pnl))):
+        result, rows = mcs_by_loss(loss, ids, first, representative, block=block_sb, reps=reps,
+                                   seed=seed)
+        summary[f"mcs_{kind}"] = {"loss": MCS_LOSSES[kind].format(pnl=pnl_name), **result}
+        for r, (value, inside) in rows.items():
+            per_row[r][f"mcs_pvalue_{kind}"], per_row[r][f"in_mcs_{kind}"] = value, bool(inside)
 
     # SPA / StepM / Sharpe differences against the benchmark.
     hits = np.flatnonzero(match_rows(group.set_index("row_id").loc[ids].reset_index(), benchmark))
@@ -800,7 +893,9 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
         for r in others:
             per_row[r]["stepm_superior"] = r in superior
         summary["spa"] = {key: float(v) for key, v in spa.pvalues.items()}
-        summary["stepm"] = {"size": TEST_SIZE, "superior": sorted(superior)}
+        summary["stepm"] = {"size": TEST_SIZE, "superior": sorted(superior),
+                            "superior_distinct": len({int(representative[ids.index(r)])
+                                                      for r in superior})}
         scale = math.sqrt(DAYS_A_YEAR)
         tests = sharpe_difference_bootstrap(pnl, bench, block=block_cb, reps=reps, seed=seed)
         for r, test in zip(ids, tests):
@@ -1072,6 +1167,10 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
                 table["sharpe_mid"].to_numpy(float) - rows["sharpe_mid"].to_numpy(float),
                 table["sharpe_net"].to_numpy(float) - rows["sharpe_net"].to_numpy(float)]))),
             "n_days": len(all_days),
+            # Configurations the joint tests saw, and how many of them differ:
+            # every MCS count is out of the second.
+            "configs_in_groups": sum(g["n_configs"] for g in groups),
+            "distinct_models": sum(g.get("distinct_models", 0) for g in groups),
         },
         "groups": groups,
         "seed_dispersion": seed_dispersion(table),
@@ -1129,9 +1228,15 @@ def print_summary(report: dict, table) -> None:
     def short(row_id):
         return "/".join(str(by_id.at[row_id, c]) for c in axes) or by_id.at[row_id, "label"]
 
-    print(f"  group: {','.join(group_keys) or '(one)'}; configuration: {'/'.join(axes)}")
-    print(f"  {'group':<28} {'k':>4} {'best by daily net SR':<38} {'MCS':>4} {'SPA p':>6} "
-          f"{'StepM':>5} {'N_eff':>6} {'DSR':>5} {'PBO':>5}")
+    def in_set(g, kind):
+        found = g.get(f"mcs_{kind}", {})
+        return (f"{found['included_distinct']}/{found['distinct_models']}"
+                if "included_distinct" in found else "-")
+
+    print(f"  group: {','.join(group_keys) or '(one)'}; configuration: {'/'.join(axes)}; "
+          f"MCS: distinct configurations in the 90% set / distinct, by mean P&L and by Sharpe")
+    print(f"  {'group':<28} {'k':>4} {'best by daily net SR':<38} {'MCS P&L':>7} {'MCS SR':>7} "
+          f"{'SPA p':>6} {'StepM':>5} {'N_eff':>6} {'DSR':>5} {'PBO':>5}")
     for g in report["groups"]:
         name = ",".join(str(g["keys"].get(k)) for k in group_keys)[:28] or "all"
         if "dsr" not in g:
@@ -1139,8 +1244,9 @@ def print_summary(report: dict, table) -> None:
             continue
         d = g["dsr"]
         best = f"{short(d['best_row_id'])[:30]} {d['best_sharpe_daily']:.1f}"
-        stepm = len(g["stepm"]["superior"]) if "stepm" in g else "-"
-        print(f"  {name:<28} {g['n_configs']:>4} {best:<38} {len(g['mcs']['included']):>4} "
+        stepm = g["stepm"]["superior_distinct"] if "stepm" in g else "-"
+        print(f"  {name:<28} {g['n_configs']:>4} {best:<38} {in_set(g, 'pnl'):>7} "
+              f"{in_set(g, 'sharpe'):>7} "
               f"{_number(g.get('spa', {}).get('consistent'), '.3f'):>6} {stepm:>5} "
               f"{_number(d['n_eff_used'], '.1f'):>6} {_number(d['best_dsr'], '.2f'):>5} "
               f"{_number(g.get('pbo', {}).get('probability'), '.2f'):>5}")
