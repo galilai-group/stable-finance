@@ -41,6 +41,7 @@ __all__ = [
     "diagonal_covariance",
     "embedding_covariance",
     "estimate_risk",
+    "factor_covariance",
     "ledoit_wolf_covariance",
     "liquidity_screen",
     "nonlinear_shrinkage_covariance",
@@ -251,6 +252,121 @@ def nonlinear_shrinkage_covariance(
     return out
 
 
+def _industry_dummies(industry: ArrayLike, n_assets: int) -> NDArray[np.float64]:
+    """``(n_assets, n_industries)`` membership of the industries with two or more names.
+
+    A one-name industry is left out, its name treated as unclassified: its
+    factor would be that name's own return, which explains it completely and
+    leaves it no specific risk -- a perfect fit that is pure overfitting.
+    """
+    codes = np.asarray(industry, dtype=np.float64)
+    if codes.shape != (n_assets,):
+        raise ValueError(
+            f"industry must be one code per asset, shape {(n_assets,)}; got {codes.shape}")
+    known = np.isfinite(codes)
+    industries = np.unique(codes[known])
+    dummies = (codes[:, None] == industries[None, :]).astype(np.float64)
+    return dummies[:, dummies.sum(axis=0) >= 2]
+
+
+def factor_covariance(
+    history: ForwardReturns,
+    *,
+    n_factors: int = 5,
+    industry: ArrayLike | None = None,
+    min_samples: int = 2,
+) -> NDArray[np.float64]:
+    """Industry and statistical factors, plus a diagonal of specific risk.
+
+    The shrinkage estimators repair a sample covariance's spectrum; a factor
+    model replaces its structure. Every name's return is a few common
+    factors' returns times its exposures plus a residual that is independent
+    across names, so the covariance is ``B F B' + D``: ``N k`` exposures and
+    ``N`` specific variances instead of ``N^2 / 2`` free entries. The
+    off-diagonal terms are then only what the factors explain, which is why a
+    factor model does not mistake idiosyncratic noise for correlation, and
+    why it is the risk model practitioners actually run.
+
+    THE FACTORS ARE STATISTICAL, because a return history carries no
+    fundamental exposures: the first ``n_factors`` principal components of the
+    history's returns at each horizon, which at intraday frequency are the
+    market and a handful of sector and style directions (Connor and
+    Korajczyk, 1986). ``industry`` optionally adds one dummy factor per
+    industry code (one finite code per asset; NaN is unclassified, and an
+    industry with a single name is left out, since its factor would be that
+    name). The industry factors are fitted first, as each decision's
+    industry-average return, and the principal components are taken of what
+    they leave, so the statistical factors describe the co-movement the
+    classification does not. An average over ``m`` members carries ``1/m`` of
+    their specific variance, so a small industry's internal correlations come
+    out high by about that much -- the usual price of a cross-sectional
+    industry factor.
+
+    The model is fitted to the CORRELATION matrix and rescaled by each name's
+    own volatility, so a few high-volatility names cannot claim the leading
+    components for themselves. Without industries the specific variance is
+    exactly what the factors leave of each name's variance, so every name's
+    variance is the one :func:`diagonal_covariance` gives it, and
+    ``n_factors=0`` without industries IS that diagonal model; the factors
+    only add covariances. Specific risk is the variance of the residual after
+    every factor, and the eigenvalues get the same relative floor as the other
+    estimators, so the result is positive definite even when the residual of
+    a name is numerically zero.
+
+    MISSING OBSERVATIONS ARE ZERO-FILLED AFTER CENTERING, as in the other
+    estimators, which biases a sparsely observed name's covariances toward
+    zero; the presence screen in
+    :func:`stable_finance.dataset.universe.presence_screen` keeps that small.
+    """
+    if (isinstance(n_factors, bool) or not isinstance(n_factors, (int, np.integer))
+            or n_factors < 0):
+        raise ValueError("n_factors must be a non-negative integer")
+    n_decisions, n_assets, n_horizons = history.values.shape
+    if n_factors >= n_assets:
+        raise ValueError(f"n_factors must be below the number of assets ({n_assets})")
+    if n_decisions < 2:
+        raise ValueError("a factor model needs at least two decisions")
+    dummies = None if industry is None else _industry_dummies(industry, n_assets)
+    out = np.empty((n_horizons, n_assets, n_assets), dtype=np.float64)
+    for horizon in range(n_horizons):
+        _, centered, counts = _observed_moments(
+            history.values[:, :, horizon], min_samples
+        )
+        squares = (centered * centered).sum(axis=0)
+        variance = squares / np.maximum(counts - 1, 1)
+        largest = float(variance.max())
+        if largest <= 0:
+            raise ValueError("returns have no variance")
+        variance = np.maximum(variance, 1e-8 * largest)
+        # Standardized so that z'z / (n - 1) is the zero-filled sample
+        # correlation, with an exact unit diagonal; a constant name stays zero.
+        scale = np.sqrt(squares / (n_decisions - 1))
+        residual = np.divide(centered, scale, out=np.zeros_like(centered),
+                             where=scale > 0)
+        exposures, factor_returns = [], []
+        if dummies is not None and dummies.shape[1] > 0:
+            averages = (residual @ dummies) / dummies.sum(axis=0)
+            residual = residual - averages @ dummies.T
+            exposures.append(dummies)
+            factor_returns.append(averages)
+        if n_factors > 0:
+            _, eigenvectors = np.linalg.eigh(residual.T @ residual)
+            loadings = eigenvectors[:, ::-1][:, :n_factors]
+            components = residual @ loadings
+            residual = residual - components @ loadings.T
+            exposures.append(loadings)
+            factor_returns.append(components)
+        specific = (residual * residual).sum(axis=0) / (n_decisions - 1)
+        correlation = np.diag(specific)
+        if exposures:
+            beta = np.hstack(exposures)
+            f = np.hstack(factor_returns)
+            correlation += beta @ (f.T @ f / (n_decisions - 1)) @ beta.T
+        sigma = np.sqrt(variance)
+        out[horizon] = _project_psd(correlation * np.outer(sigma, sigma))
+    return out
+
+
 def embedding_covariance(
     history: ForwardReturns,
     embeddings: Embeddings,
@@ -314,8 +430,15 @@ def estimate_risk(
     embeddings: Embeddings | None = None,
     shrinkage: float = 0.3,
     min_samples: int = 2,
+    n_factors: int = 5,
+    industry: ArrayLike | None = None,
 ) -> NDArray[np.float64]:
-    """Dispatch to one named risk model; see :data:`RISK_MODELS`."""
+    """Dispatch to one named risk model; see :data:`RISK_MODELS`.
+
+    ``n_factors`` and ``industry`` are read by ``factor`` alone (see
+    :func:`factor_covariance`), and ``shrinkage`` by ``shrunk_sample`` and
+    ``embedding``; every other model ignores them.
+    """
 
     if name == "diagonal":
         return diagonal_covariance(history, min_samples=min_samples)
@@ -333,17 +456,26 @@ def estimate_risk(
         return embedding_covariance(
             history, embeddings, shrinkage=shrinkage, min_samples=min_samples
         )
+    if name == "factor":
+        return factor_covariance(history, n_factors=n_factors, industry=industry,
+                                 min_samples=min_samples)
     raise ValueError(f"unknown risk model {name!r}; choose from {RISK_MODELS}")
 
 
-#: The risk models a backtest configuration may name.
+#: The risk models a backtest configuration may name. ``factor`` is named
+#: but not swept: :data:`~stable_finance.evaluation.config.CONFIG_SPACE` lists
+#: the others explicitly, so adding it left the default space and every label
+#: as they were, and a study asks for it by name.
 RISK_MODELS = (
     "diagonal", "shrunk_sample", "ledoit_wolf", "nonlinear_shrinkage", "embedding",
+    "factor",
 )
 
 #: What each risk model needs of the market: nothing, since all of them are
 #: estimated from returns (``embedding`` also needs the embeddings, which are
-#: not market data and are checked where they are used).
+#: not market data and are checked where they are used; ``factor`` adds
+#: industry factors when the market has an ``industry`` code, and runs on
+#: statistical factors alone when it does not).
 RISK_MODEL_REQUIRES: dict[str, tuple[str, ...]] = {name: () for name in RISK_MODELS}
 
 

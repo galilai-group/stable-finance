@@ -217,3 +217,179 @@ def test_rebalance_and_allocate_reject_a_malformed_risk_aversion(bad, message):
         rebalance(target, sigma, risk_aversion=bad)
     with pytest.raises(ValueError, match=message):
         allocate(forecast, sigma, risk_aversion=bad)
+
+
+# The run-to-tolerance solver: accelerated proximal gradient with adaptive restart.
+def ill_conditioned(seed=0, n_decisions=5, n_assets=10, condition=2e3):
+    """A correlated covariance with a wide spread of variances and a known condition number."""
+    rng = np.random.default_rng(seed)
+    basis, _ = np.linalg.qr(rng.normal(size=(n_assets, n_assets)))
+    spectrum = np.geomspace(1.0, 1.0 / condition, n_assets)
+    vols = np.geomspace(1.0, 8.0, n_assets)
+    sigma = 1e-4 * (vols[:, None] * (basis * spectrum) @ basis.T * vols[None, :])
+    # The forecast whose frictionless book at risk aversion 3 is of order one,
+    # so tolerances on weights mean the same thing at every condition number.
+    book = rng.normal(0, 0.5, (n_decisions, n_assets))
+    forecast = ForwardReturns(3.0 * (book @ sigma)[:, :, None],
+                              np.arange(n_decisions), [f"A{i}" for i in range(n_assets)],
+                              [300])
+    cost = 1e-4 * (1 + rng.random((n_decisions, n_assets)))
+    return forecast, sigma[None], cost
+
+
+def optimality_gap(w, previous, sigma, signal, cost, gamma):
+    """Largest violation of the problem's optimality conditions, in return units."""
+    gradient = gamma * sigma @ w - signal
+    trade = w - previous
+    traded = trade != 0
+    on_boundary = np.abs(gradient[traded] + cost[traded] * np.sign(trade[traded]))
+    inside = np.maximum(np.abs(gradient[~traded]) - cost[~traded], 0.0)
+    return max(on_boundary.max(initial=0.0), inside.max(initial=0.0))
+
+
+def test_the_restart_solver_meets_the_optimality_conditions_at_every_decision():
+    forecast, sigma, cost = ill_conditioned()
+    held, n_iter = allocate(forecast, sigma, risk_aversion=3.0, cost=cost,
+                            solver="restart", return_n_iter=True)
+    previous = np.zeros(10)
+    for decision in range(5):
+        w = held.values[decision, :, 0]
+        gap = optimality_gap(w, previous, sigma[0], forecast.values[decision, :, 0],
+                             cost[decision], 3.0)
+        assert gap < 1e-9
+        previous = w
+    assert (n_iter < 20000).all()
+
+
+def test_the_restart_solver_converges_where_the_fixed_budget_runs_out():
+    """FISTA stopped by its budget is an approximation; restart reaches the optimum."""
+    forecast, sigma, cost = ill_conditioned(seed=1)
+    exact = allocate(forecast, sigma, risk_aversion=3.0, cost=cost, max_iter=100000,
+                     tol=1e-14).values
+    capped, capped_iter = allocate(forecast, sigma, risk_aversion=3.0, cost=cost,
+                                   max_iter=50, return_n_iter=True)
+    restart, restart_iter = allocate(forecast, sigma, risk_aversion=3.0, cost=cost,
+                                     solver="restart", return_n_iter=True)
+    capped, restart = capped.values, restart.values
+    assert (capped_iter == 50).all()
+    assert (restart_iter < 20000).all()
+    # The step tolerance (1e-10) bounds the distance to the optimum only up to
+    # the contraction factor of the last iterations, hence 1e-7 here.
+    assert np.abs(restart - exact).max() < 1e-7
+    assert np.abs(capped - exact).max() > 1e4 * np.abs(restart - exact).max()
+
+
+def test_without_costs_the_restart_solver_lands_on_the_closed_form():
+    forecast, sigma, _ = ill_conditioned(seed=2)
+    aversion = np.array([0.5, 1.0, 2.0, 4.0, 8.0])
+    target = mean_variance_target(forecast, sigma, risk_aversion=aversion)
+    held = rebalance(target, sigma, risk_aversion=aversion, solver="restart",
+                     tol=1e-13).values
+    np.testing.assert_allclose(held, target.values, rtol=1e-7, atol=1e-9)
+
+
+def test_the_two_step_and_one_shot_solves_agree_under_the_restart_solver():
+    forecast, sigma, cost = ill_conditioned(seed=3)
+    aversion = np.linspace(1.0, 6.0, 5)
+    one_shot = allocate(forecast, sigma, risk_aversion=aversion, cost=cost,
+                        solver="restart").values
+    target = mean_variance_target(forecast, sigma, risk_aversion=aversion)
+    two_step = rebalance(target, sigma, risk_aversion=aversion, cost=cost,
+                         solver="restart").values
+    np.testing.assert_allclose(two_step, one_shot, rtol=1e-7, atol=1e-9)
+
+
+def test_an_untradable_name_holds_its_weight_under_the_restart_solver():
+    forecast = ForwardReturns(np.full((3, 2, 1), 0.01), [0, 1, 2], ["A", "B"], [300])
+    covariance = np.array([np.eye(2) * 0.01])
+    weights = allocate(forecast, covariance, cost=[[np.nan, 10.0]],
+                       initial=[[0.3], [-0.2]], solver="restart")
+    np.testing.assert_array_equal(weights.values[:, 0, 0], 0.3)
+    np.testing.assert_array_equal(weights.values[:, 1, 0], -0.2)
+
+
+def test_a_name_without_variance_keeps_the_unscaled_step():
+    """A zero diagonal entry cannot scale the metric; the solve must still be finite."""
+    sigma = np.diag([1e-4, 2e-4, 0.0])
+    sigma[0, 1] = sigma[1, 0] = 5e-5
+    forecast = ForwardReturns(np.array([[[1e-3], [-1e-3], [1e-4]]]), [0], ["A", "B", "C"],
+                              [300])
+    cost = np.array([[1e-4, 1e-4, 1e-3]])  # C's edge never pays its cost
+    restart = allocate(forecast, sigma[None], cost=cost, solver="restart").values
+    fista = allocate(forecast, sigma[None], cost=cost, max_iter=20000, tol=1e-14).values
+    assert np.isfinite(restart).all()
+    assert restart[0, 2, 0] == 0.0
+    np.testing.assert_allclose(restart, fista, rtol=1e-7, atol=1e-9)
+
+
+def test_iteration_counts_have_one_entry_per_decision_and_horizon():
+    returns = history(seed=6, n_assets=4)
+    sigma = estimate_covariance(returns, shrinkage=0.1)
+    forecast = ForwardReturns(np.random.default_rng(6).normal(0, 1e-3, (7, 4, 2)),
+                              np.arange(7), returns.assets, returns.horizons)
+    cost = np.full((7, 4), 1e-4)
+    for solver in (None, "restart"):
+        held, n_iter = allocate(forecast, sigma, cost=cost, solver=solver,
+                                return_n_iter=True)
+        assert n_iter.shape == (7, 2) and n_iter.dtype == np.int64
+        assert (n_iter >= 1).all()
+        np.testing.assert_array_equal(
+            held.values, allocate(forecast, sigma, cost=cost, solver=solver).values)
+    _, capped = allocate(forecast, sigma, cost=cost, max_iter=3, return_n_iter=True)
+    assert (capped == 3).all()
+
+
+def test_the_default_solver_is_the_fixed_budget_solver_bit_for_bit():
+    forecast, sigma, cost = ill_conditioned(seed=4)
+    implicit = allocate(forecast, sigma, cost=cost, max_iter=40).values
+    explicit = allocate(forecast, sigma, cost=cost, max_iter=40, solver=None).values
+    np.testing.assert_array_equal(implicit, explicit)
+
+
+def test_reaching_the_restart_cap_warns_and_max_iter_can_only_raise_it(monkeypatch):
+    import importlib
+
+    from sklearn.exceptions import ConvergenceWarning
+
+    # The package re-exports the function under the module's name.
+    module = importlib.import_module("stable_finance.evaluation.trades.rebalance")
+    monkeypatch.setattr(module, "RESTART_MAX_ITER", 10)
+    forecast, sigma, cost = ill_conditioned(seed=5, n_decisions=2)
+    # tol=0 can never be met, so every decision runs to the cap.
+    with pytest.warns(ConvergenceWarning, match="2 of 2 decisions"):
+        _, n_iter = allocate(forecast, sigma, cost=cost, solver="restart", max_iter=1,
+                             tol=0.0, return_n_iter=True)
+    assert (n_iter == 10).all()
+    with pytest.warns(ConvergenceWarning, match="cap of 25"):
+        _, n_iter = allocate(forecast, sigma, cost=cost, solver="restart", max_iter=25,
+                             tol=0.0, return_n_iter=True)
+    assert (n_iter == 25).all()
+
+
+def test_the_fixed_budget_solver_never_warns(recwarn):
+    forecast, sigma, cost = ill_conditioned(seed=5, n_decisions=2)
+    allocate(forecast, sigma, cost=cost, max_iter=2)
+    assert not recwarn.list
+
+
+def test_an_unknown_solver_is_refused():
+    forecast, sigma, _ = ill_conditioned(n_decisions=1)
+    target = mean_variance_target(forecast, sigma)
+    with pytest.raises(ValueError, match="solver='newton'"):
+        rebalance(target, sigma, solver="newton")
+    with pytest.raises(ValueError, match="solver='newton'"):
+        allocate(forecast, sigma, solver="newton")
+
+
+def test_the_allocator_passes_its_solver_through():
+    returns = history(seed=7)
+    forecast = ForwardReturns(np.random.default_rng(7).normal(0, 1e-3, (4, 3, 2)),
+                              np.arange(4), returns.assets, returns.horizons)
+    allocator = MeanVarianceAllocator(risk_aversion=2.0, solver="restart")
+    assert clone(allocator).get_params()["solver"] == "restart"
+    allocator.fit(returns)
+    held = allocator.predict(forecast, cost=1e-4)
+    direct = allocate(forecast, allocator.covariance_, risk_aversion=2.0, cost=1e-4,
+                      solver="restart")
+    np.testing.assert_array_equal(held.values, direct.values)
+    assert MeanVarianceAllocator().get_params()["solver"] is None

@@ -4,6 +4,7 @@ import pytest
 from stable_finance import (
     CONFIG_SPACE,
     DEFAULT_BACKTEST,
+    RISK_MODELS,
     BacktestConfig,
     Embeddings,
     ForwardReturns,
@@ -14,12 +15,14 @@ from stable_finance import (
     embedding_covariance,
     enumerate_configs,
     estimate_risk,
+    factor_covariance,
     ledoit_wolf_covariance,
     run_backtest,
     select_book,
     sweep_configs,
     tail_selection,
     trading_cost,
+    transfer_coefficient,
     weight_book,
 )
 from stable_finance.evaluation import backtest as bt
@@ -217,6 +220,36 @@ def test_identical_embeddings_forecast_a_perfect_correlation():
 def test_embedding_risk_model_requires_embeddings():
     with pytest.raises(ValueError, match="needs embeddings"):
         estimate_risk("embedding", world()["history"])
+
+
+def test_the_factor_model_is_selectable_but_not_swept():
+    assert "factor" in RISK_MODELS
+    assert "factor" not in CONFIG_SPACE["risk_model"]
+    assert {c.risk_model for c in enumerate_configs()} == set(CONFIG_SPACE["risk_model"])
+    asked = enumerate_configs(risk_model=("factor",), weighting="min_var", efq=0.0,
+                              universe="all", selection="all", rebalance="every_decision")
+    assert [c.risk_model for c in asked] == ["factor"]
+    w = world()
+    report = run_backtest(w["forecast"], w["realized"], history=w["history"],
+                          config=FRICTIONLESS.replace(weighting="min_var", risk_model="factor"))
+    assert np.isfinite(report.sharpe_mid)
+
+
+def test_the_factor_model_reads_the_market_industry_codes_when_there_are_some():
+    w = world()
+    codes = np.tile([1.0, 1.0, 1.0, 2.0, 2.0, 2.0], (80, 1))
+    codes[:5, 0] = np.nan  # a name first classified at decision 5
+    codes[40:, 5] = 1.0    # a reclassification later in the period is not read
+    market = MarketData({"industry": codes}, w["forecast"].decisions, ASSETS)
+    config = FRICTIONLESS.replace(weighting="min_var", risk_model="factor")
+    plain = bt._prepare(w["forecast"], w["realized"], MarketData.empty(
+        w["forecast"].decisions, ASSETS), None, 0)
+    coded = bt._prepare(w["forecast"], w["realized"], market, None, 0)
+    np.testing.assert_array_equal(bt._risk(plain, config, w["history"], w["realized"], None, 0),
+                                  factor_covariance(w["history"])[0])
+    np.testing.assert_array_equal(
+        bt._risk(coded, config, w["history"], w["realized"], None, 0),
+        factor_covariance(w["history"], industry=[1.0, 1.0, 1.0, 2.0, 2.0, 2.0])[0])
 
 
 def test_unknown_risk_model_is_rejected():
@@ -664,6 +697,117 @@ def test_a_held_book_restarts_at_each_day_and_reads_date_anchor_labels():
     assert report.n_periods == 10 * 3          # decisions 0, 3 and 6 of each day
 
 
+def held_world(unknown):
+    """``world()`` on Market-1T labels, with the realized return NaN where ``unknown``.
+
+    Eight decisions a day, 300 seconds apart: the 900-second horizon is three
+    decisions, so a held book is set at decisions 0, 3 and 6 of each day.
+    """
+    w = world()
+    labels = np.array([f"2020-08-{3 + d:02d}|{1800 + 300 * k}"
+                       for d in range(10) for k in range(8)])
+    realized = np.where(unknown[:, None], np.nan, w["realized"].values[:, :, 0])
+    return {"forecast": panel(w["forecast"].values, decisions=labels),
+            "realized": panel(realized, decisions=labels),
+            "history": panel(w["history"].values, decisions=labels),
+            "half_spread": w["half_spread"], "days": w["days"]}
+
+
+HELD = DEFAULT_BACKTEST.replace(weighting="equal", risk_model="diagonal",
+                                annualization="decisions", rebalance="horizon")
+
+
+def test_a_formation_whose_return_is_never_known_sets_a_flat_book():
+    # The last block of each day runs past the close, so its forward return
+    # is NaN for every name (the 15:45 book at 900 seconds). A forecast known
+    # there used to trade into a book that could never earn, and was charged
+    # for it. Its view there is now dropped, as an oracle's is (an oracle is
+    # unknown wherever the return is), so the book is set flat, closing the
+    # one before it.
+    k = np.tile(np.arange(8), 10)
+    late = k >= 6
+    setup = held_world(unknown=late)
+    mu = setup["forecast"].values[:, :, 0]
+    report = run_backtest(**setup, config=HELD, with_series=True)
+    blind = run_backtest(**{**setup, "forecast": panel(np.where(late[:, None], np.nan, mu),
+                                                      decisions=setup["forecast"].decisions)},
+                         config=HELD, with_series=True)
+    assert report.as_dict() == blind.as_dict()
+    np.testing.assert_array_equal(report.series.cost, blind.series.cost)
+
+    # What should have traded: the books set at 0 and 3, and nothing from 6 on.
+    weights = weight_book("equal", select_book("all", mu, np.ones(mu.shape, bool)), mu,
+                          np.eye(6), gross_exposure=HELD.gross_exposure)
+    held = np.where(late[:, None], 0.0, weights[np.arange(80) - k % 3])
+    traded = run_backtest(PortfolioWeights(held[:, :, None], setup["forecast"].decisions,
+                                           ASSETS, AXIS),
+                          setup["realized"], half_spread=setup["half_spread"],
+                          days=setup["days"], with_series=True,
+                          config=HELD.replace(rebalance="every_decision"))
+    assert report.n_periods == 10 * 3
+    book = np.cumsum(k % 3 == 0) - 1
+    np.testing.assert_allclose(report.series.cost, np.bincount(book, traded.series.cost),
+                               rtol=1e-12, atol=0)
+    # The flat book earns nothing and is charged exactly the closing trade.
+    six = np.flatnonzero(k == 6)
+    assert np.all(report.series.gross[2::3] == 0.0)
+    np.testing.assert_allclose(report.series.cost[2::3],
+                               (np.abs(held[six - 1]) * setup["half_spread"][six]).sum(axis=1),
+                               rtol=1e-12)
+    realized = setup["realized"].values[:, :, 0]
+    formed = (k == 0) | (k == 3)
+    np.testing.assert_allclose(np.delete(report.series.gross, np.s_[2::3]),
+                               (weights[formed] * realized[formed]).sum(axis=1),
+                               rtol=1e-12, atol=1e-15)
+
+
+def test_a_held_cost_aware_book_drops_its_view_where_the_return_is_never_known():
+    # The cost-aware allocator plans a path, so its held book is not set flat
+    # after the fact (a full exit and re-entry on a book meant to be kept);
+    # the forecast is dropped there before the path is solved, as an
+    # oracle's is. Rebalanced at every decision, the view is still used.
+    k = np.tile(np.arange(8), 10)
+    late = k >= 6
+    setup = held_world(unknown=late)
+    blind = {**setup, "forecast": panel(np.where(late[:, None], np.nan,
+                                                 setup["forecast"].values[:, :, 0]),
+                                        decisions=setup["forecast"].decisions)}
+    held = DEFAULT_BACKTEST.replace(annualization="decisions", rebalance="horizon", max_iter=20)
+    report = run_backtest(**setup, config=held, with_series=True)
+    oracle = run_backtest(**blind, config=held, with_series=True)
+    assert report.as_dict() == oracle.as_dict()
+    np.testing.assert_array_equal(report.series.cost, oracle.series.cost)
+    every = held.replace(rebalance="every_decision")
+    assert run_backtest(**setup, config=every).sharpe_net != run_backtest(**blind, config=every).sharpe_net
+    # A sweep keeps the book that dropped part of its view apart from the one
+    # that did not, though the two share every book axis.
+    configs = [every, held, every.replace(efq=0.5), held.replace(efq=0.5)]
+    swept = sweep_configs(setup["forecast"], setup["realized"], configs,
+                          half_spread=setup["half_spread"], history=setup["history"],
+                          days=setup["days"])
+    alone = [run_backtest(**setup, config=config) for config in configs]
+    assert [r.as_dict() for r in swept] == [r.as_dict() for r in alone]
+
+
+def test_a_held_book_reports_its_turnover_per_book_as_it_does_its_cost():
+    # The trades of a held book are folded into one period per book, and its
+    # turnover is too, so cost over turnover is the cost per unit traded.
+    setup = held_world(unknown=np.zeros(80, bool))
+    report = run_backtest(**setup, config=HELD)
+    mu = setup["forecast"].values[:, :, 0]
+    weights = weight_book("equal", select_book("all", mu, np.ones(mu.shape, bool)), mu,
+                          np.eye(6), gross_exposure=HELD.gross_exposure)
+    held = weights[np.arange(80) - np.tile(np.arange(8), 10) % 3]
+    traded = run_backtest(PortfolioWeights(held[:, :, None], setup["forecast"].decisions,
+                                           ASSETS, AXIS),
+                          setup["realized"], half_spread=setup["half_spread"],
+                          days=setup["days"], config=HELD.replace(rebalance="every_decision"))
+    assert report.n_periods == 30
+    assert report.mean_turnover == pytest.approx(traded.mean_turnover * 80 / 30, rel=1e-12)
+    assert report.mean_cost_bps / report.mean_turnover == pytest.approx(
+        traded.mean_cost_bps / traded.mean_turnover, rel=1e-12)
+
+
 def test_horizon_rebalancing_needs_decision_times_and_one_step_drift_is_refused():
     w = world()
     named = np.array([f"d{i}" for i in range(80)])
@@ -717,6 +861,13 @@ def test_an_industry_neutral_book_runs_on_a_market_with_industry_codes():
 def test_beta_neutralization_runs_on_any_market():
     w = world()
     config = FRICTIONLESS.replace(neutralize="beta", weighting="equal", risk_model="diagonal")
+    report = run_backtest(w["forecast"], w["realized"], history=w["history"], config=config)
+    assert np.isfinite(report.sharpe_mid)
+
+
+def test_principal_component_neutralization_runs_on_any_market():
+    w = world()
+    config = FRICTIONLESS.replace(neutralize="pca3", weighting="equal", risk_model="diagonal")
     report = run_backtest(w["forecast"], w["realized"], history=w["history"], config=config)
     assert np.isfinite(report.sharpe_mid)
 
@@ -793,6 +944,32 @@ def test_weights_have_no_forecast_and_so_no_transfer_coefficient():
     assert np.isnan(report.as_dict()["transfer_coefficient"])
 
 
+def test_a_held_book_is_scored_against_the_forecast_it_was_formed_on():
+    # A held book earns once, where it was set, so its TC is read there: the
+    # books set at decisions 0 and 3 of each day against those decisions'
+    # forecasts. Decision 6 sets no book (its forward return is unknown), and
+    # the decisions a book is carried through hold an older book than their
+    # forecast, which is what used to deflate the number.
+    k = np.tile(np.arange(8), 10)
+    setup = held_world(unknown=k >= 6)
+    report = run_backtest(**setup, config=HELD)
+    market = MarketData({"half_spread": setup["half_spread"]}, setup["forecast"].decisions, ASSETS)
+    context = bt._prepare(setup["forecast"], setup["realized"], market, setup["days"], 0)
+    sigma = bt._risk(context, HELD, setup["history"], setup["realized"], None, 0)
+    mu = setup["forecast"].values[:, :, 0]
+    weights = weight_book("equal", select_book("all", mu, np.ones(mu.shape, bool)), mu,
+                          sigma, gross_exposure=HELD.gross_exposure)
+    formed = (k == 0) | (k == 3)
+    expected = transfer_coefficient(weights[formed], mu[formed], sigma).mean
+    assert report.transfer_coefficient == pytest.approx(expected, rel=1e-9)
+    carried = np.where(k[:, None] >= 6, 0.0, weights[np.arange(80) - k % 3])
+    assert report.transfer_coefficient > transfer_coefficient(carried, mu, sigma).mean + 0.1
+    # Rebalanced at every decision, every decision is a book and is scored.
+    every = run_backtest(**setup, config=HELD.replace(rebalance="every_decision"))
+    assert every.transfer_coefficient == pytest.approx(
+        transfer_coefficient(weights, mu, sigma).mean, rel=1e-9)
+
+
 def test_a_sweep_reports_the_transfer_coefficient_each_run_would():
     w = world()
     configs = [FRICTIONLESS.replace(selection=selection, rebalance=rebalance, **extra)
@@ -809,3 +986,56 @@ def test_a_sweep_reports_the_transfer_coefficient_each_run_would():
     every = [r.transfer_coefficient for r in alone
              if r.config.rebalance == "every_decision"]
     assert max(daily) < min(every)
+
+
+# ── the mean-variance solver ────────────────────────────────────────────────
+
+def test_an_unset_solver_leaves_every_label_and_row_unchanged():
+    assert "mv_solver" not in DEFAULT_BACKTEST.label
+    setup = world()
+    assert "mv_solver" not in run_backtest(**setup, config=DEFAULT_BACKTEST).as_dict()
+    converged = DEFAULT_BACKTEST.replace(mv_solver="restart")
+    assert converged.label == DEFAULT_BACKTEST.label + "|mv_solver=restart"
+    assert run_backtest(**setup, config=converged).as_dict()["mv_solver"] == "restart"
+
+
+def test_the_solver_setting_is_validated():
+    with pytest.raises(ValueError, match="mv_solver"):
+        BacktestConfig(mv_solver="newton")
+
+
+def test_the_converged_book_does_not_depend_on_the_iteration_budget():
+    """Under ``restart`` max_iter only floors a safety cap; under FISTA it is the answer."""
+    setup = world()
+
+    def run(**changes):
+        return run_backtest(**setup, config=DEFAULT_BACKTEST.replace(**changes))
+
+    assert run(max_iter=1).mean_turnover != pytest.approx(run(max_iter=400).mean_turnover)
+    low, high = run(mv_solver="restart", max_iter=1), run(mv_solver="restart", max_iter=400)
+    assert {**low.as_dict(), "max_iter": 0} == {**high.as_dict(), "max_iter": 0}
+    tight = run(max_iter=100000)
+    assert low.sharpe_net == pytest.approx(tight.sharpe_net, rel=1e-6)
+    assert low.mean_turnover == pytest.approx(tight.mean_turnover, rel=1e-6)
+
+
+def test_the_solver_is_read_only_by_the_mean_variance_allocator():
+    setup = world()
+    for weighting in ("signal", "min_var_qp"):
+        config = DEFAULT_BACKTEST.replace(weighting=weighting)
+        plain = run_backtest(**setup, config=config).as_dict()
+        restart = run_backtest(**setup, config=config.replace(mv_solver="restart")).as_dict()
+        assert restart.pop("mv_solver") == "restart"
+        assert restart == plain
+
+
+def test_a_sweep_keeps_the_two_solvers_books_apart():
+    setup = world()
+    configs = [DEFAULT_BACKTEST.replace(max_iter=5, mv_solver=solver, efq=efq)
+               for solver in (None, "restart") for efq in (0.0, 1.0)]
+    swept = sweep_configs(setup["forecast"], setup["realized"], configs,
+                          half_spread=setup["half_spread"], history=setup["history"],
+                          days=setup["days"])
+    alone = [run_backtest(**setup, config=config) for config in configs]
+    assert [r.as_dict() for r in swept] == [r.as_dict() for r in alone]
+    assert swept[1].mean_turnover != pytest.approx(swept[3].mean_turnover)

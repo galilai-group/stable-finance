@@ -102,6 +102,16 @@ turnover a real signal shows. It shares neither the mechanism nor the
 parameters of the rank swaps above -- a half-life rather than a block length,
 an IC hit in expectation rather than steered -- so it is a function of its
 own rather than a fourth ``noise``.
+
+The copula's errors are still independent ACROSS names and its quality is
+the same at every decision and for every name, and a real forecast has
+neither property: its errors are bets on factors -- it is wrong about all
+high-beta names at once -- its IC drifts through good and bad stretches, and
+it is more accurate in some names than in others. :func:`factor_forecast`
+adds the three to the copula, each opt-in by a parameter: errors that load
+on the principal components of past returns, a per-decision IC that follows
+an AR(1), and accuracy that rises with a name's spread or volatility. With
+all three switched off it is the copula, draw for draw.
 """
 
 from __future__ import annotations
@@ -111,12 +121,27 @@ from statistics import NormalDist
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from stable_finance.dataset.market import MarketData, require_market_aligned
 from stable_finance.evaluation._grid import _rankdata
 from stable_finance.evaluation.returns.contract import ForwardReturns
 
-__all__ = ["NOISE_MODES", "copula_forecast", "oracle_forecast"]
+__all__ = [
+    "NOISE_MODES",
+    "QUALITY_VARIABLES",
+    "copula_forecast",
+    "factor_forecast",
+    "oracle_forecast",
+]
 
 NOISE_MODES = ("tails", "middle", "random")
+
+#: What a name's accuracy can be made to rise with in :func:`factor_forecast`.
+QUALITY_VARIABLES = ("spread", "vol")
+
+#: The largest per-name, per-decision rank IC :func:`factor_forecast` will
+#: use. A time-varying IC or a quality weight can push a target past
+#: ``+-1``, where the copula has no noise left; clipping there keeps a sliver.
+_IC_CAP = 0.999
 
 
 def oracle_forecast(
@@ -438,6 +463,427 @@ def copula_forecast(
                 centre + float(scales[horizon]) * (reordered - centre)
             )
     return ForwardReturns(forecast, realized.decisions, realized.assets, realized.horizons)
+
+
+def factor_forecast(
+    realized: ForwardReturns,
+    ic: float | ArrayLike,
+    *,
+    history: ForwardReturns | None = None,
+    n_factors: int = 3,
+    factor_share: float = 0.3,
+    ic_persistence: float | None = None,
+    ic_dispersion: float = 0.0,
+    quality: str | None = None,
+    quality_strength: float = 1.0,
+    market: MarketData | None = None,
+    half_life: float | None = None,
+    days: ArrayLike | None = None,
+    scale: float | None = None,
+    seed: int | np.random.Generator | None = None,
+) -> ForwardReturns:
+    """A copula forecast whose errors are factor bets and whose IC drifts.
+
+    :func:`copula_forecast` scores each name as
+    ``rho * z + sqrt(1 - rho**2) * e`` with ``z`` the normal score of its
+    realized rank and ``e`` noise of its own. Its errors are independent
+    across names, its IC is the same at every decision, and every name is
+    forecast equally well. None of that is how a real forecast is wrong, and
+    each of the three biases a study in a known direction:
+
+    * independent errors diversify away across a few hundred names, so
+      breadth looks larger than it is, and neutralizing a factor or using a
+      better risk model can only remove true signal -- the measured value of
+      both is biased towards zero or below. A real forecast's errors are
+      bets: it is wrong about all high-beta names, or all of one industry,
+      at once, and that is precisely what neutralization and a risk model
+      exist to take out;
+    * a fixed IC makes every decision's P&L a draw from the same law, so the
+      only strategy risk left is sampling noise. A real forecast has good
+      and bad stretches, and ``IR = mean(IC) / sd(IC)`` (Qian and Hua, 2004;
+      Ding and Martin, 2017) is set by them;
+    * equal accuracy everywhere misplaces the alpha. Short-horizon
+      predictability concentrates in wide-spread, volatile names, which is
+      where a cost-blind construction pays most to trade.
+
+    This generator adds the three, each switched off by default except the
+    factor errors. The score of name ``i`` at decision ``t`` is
+
+        ``s = c_it * z + sqrt(1 - c_it**2) * e``,
+        ``e = g_t + sqrt(1 - share_i) * u``,
+
+    and the forecast is the ranking of ``s``, valued as in
+    :func:`copula_forecast`; ``u`` is each name's own noise, the copula's
+    ``e``.
+
+    **Factor errors.** ``g_t`` is the factor part of the error: each name's
+    loadings ``B_i`` on ``n_factors`` factors, dotted with a standard-normal
+    factor shock ``f_t`` and scaled so that the name's factor part has
+    variance ``share_i`` over time, ``sqrt(share_i) * B_i . f_t / |B_i|``.
+    ``B`` comes from a principal-component analysis of the NORMAL SCORES of
+    past returns: each cross-section of the first horizon of ``history`` (or
+    of ``realized`` when no history is given) is replaced by the normal
+    scores of its ranks, each name is centred over time, and ``B`` is the
+    first ``n_factors`` right singular vectors scaled by their singular
+    values. Normal scores rather than returns because the forecast lives in
+    normal-score space, because they are already centred across names -- a
+    shift common to every name changes no ranking, so the market's level is
+    not a factor here -- and because one outlier or split cannot capture a
+    component. A name's factor share is proportional to its squared loading,
+    capped at one, and scaled so that the shares average ``factor_share``
+    over the names: a name that moves with the factors is wrong with them,
+    and one the factors barely touch keeps a mostly idiosyncratic error. Each
+    name's error therefore has unit variance, and two names' errors have
+    correlation ``sqrt(share_i * share_j)`` times the cosine of their
+    loadings. At every decision ``g_t`` is then centred across the names of
+    the cross-section and rescaled to their average share, so that the
+    factors carry exactly that share of the error's cross-sectional variance
+    at every decision (up to the sample variance of ``u``, which is the
+    copula's). Unscaled, that variance would swing with the size of
+    ``f_t``, and the IC, a concave function of it, would move off the
+    copula's. At ``factor_share=1`` every name with a loading has a share of
+    one, and a name without history has no loading and an idiosyncratic
+    error whatever the share. With no ``history`` the loadings are
+    in-sample, and the realized cross-sections correlate with loadings
+    estimated on themselves a little more than with out-of-sample ones, so
+    the IC's spread widens slightly even on pure noise.
+
+    **What factor errors do to the IC.** They widen its per-decision spread.
+    When the realized returns load on the same factors -- they do: on August
+    2020 the 5-minute cross-section correlates with the first three loading
+    vectors by 0.26, 0.17 and 0.13 in absolute value on average -- an error
+    that bets on a factor is right or wrong about many names at once. The
+    IC then moves with ``rho_t``, the cross-sectional correlation of the
+    error with the realized normal scores, whose variance is about
+    ``factor_share * E[r_t**2] + (1 - factor_share) / (n - 1)``, with
+    ``r_t`` the correlation of ``g_t`` with the realized cross-section, and
+    the IC's standard deviation is about ``sqrt(1 - c**2)`` times its root.
+    On August 2020 with three factors ``E[r_t**2]`` is 0.068 at
+    ``factor_share=0.3``, which predicts 0.146 and measures 0.151, against
+    the copula's 0.039; real forecasts show 0.12 (ridge, LASSO) to 0.15
+    (15-minute reversal) on the same month. The same nonlinearity that gives
+    the copula its ``O(1 / n)`` shortfall then lowers the mean: the expected
+    cross-sectional correlation is about ``c (1 - Var(rho_t))``, so the mean
+    IC falls short of the copula's by a relative amount of about
+    ``factor_share * (E[r_t**2] - 1 / (n - 1))``: 2% at
+    ``factor_share=0.3`` and 4% at 0.6 on August 2020, 2.5% and 2% measured
+    over four seeds, each within its 2% seed error. That is inside one
+    month's standard error of the mean IC, which the wider spread has
+    itself grown to about 0.0037. It is left in, not calibrated away: it is
+    a property of a forecast whose errors are bets, and every scored row
+    reports the IC it actually had. On realized returns with no factor
+    structure the factor errors barely change the IC's law: the spread is
+    the copula's, and the mean is within about a percent of the copula's at
+    ``factor_share=0.3`` and a few percent at ``factor_share=1``, where the
+    error is an ``n_factors``-dimensional pattern whose spread across names
+    is far from Gaussian. See ``docs/oracle_forecast_math.md`` (section 8).
+
+    **Time-varying IC.** With ``ic_dispersion > 0`` the target is no longer
+    ``ic`` at every decision but ``kappa_t = ic + ic_dispersion * a_t``, with
+    ``a_t`` a stationary standard-normal AR(1) of lag-one autocorrelation
+    ``ic_persistence`` (``None`` draws it afresh at every decision). The
+    expected per-decision IC is therefore itself an AR(1) with mean ``ic``,
+    standard deviation ``ic_dispersion`` and autocorrelation
+    ``ic_persistence ** j`` at lag ``j``; the IC a scorer measures adds the
+    sampling scatter (and the factor term above) to it, so its
+    autocovariance at lag ``j >= 1`` is ``ic_dispersion**2 *
+    ic_persistence**j`` and its variance ``ic_dispersion**2`` plus the
+    scatter. ``kappa_t`` goes into the copula's ``rho = 2 sin(pi kappa /
+    6)`` per decision, clipped to ``+-0.999``, which matters only when a
+    draw comes within reach of ``+-1``. ``ic_persistence=1`` freezes
+    ``a_t``: one IC per day when ``days`` is given, one for the whole panel
+    otherwise.
+
+    **Quality.** With ``quality="spread"`` or ``"vol"`` each name's IC is
+    ``kappa_t * q_it``, with ``q`` rising linearly in the name's rank by the
+    variable among the cross-section's ``m`` ranked names,
+    ``q = 1 + quality_strength * (2 (rank - 1/2) / m - 1)``. At the default
+    strength the narrowest-spread (or calmest) name carries almost no
+    information and the widest (or most volatile) about twice the average.
+    It is the name's IC that varies, not the size of its noise alone: every
+    score keeps unit variance, so the tails of the forecast are not filled
+    with the noisiest names, and a book that holds the tails finds the
+    accuracy where the quality variable says it is. The weights are then
+    rescaled at each decision so that the cross-section's rank IC stays
+    ``kappa_t``. To first order in ``rho`` the rank IC is proportional to
+    ``sum(rho_i z_i (Phi(z_i) - 1/2))``, so the rescaling keeps
+    ``sum(q_i z_i (Phi(z_i) - 1/2))`` equal to ``sum(z_i (Phi(z_i) - 1/2))``.
+    A plain mean of one is not enough when the variable tracks ``|z|``, as
+    volatility does -- volatile names are the ones that land in the tails
+    of a cross-section -- and with log-normal volatilities across names the
+    unrescaled weights raised the IC by about a quarter. Where the variable
+    is unrelated to ``|z|`` the rescaling is close to one, and the average
+    weight is one. ``"spread"`` reads each decision's half-spread from
+    ``market``, so the ranking moves with the quotes; names without a quote
+    get ``q = 1`` before the rescaling. ``"vol"`` ranks names by the
+    standard deviation of the same first-horizon returns the loadings come
+    from, once for the panel. On heteroskedastic returns even the copula
+    forecasts volatile names' RANKS better, since their realized ranks sit
+    in the tails where a given ``rho`` places them most reliably; ``"vol"``
+    adds to that.
+
+    **Persistence.** ``half_life`` makes ``u`` the copula's AR(1) by name,
+    and the factor shock ``f_t`` an AR(1) with the same half-life, so a
+    persistent forecast is persistently wrong about the same factor; the
+    normalized ``g_t`` follows ``f_t``'s direction, whose lag correlation is
+    a little below ``f_t``'s own (with one factor, ``(2 / pi) arcsin`` of
+    it). Given ``days``, the noise, the factor shock and the IC process all
+    restart from their stationary laws at each change of day label.
+
+    **Randomness.** Horizon ``h`` draws ``u`` from
+    ``np.random.default_rng([root, h])`` exactly as :func:`copula_forecast`
+    does, the factor shocks from ``default_rng([root, h, 1])`` and the IC
+    process from ``default_rng([root, h, 2])``, with ``root`` as there.
+    Errors and IC paths are therefore independent across horizons, a
+    horizon's forecast does not depend on how many horizons there are, and
+    with ``factor_share=0``, ``ic_dispersion=0`` and ``quality=None`` the
+    forecast is bitwise :func:`copula_forecast`'s, whatever ``n_factors`` or
+    ``ic_persistence`` say and whichever (aligned) ``history`` is given.
+
+    Args:
+        realized: Realized forward returns, the outcomes the forecast is
+            scored against.
+        ic: Target rank IC in ``(-1, 1)``, or a 1-D array of them with one
+            per horizon; the mean of the per-decision target.
+        history: Past returns on ``realized``'s assets, in their order, whose
+            first horizon gives the factor loadings and, for
+            ``quality="vol"``, the volatilities. ``None`` uses ``realized``.
+        n_factors: Number of principal components the errors load on.
+        factor_share: Share of the error variance carried by the factors,
+            averaged over the names, in ``[0, 1]``. ``0`` gives the copula's
+            independent errors.
+        ic_persistence: Lag-one autocorrelation of the IC process, in
+            ``[0, 1]``. ``None`` draws it independently at every decision.
+        ic_dispersion: Standard deviation of the per-decision target IC
+            around ``ic``; non-negative. ``0`` fixes it at ``ic``.
+        quality: ``None``, or what a name's accuracy rises with; one of
+            :data:`QUALITY_VARIABLES`.
+        quality_strength: How steeply accuracy rises with the quality rank,
+            in ``[0, 1]``: ``0`` is uniform, ``1`` runs from about zero to
+            about twice the average.
+        market: The observable market on ``realized``'s grid; needed for
+            ``quality="spread"`` (its half-spread, or the bid and ask it is
+            derived from), and otherwise unused.
+        half_life: Half-life of each name's noise and of the factor shocks,
+            in decisions; positive. ``None`` draws them afresh at every
+            decision.
+        days: Optional day label per decision, one per decision of
+            ``realized``. A change of label restarts the noise, the factor
+            shocks and the IC process.
+        scale: Shrinkage of the forecast towards the cross-sectional mean.
+            Defaults to ``abs(ic)`` per horizon, so an ``ic`` of ``0`` at
+            any horizon needs an explicit scale.
+        seed: Seed or generator for every draw.
+    """
+    values = realized.values
+    n_decisions, n_assets, n_horizons = values.shape
+    ics = _horizon_ics(ic, n_horizons)
+    if not np.all(np.abs(ics) < 1.0):
+        raise ValueError(
+            "ic must lie strictly inside (-1, 1): at |ic| = 1 the copula has no "
+            "noise; use oracle_forecast(noise='tails') for a perfect ranking"
+        )
+    scales = _horizon_scales(ics, scale)
+    if (isinstance(n_factors, bool) or not isinstance(n_factors, (int, np.integer))
+            or not 1 <= n_factors < n_assets):
+        raise ValueError(
+            f"n_factors must be a positive integer below the number of assets "
+            f"({n_assets}), got {n_factors!r}")
+    if not 0.0 <= factor_share <= 1.0:
+        raise ValueError(f"factor_share must lie in [0, 1], got {factor_share!r}")
+    if ic_persistence is not None and not 0.0 <= ic_persistence <= 1.0:
+        raise ValueError(f"ic_persistence must lie in [0, 1], got {ic_persistence!r}")
+    if not 0.0 <= ic_dispersion < np.inf:
+        raise ValueError(f"ic_dispersion must be non-negative and finite, got {ic_dispersion!r}")
+    if quality is not None and quality not in QUALITY_VARIABLES:
+        raise ValueError(f"quality must be None or one of {QUALITY_VARIABLES}, got {quality!r}")
+    if not 0.0 <= quality_strength <= 1.0:
+        raise ValueError(f"quality_strength must lie in [0, 1], got {quality_strength!r}")
+    if half_life is not None and (isinstance(half_life, bool) or not half_life > 0.0):
+        raise ValueError(f"half_life must be positive, got {half_life!r}")
+    days = _day_labels(days, n_decisions)
+    past = _first_horizon(history, realized)
+    spread = None
+    if quality == "spread":
+        if market is None:
+            raise ValueError(
+                "quality='spread' needs market, with the half-spread or the bid and "
+                "ask it is derived from")
+        require_market_aligned(market, realized)
+        market.require("half_spread", purpose="factor_forecast(quality='spread')")
+        spread = market.get("half_spread")
+    root = _root_seed(seed, np.random.default_rng(seed))
+
+    loadings = directions = shares = own_weight = None
+    if factor_share > 0.0:
+        loadings = _factor_loadings(past, int(n_factors))
+        shares = _factor_shares(loadings, factor_share)
+        size = np.linalg.norm(loadings, axis=1, keepdims=True)
+        directions = np.divide(np.sqrt(shares)[:, None] * loadings, size,
+                               out=np.zeros_like(loadings), where=size > 0)
+        own_weight = np.sqrt(1.0 - shares)
+    vol = _volatility(past) if quality == "vol" else None
+    phi = 0.0 if half_life is None else 0.5 ** (1.0 / float(half_life))
+    innovation = np.sqrt(1.0 - phi * phi)
+    ic_phi = 0.0 if ic_persistence is None else float(ic_persistence)
+    ic_innovation = np.sqrt(1.0 - ic_phi * ic_phi)
+    forecast = np.full(values.shape, np.nan)
+    for horizon in range(n_horizons):
+        # The copula's stream for the names' own noise, consumed exactly as
+        # copula_forecast consumes it; the factor shocks and the IC process
+        # have streams of their own, so switching either on leaves u alone.
+        draw = np.random.default_rng([root, horizon])
+        factor_draw = np.random.default_rng([root, horizon, 1])
+        ic_draw = np.random.default_rng([root, horizon, 2])
+        noise = draw.standard_normal(n_assets)
+        shocks = factor_draw.standard_normal(n_factors) if loadings is not None else None
+        level = float(ic_draw.standard_normal()) if ic_dispersion > 0.0 else 0.0
+        for decision in range(n_decisions):
+            fresh = draw.standard_normal(n_assets)
+            fresh_shocks = (factor_draw.standard_normal(n_factors)
+                            if loadings is not None else None)
+            fresh_level = float(ic_draw.standard_normal()) if ic_dispersion > 0.0 else 0.0
+            if decision > 0:
+                new_day = days is not None and days[decision] != days[decision - 1]
+                if new_day:
+                    noise, shocks, level = fresh, fresh_shocks, fresh_level
+                else:
+                    noise = phi * noise + innovation * fresh
+                    if shocks is not None:
+                        shocks = phi * shocks + innovation * fresh_shocks
+                    level = ic_phi * level + ic_innovation * fresh_level
+            outcome = values[decision, :, horizon]
+            names = np.flatnonzero(np.isfinite(outcome))
+            if len(names) < 2:
+                continue
+            finite = outcome[names]
+            if finite.min() == finite.max():
+                continue
+            error = noise[names]
+            if directions is not None:
+                # Each name's factor part has its share as variance over time;
+                # across the names of this cross-section it is centred and
+                # scaled to their average share, so that the share is exact
+                # at every decision rather than swinging with |f_t|.
+                common = directions[names] @ shocks
+                common = common - common.mean()
+                spread_of_common = common.std()
+                if spread_of_common > 0.0:
+                    error = (common * (np.sqrt(shares[names].mean()) / spread_of_common)
+                             + own_weight[names] * error)
+            z = _normal_scores(finite)
+            target = float(ics[horizon])
+            if ic_dispersion > 0.0:
+                target = float(np.clip(target + ic_dispersion * level, -_IC_CAP, _IC_CAP))
+            if quality is not None:
+                variable = (spread[decision, names] if spread is not None else vol[names])
+                weights = _quality_weights(variable, quality_strength)
+                # To first order in rho the rank IC is proportional to
+                # sum(rho_i z_i (Phi(z_i) - 1/2)): weights that track |z| --
+                # volatile names land in the tails -- would raise the IC along
+                # with the accuracy unless rescaled to keep that sum.
+                # z is Phi^-1(rank / (n + 1)), so Phi(z) is that quantile.
+                leverage = z * (_rankdata(finite) / (len(finite) + 1) - 0.5)
+                weights *= leverage.sum() / (weights @ leverage)
+                target = np.clip(target * weights, -_IC_CAP, _IC_CAP)
+            rho = 2.0 * np.sin(np.pi * target / 6.0)
+            score = rho * z + np.sqrt(1.0 - rho * rho) * error
+            reordered = np.empty(len(names))
+            reordered[np.argsort(score, kind="stable")] = np.sort(finite)
+            centre = finite.mean()
+            forecast[decision, names, horizon] = (
+                centre + float(scales[horizon]) * (reordered - centre)
+            )
+    return ForwardReturns(forecast, realized.decisions, realized.assets, realized.horizons)
+
+
+def _first_horizon(history: ForwardReturns | None, realized: ForwardReturns) -> NDArray:
+    """The returns loadings and volatilities come from: ``(observation, asset)``."""
+    source = realized if history is None else history
+    if not isinstance(source, ForwardReturns):
+        raise TypeError("history must be ForwardReturns on the realized returns' assets")
+    if not np.array_equal(source.assets, realized.assets):
+        raise ValueError("assets of the history and the realized returns are not aligned")
+    return source.values[:, :, 0]
+
+
+def _factor_loadings(returns: NDArray, n_factors: int) -> NDArray:
+    """Each name's loadings on the first principal components, mean square one.
+
+    The components are those of the normal scores of each cross-section,
+    centred by name over time; the loadings are the right singular vectors
+    scaled by their singular values, so a dominant component weighs more,
+    and then scaled together so that a name's squared loading averages one
+    over the names that have any. Each component's sign is fixed so that its
+    largest loading is positive: a singular vector's sign is arbitrary, and
+    the forecast for a given seed should not depend on which one the
+    linear-algebra library returns.
+    """
+    scores = np.zeros(returns.shape)
+    for row, outcome in enumerate(returns):
+        names = np.flatnonzero(np.isfinite(outcome))
+        if len(names) < 2 or outcome[names].min() == outcome[names].max():
+            continue
+        scores[row, names] = _normal_scores(outcome[names])
+    scores -= scores.mean(axis=0)
+    if min(scores.shape) <= n_factors or not np.any(scores):
+        raise ValueError(
+            f"the history has too few informative cross-sections for {n_factors} factors")
+    _, singular, components = np.linalg.svd(scores, full_matrices=False)
+    loadings = components[:n_factors].T * singular[:n_factors]
+    largest = np.argmax(np.abs(loadings), axis=0)
+    loadings *= np.sign(loadings[largest, np.arange(n_factors)])
+    size = (loadings**2).sum(axis=1)
+    return loadings / np.sqrt(size[size > 0].mean())
+
+
+def _factor_shares(loadings: NDArray, factor_share: float) -> NDArray:
+    """Each name's factor share: its squared loading scaled, capped at one.
+
+    The scale is the one that makes the shares average ``factor_share`` over
+    all names -- water-filling: the names whose scaled squared loading would
+    pass one are capped there, and the rest are scaled up to make up the
+    average. A share above what the names with any loading can carry gives
+    every such name a share of one.
+    """
+    size = (loadings**2).sum(axis=1)
+    target = factor_share * len(size)
+    if target >= np.count_nonzero(size):
+        return (size > 0).astype(np.float64)
+    descending = np.sort(size)[::-1]
+    # rest[c] is the total squared loading left when the c largest are capped.
+    rest = np.r_[np.cumsum(descending[::-1])[::-1], 0.0]
+    for capped in range(len(size)):
+        scale = (target - capped) / rest[capped]
+        if scale * descending[capped] <= 1.0:
+            return np.minimum(scale * size, 1.0)
+    return (size > 0).astype(np.float64)
+
+
+def _volatility(returns: NDArray) -> NDArray:
+    """Each name's standard deviation over time; NaN with fewer than two values."""
+    finite = np.isfinite(returns)
+    count = finite.sum(axis=0)
+    filled = np.where(finite, returns, 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = filled.sum(axis=0) / count
+        squares = (np.where(finite, returns - mean, 0.0) ** 2).sum(axis=0)
+        return np.where(count >= 2, np.sqrt(squares / (count - 1)), np.nan)
+
+
+def _quality_weights(variable: NDArray, strength: float) -> NDArray:
+    """Weights rising linearly in rank by ``variable``, averaging exactly one.
+
+    Names whose variable is missing get weight one, so the average over the
+    whole cross-section is one as well.
+    """
+    weights = np.ones(len(variable))
+    known = np.isfinite(variable)
+    m = int(known.sum())
+    if m >= 2:
+        ranks = _rankdata(variable[known])
+        weights[known] = 1.0 + strength * (2.0 * (ranks - 0.5) / m - 1.0)
+    return weights
 
 
 def _horizon_ics(ic: float | ArrayLike, n_horizons: int) -> NDArray:

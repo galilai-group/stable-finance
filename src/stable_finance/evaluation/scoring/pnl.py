@@ -126,6 +126,7 @@ def evaluate_fills(
     initial: ArrayLike | None = None,
     periods_per_year: float = 252.0,
     drift: bool = False,
+    fees: ArrayLike | None = None,
 ) -> tuple[BacktestResult, ...]:
     """Mark the realized position path at mid and charge each fill's cost.
 
@@ -136,6 +137,12 @@ def evaluate_fills(
     mid-to-mid forward return. Execution cost is the filled quantity times the
     fill price's distance from mid, so buys above mid and sells below mid both
     cost money. One result is returned per horizon.
+
+    ``fees`` is what each fill paid on top, as a fraction of equity, on the
+    fills' grid (it broadcasts to ``fills.quantity``) -- typically
+    :func:`~stable_finance.evaluation.execution.fee_cost` of the fills'
+    quantity -- and is added to the cost. Fees are kept out of the fill price,
+    so they are passed here rather than read from the fills.
     """
     require_aligned(fills, realized_mid_returns)
     positions = positions_from_fills(
@@ -145,6 +152,14 @@ def evaluate_fills(
         traded, (fills.price - fills.mid_price) / fills.mid_price, 0.0
     )
     per_asset_cost = fills.quantity * slippage
+    if fees is not None:
+        try:
+            paid = np.broadcast_to(np.asarray(fees, dtype=np.float64), per_asset_cost.shape)
+        except ValueError:
+            raise ValueError(f"fees must broadcast to {per_asset_cost.shape}") from None
+        if not np.isfinite(paid).all() or (paid < 0).any():
+            raise ValueError("fees must be finite and non-negative")
+        per_asset_cost = per_asset_cost + paid
     results = []
     for horizon in range(len(fills.horizons)):
         position = positions[:, :, horizon]
