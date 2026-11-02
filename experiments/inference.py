@@ -14,7 +14,10 @@ decisions' P&L correlated. Three corrections are reported side by side:
   independent across days), with its own Sharpe ratio;
 * Lo's (2002) autocorrelation-adjusted annualization of the per-period
   Sharpe, ``SR * q / sqrt(q + 2 sum_k (q - k) rho_k)`` with ``q`` periods a
-  year and the autocorrelations ``rho_k`` estimated up to ``lags``;
+  year and the autocorrelations ``rho_k`` estimated up to ``lags``. The
+  ratio to the naive Sharpe depends on that count, so it is also reported
+  at lags spanning one horizon, two horizons and one session
+  (``*_hold``, ``*_hold2``, ``*_day``; ``lo`` in the JSON, with a note);
 * a Newey-West (Bartlett-kernel) standard error of the Sharpe ratio by the
   delta method on the first two moments (Lo 2002's GMM form), with
   ``lags = max(floor(4 (T/100)^(2/9)), h / spacing)`` for a book booked every
@@ -23,12 +26,21 @@ decisions' P&L correlated. Three corrections are reported side by side:
 
 THE SECOND IS READING THE BEST OF A GRID AS AN ESTIMATE. Within each group of
 configurations that saw the same forecast -- by default every
-(forecast, horizon, EFQ) cell, so the configurations differ only in how the
-book is built -- the daily net P&L is tested jointly:
+(forecast, horizon, EFQ) cell, split further by any setting that changes
+what a book is scored on (returns label, latency, cost model, book size,
+fees) when the run varies it, so the configurations differ only in how the
+book is built; ``--group``/``--group-add`` or the spec's ``"inference"``
+entry change it -- the daily net P&L is tested jointly:
 
 * the Hansen-Lunde-Nason (2011) Model Confidence Set at 90%: the
-  configurations statistically indistinguishable from the best, on the mean
-  daily loss (minus the net P&L);
+  configurations statistically indistinguishable from the best, twice, each
+  summary naming its loss: ``mcs_pnl`` on minus the day's net P&L (the
+  mean daily P&L, which the book running the most risk wins) and
+  ``mcs_sharpe`` on that loss over the configuration's full-sample standard
+  deviation (minus its daily Sharpe). Configurations with identical daily
+  P&L -- a setting that changed nothing -- are one model: each row names
+  the one it copies in ``duplicate_of``, and ``distinct_models``,
+  ``included_distinct`` and every share count distinct configurations;
 * Hansen's (2005) SPA test of whether ANY configuration beats a benchmark
   (default: rank weights on the whole cross-section), and Romano-Wolf (2005)
   StepM listing which do, with the family-wise error held at 5%;
@@ -39,9 +51,16 @@ book is built -- the daily net P&L is tested jointly:
   of trials set to the EFFECTIVE number of independent configurations, the
   participation ratio ``(sum lambda)^2 / sum lambda^2`` of the eigenvalues of
   the configurations' return correlation matrix: twenty configurations that
-  hold nearly the same book are closer to one trial than to twenty;
+  hold nearly the same book are closer to one trial than to twenty. The
+  variance of a skill-less trial's Sharpe comes from the null -- each
+  configuration's daily P&L demeaned and resampled by the stationary
+  bootstrap -- not from the spread of the configurations' own Sharpe
+  ratios, which their different costs dominate. The hurdle and the Sharpe
+  it is compared with are per day (``*_per_day``); ``best_sharpe_daily``
+  and ``*_annual`` are the same annualized by ``sqrt(252)``;
 * the probability of backtest overfitting by combinatorially symmetric
-  cross-validation over blocks of days.
+  cross-validation over blocks of days. It and the deflated Sharpe's trials
+  count distinct configurations only, as the confidence sets do.
 
 MCS, SPA and StepM come from ``arch``, with its stationary bootstrap. Its
 SPA (and StepM, which runs it) does not divide the statistic by the loss
@@ -63,7 +82,9 @@ months (``walkforward.py``) is what tightens it.
 
 Also reported, from the same series: the seed-to-seed spread of a forecast
 run under several seeds beside the time-sampling standard error, the
-rejection rate of zero-IC placebo rows at the 5% level (the tests' size), a
+rejection rate of zero-IC placebo rows at the 5% level (the tests' size;
+``--size-check`` adds the SPA, StepM, MCS and DSR, run on the placebo's
+gross P&L, with intervals that respect its seeds), a
 bootstrap interval for each break-even EFQ (a ratio of mean gross P&L to
 mean cost, resampled on days), and each row's mean P&L by half hour of the
 session, since five-minute P&L is far from stationary within the day.
@@ -104,6 +125,7 @@ import math
 import sys
 import warnings
 from pathlib import Path
+from statistics import NormalDist
 
 import numpy as np
 
@@ -130,6 +152,45 @@ TOD_BUCKET = 1800
 DAYS_A_YEAR = 252.0
 #: The most CSCV blocks the overfitting probability uses.
 PBO_MAX_BLOCKS = 16
+#: The losses a group's Model Confidence Sets rank configurations by, as each
+#: summary names them (``{pnl}`` is the series tested, net or mid).
+MCS_LOSSES = {
+    "pnl": "minus the day's {pnl} P&L: ranks by mean daily {pnl} P&L",
+    "sharpe": ("minus the day's {pnl} P&L over the configuration's full-sample sd: "
+               "ranks by daily {pnl} Sharpe"),
+}
+#: Relative gap below which two columns of a loss are one series to the
+#: confidence set (:func:`tied_columns`): rounding is about 1e-16, while two
+#: books that differ at all differ far above this.
+TIE_RTOL = 1e-9
+
+#: Row columns that set what a book is scored on -- the data (the returns
+#: label, the latency) or the cost it pays (cost model, book size, impact
+#: schedule, fees) -- rather than how it is built. Like the EFQ, a confidence
+#: set must not rank one value of them against another (the same book is
+#: always cheaper without fees or at a smaller size), so the default grouping
+#: adds each of them that varies within the run.
+SCORING_COLUMNS = ("returns", "latency", "cost_model", "equity", "execution_days", "fee_bps",
+                   "fee_per_share", "sec_fee_rate")
+#: Lag counts the Lo-adjusted Sharpe is also reported at, beside the default
+#: (``row_lags``), each in the row's periods (:func:`lo_lags`).
+LO_LAGS = {
+    "hold": "the periods one horizon spans: its overlap, ceil(h / spacing), for a book booked "
+            "every decision; one for a held book or a daily series",
+    "hold2": "twice the hold choice",
+    "day": "the periods in one session, periods_per_year / 252",
+}
+#: Why the Lo ratio is reported at several lag counts.
+LO_NOTE = ("Lo's adjustment sums the autocorrelations up to the lag count and treats the "
+           "rest as zero, so its ratio depends on that count. One horizon (hold) covers "
+           "only the overlap an every-decision book has by construction; persistent "
+           "forecast errors and the intraday volatility pattern correlate P&L across many "
+           "holds, which the hold choice and a held book's default (4-6 periods) leave out, "
+           "so they under-correct. One session (day) reaches them but estimates many noisy "
+           "autocorrelations from about twenty days, and on heteroskedastic intraday P&L "
+           "their sum can come out negative, a ratio above one. Read the ratio as a range "
+           "across lag counts; the daily Sharpe (sharpe_daily_*) needs no lag choice and "
+           "is the primary unit.")
 
 CONFIG_FIELDS = tuple(f.name for f in dataclasses.fields(sf.BacktestConfig))
 PNL = ("mid", "net")  # the series' first two rows: gross (marked at the mid) and net
@@ -415,6 +476,23 @@ def series_statistics(x: np.ndarray, *, q: float, lags: int) -> dict:
                 "sharpe_t_iid": sr0 / iid if iid > 0 else np.nan}
 
 
+def lo_at_lags(x: np.ndarray, *, q: float, lags: dict[str, int]) -> dict:
+    """The Lo-adjusted annual Sharpe and its ratio to the naive one at several lag counts.
+
+    ``lags`` maps a name to a lag count; the keys returned are
+    ``sharpe_lo_<name>`` and ``lo_ratio_<name>``, computed as
+    :func:`series_statistics` computes ``sharpe_lo`` and ``lo_ratio``.
+    """
+    x = x[np.isfinite(x)]
+    sr = _sharpe(x)
+    out = {}
+    for name, n_lags in lags.items():
+        scale = lo_scale(autocorrelations(x, n_lags), q) if np.isfinite(sr) else np.nan
+        out[f"sharpe_lo_{name}"] = sr * scale
+        out[f"lo_ratio_{name}"] = scale / math.sqrt(q)
+    return out
+
+
 def daily_statistics(x: np.ndarray) -> dict:
     """Annual Sharpe of daily P&L, its HAC standard error and probabilistic Sharpe."""
     x = x[np.isfinite(x)]
@@ -441,6 +519,24 @@ def row_lags(row, n_periods: int, spacing: float | None, fixed: int | None) -> i
     if (spacing and row["rebalance"] != "horizon" and row["annualization"] != "daily"):
         lags = max(lags, math.ceil(float(row["eval_horizon"]) / spacing))
     return min(lags, max(n_periods - 2, 0))
+
+
+def lo_lags(row, n_periods: int, spacing: float | None) -> dict[str, int]:
+    """The lag counts of :data:`LO_LAGS` for a row, in its own periods.
+
+    ``hold`` spans one horizon: ``ceil(h / spacing)`` periods for a book
+    booked every decision (the overlap :func:`row_lags` also covers), one
+    for a held book, whose next period starts as the hold ends, or a daily
+    series; one when the spacing is unknown. ``hold2`` is twice that, and
+    ``day`` is the periods in a session, ``periods_per_year / 252``. Each is
+    capped at ``n_periods - 2``, as the default is.
+    """
+    hold = 1
+    if spacing and row["rebalance"] != "horizon" and row["annualization"] != "daily":
+        hold = max(math.ceil(float(row["eval_horizon"]) / spacing), 1)
+    day = max(round(float(row["periods_per_year"]) / DAYS_A_YEAR), 1)
+    cap = max(n_periods - 2, 0)
+    return {"hold": min(hold, cap), "hold2": min(2 * hold, cap), "day": min(day, cap)}
 
 
 # ── bootstrap helpers ───────────────────────────────────────────────────────
@@ -613,6 +709,148 @@ def decision_grid(labels: dict) -> tuple[dict, float | None]:
     return grid, decision_spacing(np.asarray(union), days)
 
 
+def distinct_columns(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The distinct columns of a matrix: ``(first, representative)``.
+
+    ``first`` holds the index of each distinct column's first occurrence, in
+    ``np.unique``'s (sorted) order; ``representative[j]`` is the first column
+    equal to column ``j`` in every entry, ``j`` itself when it is the first.
+    Configurations with the same P&L -- a setting that changed nothing -- are
+    one model to the joint tests and are counted once.
+    """
+    _, first, inverse = np.unique(matrix, axis=1, return_index=True, return_inverse=True)
+    return first, first[np.ravel(inverse)]
+
+
+def tied_columns(matrix: np.ndarray, rtol: float = TIE_RTOL) -> np.ndarray:
+    """``tied[j]``: the first column equal to column ``j`` up to rounding, else ``j``.
+
+    Two columns are tied when no entry differs by more than ``rtol`` times
+    the larger of their largest magnitudes. A loss built from distinct P&L
+    can still repeat a series up to its last bits -- ``x`` and ``3 x`` once
+    each is divided by its own standard deviation -- which exact equality
+    would hold apart (only a power-of-two multiple rounds identically).
+    """
+    n = matrix.shape[1]
+    tied = np.arange(n)
+    scale = np.abs(matrix).max(axis=0)
+    for j in range(1, n):
+        owners = np.flatnonzero(tied[:j] == np.arange(j))
+        gap = np.abs(matrix[:, owners] - matrix[:, [j]]).max(axis=0)
+        close = np.flatnonzero(gap <= rtol * np.maximum(scale[owners], scale[j]))
+        if len(close):
+            tied[j] = owners[close[0]]
+    return tied
+
+
+def scaled_losses(pnl: np.ndarray) -> np.ndarray:
+    """Minus each column of daily P&L over that column's full-sample standard deviation.
+
+    The mean of the scaled loss is minus the column's per-day Sharpe ratio,
+    so a confidence set on it ranks configurations by Sharpe rather than by
+    mean P&L, which the book running the most risk wins. The scale is
+    estimated once on the full sample and held fixed in the bootstrap, as
+    the SPA's studentization is, so the set ignores its sampling error. A
+    flat column (no P&L at all) has no Sharpe and scores zero loss.
+    """
+    sd = pnl.std(axis=0, ddof=1)
+    return np.where(sd > 0, -pnl / np.where(sd > 0, sd, 1.0), 0.0)
+
+
+def confidence_set(losses, block: int, reps: int, seed: int) -> tuple:
+    """Model Confidence Set p-values of the columns of ``losses`` (a frame), or None.
+
+    arch's ``R`` statistic up to :data:`MCS_R_LIMIT` columns and ``max``
+    beyond; a group the statistic cannot handle falls back to ``max``.
+    Returns ``(p-values by column name or None, method, errors)``.
+    """
+    from arch.bootstrap import MCS
+
+    method = "R" if losses.shape[1] <= MCS_R_LIMIT else "max"
+    errors = []
+    for attempt in dict.fromkeys((method, "max")):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                mcs = MCS(losses, size=MCS_SIZE, reps=reps, block_size=block, method=attempt,
+                          bootstrap="stationary", seed=seed)
+                mcs.compute()
+            return mcs.pvalues["Pvalue"], attempt, errors
+        except (IndexError, ValueError, np.linalg.LinAlgError) as error:
+            errors.append(f"{attempt}: {error}")
+    return None, method, errors
+
+
+def mcs_by_loss(loss: np.ndarray, ids: list[str], first: np.ndarray, representative: np.ndarray,
+                *, block: int, reps: int, seed: int) -> tuple[dict, dict]:
+    """One confidence set over a group's distinct configurations, on one loss.
+
+    ``loss`` is ``(days, configurations)``; ``first`` and ``representative``
+    come from :func:`distinct_columns` on the group's P&L. The set is run on
+    the representatives alone. Two that the loss itself cannot tell apart (a
+    vol-scaled loss equates P&L series that are multiples of each other, up
+    to rounding: :func:`tied_columns`) are tested once and share a p-value;
+    fed both, the set would divide rounding noise by rounding noise and could
+    keep one and drop the other. A duplicate mirrors its
+    representative's p-value and membership, but every count and share in
+    the summary is over distinct configurations. Returns the summary and
+    ``{row id: (p-value, in the set)}``; no rows when the statistic failed.
+    """
+    import pandas as pd
+
+    owner = first[tied_columns(loss[:, first])]
+    models = list(dict.fromkeys(owner.tolist()))
+    summary = {"size": MCS_SIZE, "n_configs": len(ids), "distinct_models": len(first)}
+    if len(models) < 2:
+        pvalues = {m: 1.0 for m in models}
+        summary["skipped"] = ("every configuration has the same P&L" if len(first) < 2
+                              else "the loss cannot tell the configurations apart")
+    else:
+        frame = pd.DataFrame(loss[:, models], columns=[ids[m] for m in models])
+        found, summary["method"], errors = confidence_set(frame, block, reps, seed)
+        if errors:
+            summary["errors"] = errors
+        if found is None:
+            summary["skipped"] = "the MCS statistic failed on this group"
+            return summary, {}
+        pvalues = {m: float(found.loc[ids[m]]) for m in models}
+        if len(models) < len(first):
+            summary["tied_by_loss"] = len(first) - len(models)
+    by_distinct = {int(f): pvalues[int(o)] for f, o in zip(first, owner)}
+    included = [ids[f] for f in sorted(by_distinct) if by_distinct[f] > MCS_SIZE]
+    summary.update(included=included, included_distinct=len(included),
+                   share_distinct=len(included) / len(first))
+    rows = {}
+    for j, r in enumerate(ids):
+        value = by_distinct[int(representative[j])]
+        rows[r] = (value, value > MCS_SIZE)
+    return summary, rows
+
+
+def null_sharpe_variance(matrix: np.ndarray, index: np.ndarray, chunk: int = 64) -> np.ndarray:
+    """Each column's sampling variance of the per-day Sharpe under a zero mean.
+
+    The deflated Sharpe's hurdle is the best Sharpe a sweep of SKILL-LESS
+    trials would show, so the variance it needs is that of a trial whose true
+    Sharpe is zero. Each column is demeaned -- its true Sharpe set to zero,
+    its volatility, fat tails and serial correlation kept -- and resampled on
+    ``index`` (``(reps, days)``, the group's stationary-bootstrap draws, the
+    same days for every column); the variance of the resampled per-day
+    Sharpe ratios is the column's null variance, about ``1 / days`` for iid
+    P&L. NaN for a flat column. Taken ``chunk`` columns at a time.
+    """
+    demeaned = matrix - matrix.mean(axis=0)
+    out = np.full(matrix.shape[1], np.nan)
+    for start in range(0, matrix.shape[1], chunk):
+        x = demeaned[:, start:start + chunk][index]  # (reps, days, columns)
+        with np.errstate(invalid="ignore", divide="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            sharpe = x.mean(axis=1) / x.std(axis=1, ddof=1)
+            sharpe[~np.isfinite(sharpe)] = np.nan
+            out[start:start + chunk] = np.nanvar(sharpe, axis=0, ddof=1)
+    return out
+
+
 def studentized_differences(benchmark: np.ndarray, models: np.ndarray,
                             block: int) -> np.ndarray:
     """``(L_benchmark - L_model) / omega``, the loss differentials Hansen's SPA tests.
@@ -717,12 +955,13 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
     judged on the same days.
     """
     import pandas as pd
-    from arch.bootstrap import MCS, SPA, StepM
+    from arch.bootstrap import SPA, StepM
 
     ids = [r for r in group["row_id"] if r in daily]
     summary: dict = {"n_configs": len(ids)}
     per_row: dict = {r: {} for r in ids}
     if len(ids) < 2:
+        summary["distinct_models"] = len(ids)
         summary["skipped"] = "fewer than two configurations with daily P&L"
         return summary, per_row
     full = np.stack([daily[r][which] for r in ids], axis=1)
@@ -730,6 +969,16 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
     pnl = full[common]
     n = len(pnl)
     summary["n_days"] = int(n)
+    # Configurations with the same daily P&L (a setting that changed nothing)
+    # are one model: the MCS's pairwise statistic divides by their
+    # zero-variance difference, and counting each copy would inflate every
+    # count. The first configuration with that P&L represents it; a
+    # duplicate names it in duplicate_of and mirrors its results.
+    first, representative = distinct_columns(pnl)
+    live = np.sort(first)
+    summary["distinct_models"] = len(first)
+    for j, r in enumerate(ids):
+        per_row[r]["duplicate_of"] = None if representative[j] == j else ids[representative[j]]
     if n < 4:
         summary["skipped"] = f"only {n} common days"
         return summary, per_row
@@ -737,42 +986,16 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
     summary["block"] = {"stationary": block_sb, "circular": block_cb, **block_info}
     losses = pd.DataFrame(-pnl, columns=ids)
 
-    # Model Confidence Set: the configurations indistinguishable from the best.
-    # Configurations with the same daily P&L (a setting that changed nothing)
-    # are one model to it, since its pairwise statistic divides by their
-    # zero-variance difference; each duplicate takes its representative's
-    # p-value. A group the statistic still cannot handle falls back to the
-    # max statistic, and failing that is reported as skipped.
-    _, first, inverse = np.unique(pnl, axis=1, return_index=True, return_inverse=True)
-    distinct = [ids[i] for i in first]
-    method = "R" if len(distinct) <= MCS_R_LIMIT else "max"
-    pvalues = None
-    if len(distinct) >= 2:
-        for attempt in dict.fromkeys((method, "max")):
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)
-                    mcs = MCS(losses[distinct], size=MCS_SIZE, reps=reps, block_size=block_sb,
-                              method=attempt, bootstrap="stationary", seed=seed)
-                    mcs.compute()
-                pvalues, method = mcs.pvalues["Pvalue"], attempt
-                break
-            except (IndexError, ValueError, np.linalg.LinAlgError) as error:
-                summary.setdefault("mcs_errors", []).append(f"{attempt}: {error}")
-    if len(distinct) < 2:
-        summary["mcs"] = {"size": MCS_SIZE, "skipped": "every configuration has the same P&L",
-                          "included": list(ids)}
-        for r in ids:
-            per_row[r]["mcs_pvalue"], per_row[r]["in_mcs"] = 1.0, True
-    elif pvalues is None:
-        summary["mcs"] = {"size": MCS_SIZE, "skipped": "the MCS statistic failed on this group"}
-    else:
-        for j, r in enumerate(ids):
-            value = float(pvalues.loc[distinct[int(np.ravel(inverse)[j])]])
-            per_row[r]["mcs_pvalue"] = value
-            per_row[r]["in_mcs"] = bool(value > MCS_SIZE)
-        summary["mcs"] = {"size": MCS_SIZE, "method": method, "distinct_models": len(distinct),
-                          "included": [r for r in ids if per_row[r]["in_mcs"]]}
+    # Model Confidence Sets: the configurations indistinguishable from the
+    # best, by mean P&L and by Sharpe (a vol-scaled loss), each over the
+    # distinct configurations.
+    pnl_name = PNL[which]
+    for kind, loss in (("pnl", -pnl), ("sharpe", scaled_losses(pnl))):
+        result, rows = mcs_by_loss(loss, ids, first, representative, block=block_sb, reps=reps,
+                                   seed=seed)
+        summary[f"mcs_{kind}"] = {"loss": MCS_LOSSES[kind].format(pnl=pnl_name), **result}
+        for r, (value, inside) in rows.items():
+            per_row[r][f"mcs_pvalue_{kind}"], per_row[r][f"in_mcs_{kind}"] = value, bool(inside)
 
     # SPA / StepM / Sharpe differences against the benchmark.
     hits = np.flatnonzero(match_rows(group.set_index("row_id").loc[ids].reset_index(), benchmark))
@@ -800,7 +1023,9 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
         for r in others:
             per_row[r]["stepm_superior"] = r in superior
         summary["spa"] = {key: float(v) for key, v in spa.pvalues.items()}
-        summary["stepm"] = {"size": TEST_SIZE, "superior": sorted(superior)}
+        summary["stepm"] = {"size": TEST_SIZE, "superior": sorted(superior),
+                            "superior_distinct": len({int(representative[ids.index(r)])
+                                                      for r in superior})}
         scale = math.sqrt(DAYS_A_YEAR)
         tests = sharpe_difference_bootstrap(pnl, bench, block=block_cb, reps=reps, seed=seed)
         for r, test in zip(ids, tests):
@@ -812,18 +1037,27 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
                     "sharpe_diff_low": test["low"] * scale,
                     "sharpe_diff_high": test["high"] * scale})
 
-    # Deflated Sharpe with the effective number of trials.
+    # Deflated Sharpe over the distinct configurations, with the effective
+    # number of trials and the variance of a skill-less trial's Sharpe taken
+    # from the null (null_sharpe_variance). The spread of the configurations'
+    # own Sharpes, the variance used before, measures how differently they
+    # pay costs, not how far noise moves a Sharpe; it is kept for comparison,
+    # as is 1 / (days - 1), the null variance of iid normal P&L.
+    scale = math.sqrt(DAYS_A_YEAR)
     sharpes = np.array([_sharpe(pnl[:, j]) for j in range(pnl.shape[1])])
-    finite = sharpes[np.isfinite(sharpes)]
-    variance = float(finite.var(ddof=1)) if len(finite) >= 2 else 0.0
-    n_eff_day, top_day = effective_trials(pnl)
+    finite = sharpes[live][np.isfinite(sharpes[live])]
+    cross = float(finite.var(ddof=1)) if len(finite) >= 2 else 0.0
+    index = stationary_indices(n, block_sb, reps, seed)
+    null = null_sharpe_variance(pnl[:, live], index)
+    variance = float(np.mean(null[np.isfinite(null)])) if np.isfinite(null).any() else 0.0
+    n_eff_day, top_day = effective_trials(pnl[:, live])
     n_eff_block = top_block = None
     if block_data is not None:
-        n_eff_block, top_block = effective_trials(block_data)
+        n_eff_block, top_block = effective_trials(block_data[:, live])
     n_eff = n_eff_block if n_eff_block is not None else n_eff_day
     trials = max(1, round(n_eff))
     hurdle = sf.expected_max_sharpe(trials, variance)
-    hurdle_all = sf.expected_max_sharpe(len(ids), variance)
+    hurdle_all = sf.expected_max_sharpe(len(live), variance)
     for j, r in enumerate(ids):
         per_row[r]["dsr_daily"] = sf.probabilistic_sharpe(pnl[:, j], benchmark=hurdle)
         per_row[r]["dsr_daily_all_trials"] = sf.probabilistic_sharpe(pnl[:, j],
@@ -833,17 +1067,29 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
         "n_eff_day": n_eff_day, "top_eigen_share_day": top_day,
         "n_eff_block": n_eff_block, "top_eigen_share_block": top_block,
         "n_block_periods": None if block_data is None else int(block_data.shape[0]),
-        "n_eff_used": n_eff, "n_trials": trials, "sharpe_var_daily": variance,
-        "hurdle_daily": hurdle, "hurdle_annual": hurdle * math.sqrt(DAYS_A_YEAR),
-        "best_row_id": ids[best], "best_sharpe_daily": sharpes[best] * math.sqrt(DAYS_A_YEAR),
+        "n_eff_used": n_eff, "n_trials": trials, "n_trials_all": len(live),
+        "sharpe_var_per_day": variance,
+        "sharpe_var_source": ("null: each distinct configuration's daily P&L demeaned and "
+                              "resampled by the group's stationary bootstrap, the mean of "
+                              "their Sharpe variances"),
+        "sharpe_var_cross_per_day": cross, "sharpe_var_iid_per_day": 1.0 / (n - 1),
+        "hurdle_per_day": hurdle, "hurdle_annual": hurdle * scale,
+        "hurdle_cross_annual": sf.expected_max_sharpe(trials, cross) * scale,
+        "best_row_id": ids[best], "best_sharpe_per_day": sharpes[best],
+        "best_sharpe_daily": sharpes[best] * scale,
         "best_dsr": per_row[ids[best]]["dsr_daily"],
-        "best_dsr_all_trials": per_row[ids[best]]["dsr_daily_all_trials"]}
+        "best_dsr_all_trials": per_row[ids[best]]["dsr_daily_all_trials"],
+        "units": ("*_per_day: Sharpe of daily P&L, not annualized (the DSR compares "
+                  "best_sharpe_per_day with hurdle_per_day); best_sharpe_daily and *_annual: "
+                  f"the same Sharpe times sqrt({DAYS_A_YEAR:g}); sharpe_var_*: variances of "
+                  "that per-day Sharpe, in its units squared (not annualized)")}
 
-    # Probability of backtest overfitting over blocks of days.
+    # Probability of backtest overfitting over blocks of days, distinct
+    # configurations only: a copy would take a rank of its own.
     blocks = pbo_blocks(n, pbo_n)
     if blocks >= 2:
         try:
-            result = sf.pbo(pnl, n_blocks=blocks)
+            result = sf.pbo(pnl[:, live], n_blocks=blocks)
             summary["pbo"] = {"probability": result.probability,
                               "probability_of_loss": result.probability_of_loss,
                               "n_blocks": blocks, "block_days": result.block_length,
@@ -884,26 +1130,191 @@ def seed_dispersion(table) -> list[dict]:
     return out
 
 
+def wilson_interval(hits: float, n: float) -> tuple[float, float]:
+    """Wilson's 95% interval for a proportion ``hits / n``; NaN for no trials.
+
+    ``n`` may be an effective, fractional number of trials. The interval
+    reaches exactly 0 with no hits and 1 with all, where the arithmetic
+    would leave a rounding error.
+    """
+    if n == 0:
+        return np.nan, np.nan
+    z = NormalDist().inv_cdf(1.0 - TEST_SIZE / 2)
+    p = hits / n
+    centre = (p + z ** 2 / (2 * n)) / (1 + z ** 2 / n)
+    half = z * math.sqrt(p * (1 - p) / n + z ** 2 / (4 * n ** 2)) / (1 + z ** 2 / n)
+    return (0.0 if hits == 0 else max(centre - half, 0.0),
+            1.0 if hits == n else min(centre + half, 1.0))
+
+
+def lowest_efq(rows):
+    """The rows at the lowest EFQ in the frame, and that EFQ (None without the column).
+
+    The EFQ changes only the cost, so the same book at another EFQ repeats
+    its gross P&L -- exactly when held, nearly when booked every decision,
+    whose gross moves slightly with the EFQ -- and is no new trial of a test
+    on gross P&L.
+    """
+    if "efq" not in rows or rows.empty:
+        return rows, None
+    efq = float(rows["efq"].min())
+    return rows[rows["efq"] == efq], efq
+
+
+def clustered_rate(hits, clusters) -> tuple[float, float, float]:
+    """A rejection rate over trials that come in correlated clusters, with a 95% interval.
+
+    The rate is the share of ``hits``. The interval is Wilson's at the
+    effective number of trials: ``N`` over the design effect, the ratio of
+    the rate's cluster-robust variance ``G / (G - 1) sum_g (h_g - p n_g)^2 /
+    N^2`` (``h_g`` hits in the ``n_g`` trials of each of ``G`` clusters) to
+    the binomial ``p (1 - p) / N``, never above ``N``. Trials that share a
+    forecast thus count as fewer independent ones when their rejections come
+    together. With no rejection, or all, the design effect is undefined and
+    each cluster counts as one trial. ``(rate, low, high)``; the interval is
+    NaN with fewer than two clusters, everything without trials.
+    """
+    hits = np.asarray(hits, dtype=bool)
+    if not len(hits):
+        return np.nan, np.nan, np.nan
+    _, index = np.unique(np.asarray(clusters).astype(str), return_inverse=True)
+    h, n = np.bincount(index, weights=hits), np.bincount(index)
+    total, rate, groups = len(hits), float(hits.mean()), len(n)
+    if groups < 2:
+        return rate, np.nan, np.nan
+    effective = float(groups)
+    if 0.0 < rate < 1.0:
+        variance = groups / (groups - 1) * float(np.sum((h - rate * n) ** 2)) / total ** 2
+        binomial = rate * (1.0 - rate) / total
+        effective = total if variance <= binomial else total * binomial / variance
+    low, high = wilson_interval(rate * effective, effective)
+    return rate, low, high
+
+
 def size_check(table) -> dict:
     """How often zero-IC placebo rows reject a zero gross Sharpe at the 5% level.
 
     The gross (mid) P&L of an IC-0 forecast has mean zero, so a test of the
     right size rejects about 5% of the time; the iid test, which ignores the
     serial correlation, shows how far that assumption over-rejects. Net P&L
-    is left out: it carries the cost, so its mean is not zero.
+    is left out: it carries the cost, so its mean is not zero. Only rows at
+    the lowest EFQ count (:func:`lowest_efq`), and the rows of one group
+    share a forecast, so each rate's 95% interval (``interval_<column>``) is
+    clustered by group (:func:`clustered_rate`). :func:`placebo_size`
+    (``--size-check``) adds the joint tests.
     """
     if "f_ic" not in table:
         return {}
-    placebo = table[table["f_ic"].astype(float) == 0.0]
+    placebo, efq = lowest_efq(table[table["f_ic"].astype(float) == 0.0])
     if placebo.empty:
         return {}
-    critical = 1.959963984540054
-    out = {"n_rows": len(placebo), "level": TEST_SIZE}
+    critical = NormalDist().inv_cdf(1.0 - TEST_SIZE / 2)
+    clusters = (placebo["group"] if "group" in placebo else placebo["row_id"]).astype(str)
+    out = {"n_rows": len(placebo), "efq": efq, "level": TEST_SIZE,
+           "n_clusters": int(clusters.nunique())}
     for column in ("sharpe_t_hac_mid", "sharpe_t_iid_mid", "sharpe_daily_t_hac_mid"):
         values = placebo[column].to_numpy(dtype=float)
-        values = values[np.isfinite(values)]
-        out[f"reject_{column}"] = float(np.mean(np.abs(values) > critical)) if len(values) else None
+        keep = np.isfinite(values)
+        rate, low, high = clustered_rate(np.abs(values[keep]) > critical,
+                                         clusters.to_numpy()[keep])
+        out[f"reject_{column}"] = rate if keep.any() else None
+        out[f"interval_{column}"] = [low, high]
     return out
+
+
+def _rate(hits: list[bool], level: float | None, unit: str) -> dict:
+    """A rejection rate over independent trials, with Wilson's interval."""
+    low, high = wilson_interval(int(np.sum(hits)), len(hits))
+    return {"level": level, "unit": unit, "n": len(hits),
+            "rate": float(np.mean(hits)) if hits else None, "low": low, "high": high}
+
+
+def placebo_size(rows, daily: dict, *, group_by: list[str], benchmark: str, reps: int,
+                 seed: int, block: int | None, pbo_n: int | None, block_data=None) -> dict:
+    """How often each test rejects on zero-IC placebo rows, against its nominal level.
+
+    A forecast with IC 0 has no skill, so every construction's gross (mid)
+    P&L has mean zero and no configuration is better than another; each test
+    is run on it exactly as the analysis runs it (:func:`group_statistics`)
+    and should reject about as often as its level says. Net P&L is not used:
+    its costs make its mean negative and different across constructions, a
+    true difference. Only the placebo rows at their lowest EFQ are used (0,
+    where net is gross, in E6): another EFQ repeats the same books, exactly
+    when held and nearly when booked every decision, whose gross moves
+    slightly with the EFQ, so it is no new trial, and next to the first its
+    near-copies are books the joint tests can tell apart. They are grouped
+    as the analysis groups them, each group (a seed, say) one independent
+    trial of the joint tests:
+
+    * ``daily_t``: the daily gross Sharpe's HAC t beyond the two-sided 5%
+      critical value, per distinct configuration; its interval is clustered
+      by group, whose books share one forecast. ``daily_t_any`` is the share
+      of groups with any such rejection, the family-wise rate the joint
+      tests exist to hold down (no nominal level);
+    * ``spa`` (consistent p-value) and ``stepm`` (any superior configuration)
+      at 5%, in groups that hold the benchmark;
+    * ``mcs_<loss>``: the 90% set drops a configuration, which under the
+      placebo should happen in at most 10% of groups;
+    * ``dsr``: the best configuration's deflated Sharpe above 95%.
+
+    Group-level rates carry Wilson's 95% interval. ``block_data`` maps a
+    group's row ids to its block matrix (or None), as the analysis builds
+    it for the effective number of trials. Empty without IC-0 rows.
+    """
+    if "f_ic" not in rows:
+        return {}
+    placebo, efq = lowest_efq(rows[(rows["f_ic"].astype(float) == 0.0)
+                                   & rows["row_id"].isin(list(daily))])
+    if placebo.empty:
+        return {}
+    keys = [k for k in group_by if k != "all"]
+    grouped = placebo.groupby(keys, dropna=False, sort=False) if keys else [((), placebo)]
+    critical = NormalDist().inv_cdf(1.0 - TEST_SIZE / 2)
+    t_hits, t_group, t_any = [], [], []
+    joint: dict[str, list[bool]] = {"spa": [], "stepm": [], "dsr": [],
+                                    **{f"mcs_{kind}": [] for kind in MCS_LOSSES}}
+    skipped = 0
+    for g, (_, members) in enumerate(grouped):
+        ids = members["row_id"].tolist()
+        summary, results = group_statistics(
+            members, daily, benchmark=benchmark, which=0, reps=reps, seed=seed, block=block,
+            pbo_n=pbo_n, block_data=block_data(ids) if block_data else None)
+        if "dsr" not in summary:
+            skipped += 1
+            continue
+        distinct = [r for r in ids if r in results and results[r].get("duplicate_of") is None]
+        t = np.array([daily_statistics(daily[r][0])["sharpe_daily_t_hac"] for r in distinct])
+        rejected = np.abs(t[np.isfinite(t)]) > critical
+        t_hits += rejected.tolist()
+        t_group += [g] * len(rejected)
+        t_any.append(bool(rejected.any()))
+        if "spa" in summary:
+            joint["spa"].append(summary["spa"]["consistent"] < TEST_SIZE)
+            joint["stepm"].append(len(summary["stepm"]["superior"]) > 0)
+        for kind in MCS_LOSSES:
+            found = summary[f"mcs_{kind}"]
+            if "included_distinct" in found and "skipped" not in found:
+                joint[f"mcs_{kind}"].append(found["included_distinct"] < found["distinct_models"])
+        best = summary["dsr"]["best_dsr"]
+        if best is not None and np.isfinite(best):
+            joint["dsr"].append(best > 1.0 - TEST_SIZE)
+
+    # The daily t test's rate pools configurations, so its interval is
+    # clustered by group.
+    rate, low, high = clustered_rate(t_hits, t_group)
+    tests = {"daily_t": {"level": TEST_SIZE, "unit": "distinct configuration", "n": len(t_hits),
+                         "rate": rate, "low": low, "high": high,
+                         "interval": "clustered by group"},
+             "daily_t_any": _rate(t_any, None, "group"),
+             "spa": _rate(joint["spa"], TEST_SIZE, "group"),
+             "stepm": _rate(joint["stepm"], TEST_SIZE, "group"),
+             **{f"mcs_{kind}": _rate(joint[f"mcs_{kind}"], MCS_SIZE, "group")
+                for kind in MCS_LOSSES},
+             "dsr": _rate(joint["dsr"], TEST_SIZE, "group")}
+    return {"n_rows": len(placebo), "efq": efq, "n_groups": len(t_any), "n_skipped": skipped,
+            "group_by": keys or ["all"], "pnl": PNL[0], "tests": tests,
+            "note": ("a test of the right size rejects at about its level; a rate whose "
+                     "interval lies above the level over-rejects, one below is conservative")}
 
 
 def time_of_day(row_id: str, values: np.ndarray, labels) -> list[dict]:
@@ -927,9 +1338,38 @@ def time_of_day(row_id: str, values: np.ndarray, labels) -> list[dict]:
 # ── the analysis ────────────────────────────────────────────────────────────
 
 def default_group(rows) -> list[str]:
-    """(forecast, horizon, EFQ): every forecast parameter, the horizon and the EFQ."""
+    """(forecast, horizon, EFQ), split by every scoring setting the rows do not share.
+
+    Every forecast parameter, the horizon and the EFQ, then each of
+    :data:`SCORING_COLUMNS` that takes more than one value in the run (a
+    missing value counts as one), so a group's configurations differ only in
+    how the book is built. A run that varies none of them keeps the
+    (forecast, horizon, EFQ) cells.
+    """
     keys = ["forecast", *[c for c in rows.columns if c.startswith("f_")], "eval_horizon", "efq"]
+    keys += [c for c in SCORING_COLUMNS
+             if c in rows and rows[c].astype(str).nunique(dropna=False) > 1]
     return [k for k in keys if k in rows]
+
+
+def group_keys(rows, spec: dict | None, group_by: list[str] | None = None,
+               group_add: list[str] | None = None) -> list[str]:
+    """The columns a run's groups are keyed by; ``["all"]`` for one group.
+
+    ``group_by`` (``--group``) replaces :func:`default_group`, and so does a
+    spec's ``"inference": {"group_by": [...]}`` when it is not given;
+    ``group_add`` (``--group-add``, else the spec's ``"group_add"``) appends
+    columns to whichever applies, as for a spec that varies a setting the
+    default would compare. Named columns must exist.
+    """
+    options = (spec or {}).get("inference", {})
+    keys = list(group_by or options.get("group_by") or default_group(rows))
+    added = list(group_add or options.get("group_add") or [])
+    keys = [k for k in keys if k != "all"] + [k for k in added if k not in keys]
+    missing = [k for k in keys if k not in rows]
+    if missing:
+        raise ValueError(f"cannot group by {missing}: not columns of the run's rows")
+    return keys or ["all"]
 
 
 def _group_name(keys: list[str], values) -> str:
@@ -937,9 +1377,14 @@ def _group_name(keys: list[str], values) -> str:
 
 
 def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str] | None = None,
-            pnl: str = "net", reps: int = REPS, seed: int = 0, block: int | None = None,
-            lags: int | None = None, pbo_n: int | None = None) -> dict:
-    """Run every statistic on ``results/<name>`` and write the outputs; returns the JSON."""
+            group_add: list[str] | None = None, pnl: str = "net", reps: int = REPS,
+            seed: int = 0, block: int | None = None, lags: int | None = None,
+            pbo_n: int | None = None, size: bool = False) -> dict:
+    """Run every statistic on ``results/<name>`` and write the outputs; returns the JSON.
+
+    ``size`` also runs the joint tests on the run's IC-0 placebo rows
+    (:func:`placebo_size`), reported under ``placebo_size``.
+    """
     import pandas as pd
 
     out = run_dir(name)
@@ -990,8 +1435,11 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
         record = {"row_id": r, "label_source": source.get(r)}
         n_lags = row_lags(row, values.shape[1], spacing, lags)
         record["lags"] = n_lags
+        choices = lo_lags(row, values.shape[1], spacing)
+        record.update({f"lo_lags_{name}": v for name, v in choices.items()})
         for i, kind in enumerate(PNL):
             stats = series_statistics(values[i], q=q, lags=n_lags)
+            stats.update(lo_at_lags(values[i], q=q, lags=choices))
             record.update({f"{key}_{kind}": v for key, v in stats.items()})
             if r in daily:
                 stats = daily_statistics(daily[r][i][np.isfinite(daily[r][i])])
@@ -1006,23 +1454,26 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
     stats_frame = pd.DataFrame(records)
 
     # Groups.
-    group_by = group_by or default_group(rows)
+    group_by = group_keys(rows, spec, group_by, group_add)
     which = PNL.index(pnl)
     horizons = {r: (int(h) if reb == "horizon" else 0)
                 for r, h, reb in zip(rows["row_id"], rows["eval_horizon"], rows["rebalance"])}
+    def block_data(member_ids: list[str], which: int = which):
+        member_ids = [r for r in member_ids if r in daily]
+        if grid and all(r in labels for r in member_ids) and member_ids:
+            return block_matrix(member_ids, horizons, labels,
+                                {r: series[r][which] for r in member_ids}, grid, spacing)
+        return None
+
     groups, per_row = [], {}
     keys = group_by if group_by != ["all"] else []
     grouped = rows.groupby(keys, dropna=False, sort=False) if keys else [((), rows)]
     for key, members in grouped:
         key = key if isinstance(key, tuple) else (key,)
         member_ids = [r for r in members["row_id"] if r in daily]
-        block_data = None
-        if grid and all(r in labels for r in member_ids) and member_ids:
-            block_data = block_matrix(member_ids, horizons, labels,
-                                      {r: series[r][which] for r in member_ids}, grid, spacing)
         summary, results = group_statistics(
             members, daily, benchmark=benchmark, which=which, reps=reps, seed=seed,
-            block=block, pbo_n=pbo_n, block_data=block_data)
+            block=block, pbo_n=pbo_n, block_data=block_data(member_ids))
         gid = _group_name(keys, key) if keys else "all"
         summary = {"group": gid, "keys": {k: _scalar(v) for k, v in zip(keys, key)}, **summary}
         groups.append(summary)
@@ -1057,6 +1508,14 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
     if daily:
         np.savez_compressed(out / "inference_daily.npz", __days__=all_days, **daily)
 
+    # Lo's ratio at each lag count, the median over rows: how far the choice moves it.
+    lo = {"note": LO_NOTE, "lags": {"default": "the lags column (module docstring)", **LO_LAGS}}
+    for kind in PNL:
+        lo[f"median_ratio_{kind}"] = {
+            "default": float(np.nanmedian(table[f"lo_ratio_{kind}"].to_numpy(float))),
+            **{name: float(np.nanmedian(table[f"lo_ratio_{name}_{kind}"].to_numpy(float)))
+               for name in LO_LAGS}}
+
     report = {
         "name": name, "spec_name": spec.get("name") if spec else None,
         "settings": {"benchmark": benchmark, "group_by": group_by, "pnl": pnl, "reps": reps,
@@ -1072,11 +1531,20 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
                 table["sharpe_mid"].to_numpy(float) - rows["sharpe_mid"].to_numpy(float),
                 table["sharpe_net"].to_numpy(float) - rows["sharpe_net"].to_numpy(float)]))),
             "n_days": len(all_days),
+            # Configurations the joint tests saw, and how many of them differ:
+            # every MCS count is out of the second.
+            "configs_in_groups": sum(g["n_configs"] for g in groups),
+            "distinct_models": sum(g.get("distinct_models", 0) for g in groups),
         },
+        "lo": lo,
         "groups": groups,
         "seed_dispersion": seed_dispersion(table),
         "size_check": size_check(table),
     }
+    if size:
+        report["placebo_size"] = placebo_size(
+            rows, daily, group_by=group_by, benchmark=benchmark, reps=reps, seed=seed,
+            block=block, pbo_n=pbo_n, block_data=lambda ids: block_data(ids, which=0))
     (out / "inference.json").write_text(json.dumps(_clean(report), indent=2))
     print_summary(report, table)
     return report
@@ -1119,6 +1587,9 @@ def print_summary(report: dict, table) -> None:
     print(f"  per-period net Sharpe, Lo / naive (median [p10, p90]): "
           f"{_quantiles(table['lo_ratio_net'])}; HAC / iid s.e.: "
           f"{_quantiles(table['sharpe_se_hac_net'] / table['sharpe_se_iid_net'])}")
+    print("  Lo / naive by lag count (median, net; it depends on the count, see lo.note): "
+          + ", ".join(f"{name} {_number(v, '.2f')}"
+                      for name, v in report["lo"]["median_ratio_net"].items()))
     # Name groups and configurations by what varies, not by what every row shares.
     group_keys = [k for k in report["settings"]["group_by"]
                   if len({str(g["keys"].get(k)) for g in report["groups"]}) > 1]
@@ -1129,9 +1600,15 @@ def print_summary(report: dict, table) -> None:
     def short(row_id):
         return "/".join(str(by_id.at[row_id, c]) for c in axes) or by_id.at[row_id, "label"]
 
-    print(f"  group: {','.join(group_keys) or '(one)'}; configuration: {'/'.join(axes)}")
-    print(f"  {'group':<28} {'k':>4} {'best by daily net SR':<38} {'MCS':>4} {'SPA p':>6} "
-          f"{'StepM':>5} {'N_eff':>6} {'DSR':>5} {'PBO':>5}")
+    def in_set(g, kind):
+        found = g.get(f"mcs_{kind}", {})
+        return (f"{found['included_distinct']}/{found['distinct_models']}"
+                if "included_distinct" in found else "-")
+
+    print(f"  group: {','.join(group_keys) or '(one)'}; configuration: {'/'.join(axes)}; "
+          f"MCS: distinct configurations in the 90% set / distinct, by mean P&L and by Sharpe")
+    print(f"  {'group':<28} {'k':>4} {'best by daily net SR':<38} {'MCS P&L':>7} {'MCS SR':>7} "
+          f"{'SPA p':>6} {'StepM':>5} {'N_eff':>6} {'DSR':>5} {'PBO':>5}")
     for g in report["groups"]:
         name = ",".join(str(g["keys"].get(k)) for k in group_keys)[:28] or "all"
         if "dsr" not in g:
@@ -1139,16 +1616,33 @@ def print_summary(report: dict, table) -> None:
             continue
         d = g["dsr"]
         best = f"{short(d['best_row_id'])[:30]} {d['best_sharpe_daily']:.1f}"
-        stepm = len(g["stepm"]["superior"]) if "stepm" in g else "-"
-        print(f"  {name:<28} {g['n_configs']:>4} {best:<38} {len(g['mcs']['included']):>4} "
+        stepm = g["stepm"]["superior_distinct"] if "stepm" in g else "-"
+        print(f"  {name:<28} {g['n_configs']:>4} {best:<38} {in_set(g, 'pnl'):>7} "
+              f"{in_set(g, 'sharpe'):>7} "
               f"{_number(g.get('spa', {}).get('consistent'), '.3f'):>6} {stepm:>5} "
               f"{_number(d['n_eff_used'], '.1f'):>6} {_number(d['best_dsr'], '.2f'):>5} "
               f"{_number(g.get('pbo', {}).get('probability'), '.2f'):>5}")
     size = report["size_check"]
     if size:
-        print(f"  size check on {size['n_rows']} IC-0 rows (gross, 5% level): "
-              + ", ".join(f"{k[len('reject_'):]} {v:.2f}" for k, v in size.items()
-                          if k.startswith("reject_") and v is not None))
+        parts = []
+        for key, rate in size.items():
+            if key.startswith("reject_") and rate is not None:
+                column = key[len("reject_"):]
+                low, high = size[f"interval_{column}"]
+                parts.append(f"{column} {rate:.2f} [{_number(low, '.2f')}, "
+                             f"{_number(high, '.2f')}]")
+        print(f"  size check on {size['n_rows']} IC-0 rows at EFQ {size['efq']} (gross, 5% "
+              f"level; 95% interval clustered by group): " + ", ".join(parts))
+    placebo = report.get("placebo_size")
+    if placebo:
+        print(f"  placebo size on {placebo['n_groups']} groups of IC-0 rows (gross P&L): "
+              f"rejection rate [95%] against the level")
+        for name, t in placebo["tests"].items():
+            print(f"    {name:<12} {_number(t['rate'], '.3f')} [{_number(t['low'], '.3f')}, "
+                  f"{_number(t['high'], '.3f')}] over {t['n']} {t['unit']}s; level "
+                  f"{_number(t['level'], '.2f')}")
+    elif placebo is not None:
+        print("  placebo size: no IC-0 rows")
     seeds = report["seed_dispersion"]
     if seeds:
         ratio = [s["sharpe_daily_net_sd"] / s["sharpe_daily_se_hac_net_mean"] for s in seeds
@@ -1165,7 +1659,11 @@ def main(argv=None) -> int:
                              f"group; ties go to the first row (default {DEFAULT_BENCHMARK!r})")
     parser.add_argument("--group", default=None,
                         help="comma-separated row columns to group by, or 'all' for one group "
-                             "(default: forecast, its parameters, eval_horizon, efq)")
+                             "(default: the spec's inference.group_by, else forecast, its "
+                             "parameters, eval_horizon, efq and any scoring setting that varies)")
+    parser.add_argument("--group-add", default=None,
+                        help="comma-separated row columns added to the grouping (default: the "
+                             "spec's inference.group_add)")
     parser.add_argument("--pnl", choices=PNL, default="net", help="series the group tests use")
     parser.add_argument("--reps", type=int, default=REPS)
     parser.add_argument("--seed", type=int, default=0)
@@ -1174,10 +1672,15 @@ def main(argv=None) -> int:
     parser.add_argument("--lags", type=int, default=None,
                         help="fixed HAC lags for the per-period series (default: see the docstring)")
     parser.add_argument("--pbo-blocks", type=int, default=None)
+    parser.add_argument("--size-check", action="store_true",
+                        help="also run the joint tests on the IC-0 placebo rows' gross P&L and "
+                             "report how often each rejects against its level")
     args = parser.parse_args(argv)
     group = args.group.split(",") if args.group else None
-    analyze(args.name, benchmark=args.benchmark, group_by=group, pnl=args.pnl, reps=args.reps,
-            seed=args.seed, block=args.block, lags=args.lags, pbo_n=args.pbo_blocks)
+    added = args.group_add.split(",") if args.group_add else None
+    analyze(args.name, benchmark=args.benchmark, group_by=group, group_add=added, pnl=args.pnl,
+            reps=args.reps, seed=args.seed, block=args.block, lags=args.lags,
+            pbo_n=args.pbo_blocks, size=args.size_check)
     return 0
 
 
