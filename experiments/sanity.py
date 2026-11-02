@@ -29,8 +29,10 @@ advance, and prints PASS, FAIL or SKIP with the numbers behind it:
   rule. If the curves are roughly flat in IC, exact-IC gross Sharpe measures
   the dispersion process, not forecast quality, and should be read only as
   a cost-ratio device.
-* PLACEBO. E6's IC-0 forecasts under ten seeds: the daily Sharpe must centre
-  on zero relative to its spread, and the 95% intervals must cover zero.
+* PLACEBO. E6's IC-0 forecasts under ten seeds, each distinct book once: the
+  daily gross Sharpe must centre on zero relative to its spread across
+  seeds, and the 95% intervals must exclude zero no more often than 5%,
+  within the interval of that rate.
 * INVARIANCE AT IC 1. E6's tails, middle and random oracles at IC 1 are the
   same forecast and must give identical rows.
 * LOOK-AHEAD CANARIES, on the real month: the realized forward return used as
@@ -457,21 +459,57 @@ def exact_ic_invariance(results: Path) -> dict:
                    median_relative_range=float(np.median(ranges)), curves=curves)
 
 
+#: The level of the placebo's tests: a 95% interval should exclude zero this often.
+TEST_LEVEL = 0.05
+
+
+def _wilson(successes: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
+    """The Wilson score 95% interval of a proportion of ``n``."""
+    p = successes / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return max(centre - half, 0.0), min(centre + half, 1.0)
+
+
 def placebo(results: Path) -> dict:
-    """E6's IC-0 seeds: centred on zero, intervals covering it."""
+    """E6's IC-0 seeds: daily gross Sharpe centred on zero, intervals of the right size.
+
+    EACH DISTINCT BOOK COUNTS ONCE. Gross does not depend on EFQ, so a book's
+    copies at each EFQ are one test of the placebo, not several, and collapse
+    to the frictionless row. The configurations run on one seed share its
+    forecast and their Sharpe ratios move together, so a seed is one cluster:
+    the t statistic is taken over the seeds' mean Sharpe, with each
+    configuration's own t across the seeds beside it. The size is the share
+    of books whose 95% day-bootstrap interval excludes zero, with a Wilson
+    interval that treats the books as independent and so is, if anything,
+    too narrow; the check fails when even its lower end is above 5%.
+    """
+    name = "placebo (IC 0)"
     rows = _rows(results, "e6_sanity_checks")
     if rows is None:
-        return _result("placebo (IC 0)", "SKIP", reason="no E6 rows")
-    part = rows[(rows["forecast"] == "copula") & (rows["f_ic"] == 0.0) & (rows["efq"] == 0.0)]
+        return _result(name, "SKIP", reason="no E6 rows")
+    part = rows[(rows["forecast"] == "copula") & (rows["f_ic"] == 0.0)]
     if part.empty or "sharpe_daily_mid" not in part:
-        return _result("placebo (IC 0)", "SKIP", reason="no IC-0 rows with daily Sharpe")
-    sharpe = part["sharpe_daily_mid"].to_numpy()
-    t = float(sharpe.mean() / (sharpe.std(ddof=1) / np.sqrt(len(sharpe))))
-    cover = float(((part["sharpe_daily_mid_low"] <= 0)
-                   & (part["sharpe_daily_mid_high"] >= 0)).mean())
-    status = "PASS" if abs(t) < 3 and cover >= 0.8 else "FAIL"
-    return _result("placebo (IC 0)", status, mean_daily_sharpe=float(sharpe.mean()),
-                   t_of_mean=t, interval_coverage=cover, n_rows=len(part))
+        return _result(name, "SKIP", reason="no IC-0 rows with daily Sharpe")
+    book = [c for c in part.columns if (c.startswith("f_") or c in CONFIG_FIELDS) and c != "efq"]
+    part = part.sort_values("efq", kind="stable").drop_duplicates(book)
+    sharpe = part["sharpe_daily_mid"].to_numpy(dtype=np.float64)
+    seeds = part.groupby("f_seed")["sharpe_daily_mid"].mean()
+    t = float(seeds.mean() / (seeds.std(ddof=1) / np.sqrt(len(seeds))))
+    t_iid = float(sharpe.mean() / (sharpe.std(ddof=1) / np.sqrt(len(sharpe))))
+    varying = [c for c in book if not c.startswith("f_") and part[c].nunique(dropna=False) > 1]
+    by_config = {}
+    for key, group in part.groupby(varying) if varying else ():
+        values = group["sharpe_daily_mid"].to_numpy(dtype=np.float64)
+        label = "|".join(f"{c}={v}" for c, v in zip(varying, np.atleast_1d(key)))
+        by_config[label] = float(values.mean() / (values.std(ddof=1) / np.sqrt(len(values))))
+    rejected = ~((part["sharpe_daily_mid_low"] <= 0) & (part["sharpe_daily_mid_high"] >= 0))
+    size_low, size_high = _wilson(int(rejected.sum()), len(part))
+    status = "PASS" if abs(t) < 3 and size_low <= TEST_LEVEL else "FAIL"
+    return _result(name, status, mean_daily_sharpe=float(sharpe.mean()), t_clustered_by_seed=t,
+                   t_iid=t_iid, size=float(rejected.mean()), size_low=size_low,
+                   size_high=size_high, n_books=len(part), n_seeds=len(seeds),
+                   t_by_configuration=by_config)
 
 
 def invariance_at_one(results: Path) -> dict:

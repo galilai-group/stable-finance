@@ -233,3 +233,35 @@ def test_cost_identity_fails_a_break_even_its_series_does_not_reproduce(tmp_path
     _cost_run(tmp_path, breakeven_error=1e-6)
     result = sanity.cost_identity(tmp_path)
     assert result["status"] == "FAIL" and result["worst_breakeven_error"] == pytest.approx(1e-6)
+
+
+def test_placebo_counts_a_book_once_and_clusters_its_t_by_seed(tmp_path):
+    rows = []
+    # The seed's forecast moves every book run on it.
+    for seed, shared in enumerate((2.0, -1.0, 0.5, -2.0, 1.0)):
+        for weighting, own in (("equal", 0.1), ("rank", -0.1), ("signal", 0.0)):
+            sharpe = shared + own
+            # One book's interval excludes zero; every other one is wide.
+            width = 0.5 if (seed, weighting) == (0, "rank") else 10.0
+            for efq in (0.0, 0.7):                                 # the same book, priced twice
+                rows.append({"forecast": "copula", "f_ic": 0.0, "f_seed": seed,
+                             "weighting": weighting, "efq": efq, "sharpe_daily_mid": sharpe,
+                             "sharpe_daily_mid_low": sharpe - width,
+                             "sharpe_daily_mid_high": sharpe + width})
+    _write_rows(tmp_path, "e6_sanity_checks", rows)
+    result = sanity.placebo(tmp_path)
+    assert result["status"] == "PASS"
+    assert result["n_books"] == 15 and result["n_seeds"] == 5
+    seeds = np.array([2.0, -1.0, 0.5, -2.0, 1.0])
+    assert result["t_clustered_by_seed"] == pytest.approx(
+        seeds.mean() / (seeds.std(ddof=1) / np.sqrt(5)))
+    assert set(result["t_by_configuration"]) == {"weighting=equal", "weighting=rank",
+                                                 "weighting=signal"}
+    assert result["size"] == pytest.approx(1 / 15)
+    assert (result["size_low"], result["size_high"]) == pytest.approx(sanity._wilson(1, 15))
+
+
+def test_wilson_interval_matches_its_closed_form():
+    low, high = sanity._wilson(4, 60)
+    assert (low, high) == pytest.approx((0.0262, 0.1592), abs=1e-4)
+    assert sanity._wilson(0, 60)[0] == 0.0
