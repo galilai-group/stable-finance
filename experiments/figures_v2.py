@@ -15,8 +15,10 @@ not exist yet:
 * ``breakeven``: a heatmap of break-even EFQ by construction and IC;
 * ``walkforward``: per-month small multiples of daily net Sharpe, when any
   ``results/*_wf`` run exists;
-* ``mcs``: the share of groups in which each construction is in the 90% model
-  confidence set, when ``results/*/inference.parquet`` exists.
+* ``mcs``: the share of each construction's DISTINCT configurations (identical
+  P&L counted once) in the 90% model confidence set, under each of its two
+  losses (mean daily P&L, daily Sharpe), when ``results/*/inference.parquet``
+  exists.
 
     uv run --extra experiments python -m experiments.figures_v2 [--results DIR]
 """
@@ -210,27 +212,59 @@ def walkforward(results: Path, out: Path, mode: str) -> list[Path]:
     return paths
 
 
-def mcs(results: Path, out: Path, mode: str) -> list[Path]:
+#: The two losses ``inference.py`` runs the confidence set on, as the legend names them.
+MCS_LOSSES = (("pnl", "mean daily {pnl} P&L"), ("sharpe", "daily {pnl} Sharpe"))
+
+
+def mcs_shares(rows):
+    """Share of each construction's distinct configurations in the MCS, per loss.
+
+    ``rows`` are ``inference.parquet`` rows. A duplicate (``duplicate_of``
+    set) only mirrors its representative, so it is dropped before counting,
+    as is a row whose group's set was not computed. One column per loss,
+    indexed by weighting.
+    """
     import pandas as pd
 
-    frames = []
+    rows = rows[rows["duplicate_of"].isna()]
+    shares = {}
+    for kind, _ in MCS_LOSSES:
+        tested = rows[rows[f"in_mcs_{kind}"].notna()]
+        shares[kind] = tested[f"in_mcs_{kind}"].astype(bool).groupby(tested["weighting"]).mean()
+    return pd.DataFrame(shares)
+
+
+def mcs(results: Path, out: Path, mode: str) -> list[Path]:
+    import json
+
+    import pandas as pd
+
+    frames, tested = [], set()
     for path in sorted(results.glob("*/inference.parquet")):
         frame = pd.read_parquet(path)
-        if {"in_mcs", "weighting"} <= set(frame.columns):
+        # Older outputs flagged every copy of a configuration: left out.
+        if {"duplicate_of", "weighting", *(f"in_mcs_{k}" for k, _ in MCS_LOSSES)} <= set(frame):
             frames.append(frame.assign(run=path.parent.name))
+            report = path.parent / "inference.json"
+            if report.is_file():
+                tested.add(json.loads(report.read_text())["settings"]["pnl"])
     if not frames:
         return []
-    rows = pd.concat(frames, ignore_index=True)
+    share = mcs_shares(pd.concat(frames, ignore_index=True))
+    pnl = tested.pop() if len(tested) == 1 else ""
     plt = _plt(mode)
-    share = rows.groupby("weighting")["in_mcs"].mean()
     weightings = [w for w in WEIGHTING_ORDER if w in share.index]
     fig, ax = plt.subplots(figsize=(1.2 * len(weightings) + 2.0, 2.8))
-    ax.bar(range(len(weightings)), [share[w] for w in weightings],
-           color=[_color(mode, w, WEIGHTING_ORDER) for w in weightings])
+    width = 0.8 / len(MCS_LOSSES)
+    for k, (kind, name) in enumerate(MCS_LOSSES):
+        x = np.arange(len(weightings)) + (k - (len(MCS_LOSSES) - 1) / 2) * width
+        ax.bar(x, [share.at[w, kind] for w in weightings], width=width * 0.9,
+               color=SEQUENTIAL[2 + 2 * k], label="loss: " + " ".join(name.format(pnl=pnl).split()))
     ax.set_xticks(range(len(weightings)), [LABELS[w] for w in weightings])
     ax.set_ylim(0, 1)
-    ax.set_ylabel("Share of groups in the 90% MCS")
+    ax.set_ylabel("Share of distinct configs\nin the 90% MCS")
     ax.set_title("Which constructions cannot be told apart from the best")
+    ax.legend(fontsize=7)
     path = _save(fig, out, "mcs", mode)
     plt.close(fig)
     return [path]
