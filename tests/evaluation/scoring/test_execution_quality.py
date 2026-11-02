@@ -124,9 +124,28 @@ class TestSharpeVsExecutionQuality:
     def test_non_finite_periods_are_dropped_not_propagated(self):
         gross, cost = self._series(n=100)
         gross[5] = np.nan
+        cost[[7, 9]] = [np.inf, -np.inf]
         curve = sharpe_vs_execution_quality(gross, cost, efq_grid=[0.5])
-        assert curve.periods == 99
+        assert curve.periods == 97
         assert np.isfinite(curve.sharpe[0])
+        keep = np.isfinite(gross) & np.isfinite(cost)
+        assert curve.sharpe[0] == pytest.approx(sharpe_ratio(gross[keep] - 0.5 * cost[keep]))
+
+    def test_a_period_paid_by_price_improvement_is_netted_as_it_is(self):
+        # Fills priced off the touch on arrival are measured against the mid
+        # at the decision, so a quote that moved in the order's favour leaves
+        # a negative unit cost. It is a payment, not an error.
+        rng = np.random.default_rng(3)
+        gross = rng.normal(5e-4, 1e-3, 300)
+        cost = rng.normal(2e-4, 3e-4, 300)
+        assert (cost < 0).any()
+        curve = sharpe_vs_execution_quality(gross, cost, efq_grid=[0.0, 0.7, 1.0])
+        for index, efq in enumerate([0.0, 0.7, 1.0]):
+            assert curve.sharpe[index] == pytest.approx(sharpe_ratio(gross - efq * cost))
+        assert curve.breakeven == pytest.approx(gross.mean() / cost.mean())
+        # A strategy price improvement pays on average never breaks even.
+        paid = sharpe_vs_execution_quality(gross, -np.abs(cost), efq_grid=[0.0, 1.0])
+        assert np.isinf(paid.breakeven) and paid.sharpe[1] > paid.sharpe[0]
 
     def test_the_reported_band_is_the_informed_one_not_the_retail_one(self):
         # The band drawn on the figure must sit between a midpoint fill and
@@ -141,5 +160,5 @@ class TestSharpeVsExecutionQuality:
     def test_mismatched_inputs_are_refused(self):
         with pytest.raises(ValueError, match="same shape"):
             sharpe_vs_execution_quality(np.zeros(5), np.zeros(4))
-        with pytest.raises(ValueError, match="cannot be negative"):
-            sharpe_vs_execution_quality(np.zeros(5), -np.ones(5))
+        with pytest.raises(ValueError, match="fees cannot be negative"):
+            sharpe_vs_execution_quality(np.zeros(5), np.ones(5), fees=-np.ones(5))

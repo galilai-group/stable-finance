@@ -171,6 +171,14 @@ def sharpe_vs_execution_quality(
     linear in EFQ, the whole curve is ``gross - efq * cost`` and needs no
     re-running: one backtest produces the entire sensitivity.
 
+    That is the sensitivity of ONE BOOK, held fixed while its fills get
+    dearer. A cost-aware allocator (``weighting="mean_variance"``) plans
+    against the cost it is billed, so at another EFQ it would hold another
+    book, with another gross: its gross Sharpe depends on EFQ by design. For
+    such a book this curve says what the book run at one EFQ would earn at
+    the others, not what the allocator would; that needs a run at each EFQ,
+    which is why the experiments sweep EFQ as a configuration axis.
+
     This is the honest way to present a Sharpe ratio that a cost assumption
     can dominate. Rather than defending one number, it reports where the
     result lives as a function of the single assumption that matters, and
@@ -187,6 +195,15 @@ def sharpe_vs_execution_quality(
     -- commissions, access and regulatory fees -- paid at every EFQ, so the
     curve is ``gross - fees - efq * cost`` and ``gross_sharpe`` stays the
     frictionless one. ``cost_at_unit_efq`` must then exclude them.
+
+    A period's cost may be NEGATIVE. A crossing fill priced off the touch the
+    order meets on arrival (``exec_bid_price`` and ``exec_ask_price``; see
+    :func:`~stable_finance.evaluation.execution.simulate_fills`) is measured
+    against the mid at the decision, so when the quote moved in the order's
+    favour in between, the period was paid rather than charged -- price
+    improvement, which the netting keeps as it is. A period whose gross,
+    cost or fee is not finite is left out of every point of the curve. Fees
+    are a charge and cannot be negative.
     """
     gross = np.asarray(gross, dtype=np.float64).ravel()
     cost = np.asarray(cost_at_unit_efq, dtype=np.float64).ravel()
@@ -204,8 +221,6 @@ def sharpe_vs_execution_quality(
     gross, cost = gross[keep], cost[keep]
     if len(gross) < 2:
         raise ValueError("need at least two periods")
-    if np.any(cost < 0):
-        raise ValueError("cost cannot be negative")
 
     grid = (np.linspace(0.0, 1.5, 61) if efq_grid is None
             else np.asarray(efq_grid, dtype=np.float64).ravel())

@@ -141,6 +141,18 @@ class BacktestReport:
     ``information_coefficient`` is measured on the same forecast over the same
     screened universe, so the pair is comparable by construction.
 
+    ``sharpe_mid`` is the gross of the book this configuration HOLDS, which is
+    not always the book a cost-free configuration would hold. The
+    mean-variance allocator plans against the cost it is billed (the cost
+    model with its ``efq``, ``equity`` and ``impact``, and the fees), so a
+    dearer configuration holds a book that trades less, and its gross Sharpe
+    moves with EFQ BY DESIGN: that is the allocator doing its job, not cost
+    leaking into the gross. Compare a configuration's gross with its own net;
+    a gross at one EFQ against a net at another mixes two books. Every other
+    weighting holds the same book at any cost, and its gross differs across
+    EFQ only where a name without a usable quote fills at the mid (EFQ 0) but
+    not across the spread.
+
     ``transfer_coefficient`` is how much of the forecast the book expresses
     (:func:`~stable_finance.evaluation.scoring.tc.transfer_coefficient`): the
     correlation, over the screened names, of the positions actually HELD --
@@ -149,7 +161,26 @@ class BacktestReport:
     model's units. It is measured against the transformed forecast rather than
     the raw one because the transforms are what the book was asked to express;
     the IC is what scores the raw forecast. Below the forecast level there is
-    no forecast to transfer, and it is NaN.
+    no forecast to transfer, and it is NaN. It is averaged over the decisions
+    at which the book earns -- the same time base as the profit path: every
+    decision, except under ``rebalance="horizon"``, where a held book earns
+    its return once, at the formation that set it, and so is scored there,
+    against the forecast it was formed on. A carried decision holds a book
+    formed on an earlier forecast and is not scored against a fresh one, nor
+    is a formation whose forward return is unknown, which sets no book.
+
+    UNITS. ``mean_gross_return_bps`` and ``mean_cost_bps`` are means over the
+    periods of the profit path, in basis points of equity: per decision, per
+    held book under ``rebalance="horizon"``, or per day under
+    ``annualization="daily"``. ``mean_turnover`` is the two-way traded weight
+    -- the sum over names of the absolute change in weight, in units of
+    equity -- per decision, or per held book under ``rebalance="horizon"``,
+    whatever the annualization. Under ``annualization="decisions"`` (which
+    every experiment spec sets; the configuration's default is ``"daily"``)
+    the two share a basis, so ``mean_cost_bps / mean_turnover`` is the cost
+    per unit traded; under ``"daily"`` the cost is per day and the turnover
+    is not. ``mean_gross_exposure`` and ``mean_names_held`` are means over
+    decisions.
     """
 
     config: BacktestConfig
@@ -360,8 +391,24 @@ def _book(context: dict, config: BacktestConfig, sigma: NDArray[np.float64]
     only in ``neutralize`` would read each other's. Returned together, the pair
     is cached together, so the transfer coefficient a sweep reports is the one
     :func:`run_backtest` would.
+
+    A HELD BOOK HAS NO VIEW WHERE ITS RETURN IS NEVER KNOWN. A held book earns
+    its forward return once, at its formation, and at the last formations of
+    a day that return runs past the close and is NaN for every name: a book
+    set there earns nothing. Under ``rebalance="horizon"`` the forecast at
+    such a decision is therefore dropped before the book is built, exactly as
+    though it were an oracle's, which is NaN wherever the return is. A
+    path-independent rule then sets a flat book, closing the one before it;
+    the cost-aware allocator unwinds as risk and cost allow. No trade into a
+    book that cannot earn is made or charged, and the exit from the book
+    before it is charged as an oracle's always was. (Setting the HELD book
+    flat after the fact instead would force a mean-variance book, which
+    barely trades, through a full exit and re-entry.)
     """
     spread = context["spread"]
+    if _drops_forecast(context, config):
+        context = {**context, "mu": np.where(_no_outcome(context)[:, None], np.nan,
+                                             context["mu"])}
     mu = context["mu"]
 
     # THE SCREEN AND THE BOOK ARE DIFFERENT SETS. ``screened`` is what the
@@ -532,7 +579,9 @@ def _formations(context: dict) -> NDArray[np.bool_]:
 
     k is the forecast horizon in decisions. Blocks restart at each day, since
     a forward return does not run across the close; without ``days`` the
-    decisions are one run.
+    decisions are one run. A formation whose forward return is unknown for
+    every name still starts a period, but the forecast has no view there (see
+    :func:`_book`), so the period carries the unwinding of the book before it.
     """
     if "formed" not in context:
         if context["horizon"] <= 0:
@@ -546,6 +595,25 @@ def _formations(context: dict) -> NDArray[np.bool_]:
             index = index - np.maximum.accumulate(np.where(starts, index, 0))
         context["formed"] = index % every == 0
     return context["formed"]
+
+
+def _no_outcome(context: dict) -> NDArray[np.bool_]:
+    """The decisions at which no name's forward return is known."""
+    if "dead" not in context:
+        context["dead"] = ~np.isfinite(context["outcome_values"]).any(axis=1)
+    return context["dead"]
+
+
+def _drops_forecast(context: dict, config: BacktestConfig) -> bool:
+    """Whether this configuration's book is built with part of the forecast dropped.
+
+    True for a held book whose forecast has a view at a decision where no
+    forward return is known (see :func:`_book`); a forecast already unknown
+    at every such decision, as an oracle's is, has nothing to drop.
+    """
+    if config.rebalance != "horizon" or context["mu"] is None:
+        return False
+    return bool(np.isfinite(context["mu"][_no_outcome(context)]).any())
 
 
 def _hold_from(weights, formed):
@@ -652,6 +720,11 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
     """
     mu, spread, day = context["mu"], context["spread"], context["day"]
     net = gross - costs
+    turnover = turnover_per_asset.sum(axis=1)
+    if config.rebalance == "horizon":
+        # Turnover per held book, the basis its cost is reported on: the
+        # trades into a book and any while it is carried are one rebalance.
+        turnover = np.add.reduceat(turnover, np.flatnonzero(_formations(context)))
 
     if config.annualization == "daily":
         order = np.argsort(day, kind="stable")
@@ -701,7 +774,12 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
     tc = np.nan
     if mu is not None and alpha is not None and sigma is not None:
         held = np.where(np.isfinite(values) & (np.abs(values) <= 1e-12), 0.0, values)
-        mean = transfer_coefficient(held, alpha, sigma, eligible=screened).mean
+        # A held book is scored where it was set, against the forecast it was
+        # set from: the decisions it is carried through hold an older book.
+        rows = (_formations(context) & ~_no_outcome(context)
+                if config.rebalance == "horizon" else slice(None))
+        mean = transfer_coefficient(held[rows], alpha[rows], sigma,
+                                    eligible=screened[rows]).mean
         tc = float(mean) if np.isfinite(mean) else np.nan
     return BacktestReport(
         config=config, horizon=context["horizon"],
@@ -711,7 +789,7 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         sharpe_net=sharpe_ratio(net, periods_per_year=periods_per_year),
         mean_gross_return_bps=float(np.nanmean(gross) * 1e4),
         mean_cost_bps=float(np.nanmean(costs_series) * 1e4),
-        mean_turnover=float(turnover_per_asset.sum(axis=1).mean()),
+        mean_turnover=float(turnover.mean()),
         mean_gross_exposure=float(np.abs(values).sum(axis=1).mean()),
         periods_per_year=float(periods_per_year),
         n_periods=int(len(net)),
@@ -948,7 +1026,8 @@ def sweep_configs(
                 _beta(context, history, realized)
             if config.neutralize == "pca3":
                 _loadings(context, history, realized)
-            book_key = _book_key(config)
+            # A held book that drops part of its forecast is a different book.
+            book_key = (*_book_key(config), ("drops_forecast", _drops_forecast(context, config)))
             if book_key in book_cache:
                 book_cache.move_to_end(book_key)
             else:
