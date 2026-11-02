@@ -11,12 +11,19 @@ advance, and prints PASS, FAIL or SKIP with the numbers behind it:
   ``sqrt(2 / pi) = 0.798``, top and bottom deciles ``0.785``, quintiles
   ``0.885`` (``2 phi(z_q) / sqrt(2 q)`` for a tail of size ``q``). The
   library's books and its ``transfer_coefficient`` must land on them.
-* THE FUNDAMENTAL LAW. Realized per-period IR against ``TC * IC * sqrt(N)``
-  (Grinold 1989, with the transfer coefficient), per construction, from the
-  E6 and E1 rows. It is reported, not enforced: for an oracle whose IC is
-  exact at every decision the law does not apply (each period's P&L is about
-  ``N * IC * sd(w) * sd(r)``, almost never negative), which the exact-IC
-  invariance diagnostic below makes visible.
+* THE FUNDAMENTAL LAW. Realized IR per held book against ``TC * IC *
+  sqrt(N)`` (Grinold 1989, with the transfer coefficient), on E1x's
+  random-error oracle (E1's without it), the one whose IC is a target in
+  expectation. The books are rebuilt from the run's own spec, so every factor
+  is measured in one set of units: TC in the identity metric the rank IC
+  lives in, both at the formations the P&L is booked at, N the screened
+  universe the TC spans. Beside the law, a second prediction keeps what the
+  law drops: the value IC (which the P&L carries, not the rank IC) times the
+  cross-sectional dispersion, whose swings cost IR. Realized / predicted is
+  reported by IC with a day-bootstrap interval. An oracle whose IC is exact
+  at every decision is outside the law altogether (each period's P&L is
+  about ``N * IC * sd(w) * sd(r)``, almost never negative), which the
+  exact-IC invariance diagnostic below makes visible.
 * EXACT-IC INVARIANCE. Gross Sharpe of the exact-IC (tails, middle) signal
   book across ICs, from E1. If it is roughly flat in IC, exact-IC gross
   Sharpe measures the dispersion process, not forecast quality, and should be
@@ -41,9 +48,9 @@ advance, and prints PASS, FAIL or SKIP with the numbers behind it:
 
 ``--results`` points at the directory holding finished runs (default
 ``experiments/results``); the report goes to ``<results>/sanity/report.json``
-unless ``--out`` says otherwise. ``--quick`` skips the canaries and the
-determinism runs, which load a month and run backtests. ``--only`` runs just
-the named checks (see :data:`CHECKS`).
+unless ``--out`` says otherwise. ``--quick`` skips the checks that load a
+month and run backtests: the law, the canaries, the latency and determinism
+runs. ``--only`` runs just the named checks (see :data:`CHECKS`).
 """
 
 from __future__ import annotations
@@ -54,8 +61,10 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, "1")
 
 import argparse
+import dataclasses
 import hashlib
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -66,7 +75,8 @@ from statistics import NormalDist
 import numpy as np
 
 import stable_finance as sf
-from experiments.run import RESULTS
+from experiments.run import BOOTSTRAP_DRAWS, RESULTS
+from stable_finance.evaluation._grid import _rankdata
 
 #: The closed-form transfer coefficient of each book on Gaussian signals and
 #: an identity covariance, as (selection, weighting) -> TC.
@@ -77,8 +87,20 @@ ANALYTIC_TC = {
     ("decile", "equal"): 2 * NormalDist().pdf(NormalDist().inv_cdf(0.9)) / np.sqrt(0.2),
     ("quintile", "equal"): 2 * NormalDist().pdf(NormalDist().inv_cdf(0.8)) / np.sqrt(0.4),
 }
-#: Fundamental-law ratios outside this band are flagged.
+#: Realized over predicted IR: a ratio whose interval lies wholly outside this
+#: band is flagged (see :func:`fundamental_law` for which side of it counts).
 LAW_BAND = (0.85, 1.15)
+#: The runs the law is read from, in order of preference: the expected-IC
+#: oracles of E1x, else E1's.
+LAW_RUNS = ("e1x_expected_ic", "e1_transfer_map")
+#: The books the identity-metric law describes: those built from the forecast
+#: alone. HRP and minimum variance size by the covariance, a transfer the
+#: identity-metric TC does not measure and the rank IC has no counterpart for.
+LAW_WEIGHTINGS = ("equal", "rank", "signal")
+#: The predictions realized IR is read against, as the report names them.
+LAW_PREDICTIONS = ("law", "value_dispersion")
+#: The harness's configuration fields, as the columns a row records them in.
+CONFIG_FIELDS = tuple(f.name for f in dataclasses.fields(sf.BacktestConfig))
 
 
 def _result(name: str, status: str, **numbers) -> dict:
@@ -93,6 +115,39 @@ def _rows(results: Path, name: str):
 
     path = results / name / "rows.parquet"
     return pd.read_parquet(path) if path.is_file() else None
+
+
+def _scalar(value):
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _missing(value) -> bool:
+    value = _scalar(value)
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
+def _row_config(row) -> sf.BacktestConfig:
+    """The configuration a row was written from, read back from its columns.
+
+    A field the row leaves blank -- a column the run wrote for other rows,
+    NaN or None here -- takes the default, as it did when the row ran; numpy
+    scalars become the Python values the configuration was built from.
+    """
+    settings = {}
+    for name in CONFIG_FIELDS:
+        if name in row and not _missing(row[name]):
+            value = _scalar(row[name])
+            settings[name] = tuple(value) if isinstance(value, (list, np.ndarray)) else value
+    return sf.BacktestConfig(**settings)
+
+
+def _row_forecast(row) -> dict:
+    """The forecast spec a row was written from: its kind and ``f_`` columns, blanks left out."""
+    spec = {"kind": _scalar(row["forecast"])}
+    for key, value in row.items():
+        if key.startswith("f_") and not _missing(value):
+            spec[key[2:]] = _scalar(value)
+    return spec
 
 
 # ── checks that need no run ────────────────────────────────────────────────
@@ -118,39 +173,250 @@ def analytic_transfer_coefficients(n_assets: int = 2000, n_decisions: int = 100,
                    worst_abs_error=float(worst), tolerance=tolerance, detail=measured)
 
 
-# ── checks on finished runs ────────────────────────────────────────────────
+# ── the fundamental law ────────────────────────────────────────────────────
+
+def _row_correlation(left: np.ndarray, right: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Pearson correlation of each row's entries under ``mask``; NaN below three of them."""
+    n = mask.sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        x = np.where(mask, left, 0.0)
+        y = np.where(mask, right, 0.0)
+        x = np.where(mask, x - x.sum(axis=1, keepdims=True) / n[:, None], 0.0)
+        y = np.where(mask, y - y.sum(axis=1, keepdims=True) / n[:, None], 0.0)
+        out = (x * y).sum(axis=1) / np.sqrt((x * x).sum(axis=1) * (y * y).sum(axis=1))
+    return np.where((n >= 3) & np.isfinite(out), out, np.nan)
+
+
+def formation_statistics(mu: np.ndarray, outcome: np.ndarray,
+                         screened: np.ndarray) -> dict[str, np.ndarray]:
+    """Each row's rank IC, value IC, outcome dispersion and breadth over the screen.
+
+    Rows are decisions -- here the formations of a held book -- and the
+    cross-section is the screened names with a known forecast and a known
+    outcome, the names the harness scores its IC on. The rank IC is the
+    harness's (:func:`~stable_finance.grouped_rank_ic` on one decision); the
+    value IC is the Pearson correlation a signal book's P&L carries; the
+    dispersion is the outcome's cross-sectional standard deviation. A row
+    whose outcome is never known has breadth 0 and NaN for the rest.
+    """
+    known = screened & np.isfinite(mu) & np.isfinite(outcome)
+    rank_mu, rank_outcome = np.full(mu.shape, np.nan), np.full(mu.shape, np.nan)
+    dispersion = np.full(len(mu), np.nan)
+    for t in np.flatnonzero(known.any(axis=1)):
+        m = known[t]
+        rank_mu[t, m], rank_outcome[t, m] = _rankdata(mu[t, m]), _rankdata(outcome[t, m])
+        dispersion[t] = outcome[t, m].std()
+    return {"ic_rank": _row_correlation(rank_mu, rank_outcome, known),
+            "ic_value": _row_correlation(mu, outcome, known),
+            "dispersion": dispersion, "breadth": known.sum(axis=1)}
+
+
+def identity_tc(book: np.ndarray, alpha: np.ndarray, screened: np.ndarray) -> np.ndarray:
+    """Each row's transfer coefficient in the identity metric: corr(weights, alpha).
+
+    The metric the analytic transfer coefficients and the rank IC both live
+    in, where the harness's own TC whitens by the covariance. It reads the
+    screened names, a name the book does not hold counting as a zero weight,
+    with roundoff residue zeroed under the harness's threshold.
+    """
+    held = np.where(np.isfinite(book) & (np.abs(book) <= 1e-12), 0.0, book)
+    return _row_correlation(held, alpha, screened & np.isfinite(held) & np.isfinite(alpha))
+
+
+def day_draws(day, n_draws: int = BOOTSTRAP_DRAWS, seed: int = 0) -> np.ndarray:
+    """Period weights for a day bootstrap: row 0 the sample itself, then one row per draw.
+
+    Each draw resamples the days with replacement, and a period counts as
+    often as its day was drawn, so a statistic computed under every row is
+    its sampling distribution with the within-day correlation kept. The
+    draws are the ones :func:`experiments.run._inference` makes for a row's
+    daily intervals: the same generator, seed and number of days.
+    """
+    _, index = np.unique(np.asarray(day), return_inverse=True)
+    n = int(index.max()) + 1
+    draws = np.random.default_rng(seed).integers(0, n, size=(n_draws, n))
+    counts = np.zeros((n_draws, n))
+    np.add.at(counts, (np.arange(n_draws)[:, None], draws), 1.0)
+    return np.vstack([np.ones(len(index)), counts[:, index]])
+
+
+def _moments(weights: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and sample sd of ``values`` under each row of period weights; NaN drops out."""
+    known = np.isfinite(values)
+    w, v = weights[:, known], values[known]
+    total = w.sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = w @ v / total
+        var = (w * (v[None, :] - mean[:, None]) ** 2).sum(axis=1) / (total - 1)
+    return mean, np.sqrt(var)
+
+
+def law_draws(gross: np.ndarray, tc: np.ndarray, stats: dict[str, np.ndarray],
+              weights: np.ndarray) -> dict[str, np.ndarray]:
+    """Realized IR and its two predictions under each row of ``weights``.
+
+    ``gross`` is the book's P&L at each formation, ``tc`` its identity TC
+    there and ``stats`` the formations' :func:`formation_statistics`. EVERY
+    FACTOR READS THE SAME PERIODS, the formations whose outcome is known: a
+    formation whose forward return is never known (the day's last, whose
+    return runs past the close) books nothing, and counting it as a zero
+    P&L in the IR while the IC skips it would mix two time bases. Returned,
+    per row of ``weights``:
+
+    * ``ir``: mean over sd of the P&L;
+    * ``law``: ``TC * IC * sqrt(N)`` from the mean TC, the mean rank IC and
+      the mean breadth;
+    * ``value_dispersion``: TC times the IR of ``IC_value * dispersion``,
+      which is a signal book's P&L period by period up to its scale: the law
+      with the forecast's own IR measured in the units the P&L is in, the
+      value IC's shortfall from the rank IC and the dispersion's swings kept;
+    * ``tc``, ``ic_rank``, ``ic_value``, ``breadth`` (the means) and
+      ``n_periods``.
+    """
+    known = np.isfinite(stats["ic_rank"]) & np.isfinite(stats["ic_value"])
+    w = weights[:, known]
+    mean, sd = _moments(w, gross[known])
+    tc_mean = _moments(w, tc[known])[0]
+    ic_rank = _moments(w, stats["ic_rank"][known])[0]
+    ic_value = _moments(w, stats["ic_value"][known])[0]
+    breadth = _moments(w, stats["breadth"][known].astype(np.float64))[0]
+    signal_mean, signal_sd = _moments(w, (stats["ic_value"] * stats["dispersion"])[known])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return {"ir": mean / sd, "law": tc_mean * ic_rank * np.sqrt(breadth),
+                "value_dispersion": tc_mean * signal_mean / signal_sd,
+                "tc": tc_mean, "ic_rank": ic_rank, "ic_value": ic_value, "breadth": breadth,
+                "n_periods": w.sum(axis=1)}
+
+
+def _ratio_interval(draws: np.ndarray) -> dict:
+    """The sample's ratio (row 0) and the 95% interval of the draws behind it."""
+    boot = draws[1:][np.isfinite(draws[1:])]
+    low, high = np.percentile(boot, [2.5, 97.5]) if len(boot) else (np.nan, np.nan)
+    return {"ratio": float(draws[0]), "low": float(low), "high": float(high)}
+
+
+def _law_inputs(out: Path, horizons) -> dict:
+    """The run's inputs, from the spec its manifest records (else the month pair)."""
+    from experiments.run import load_inputs
+
+    manifest = out / "manifest.json"
+    spec = json.loads(manifest.read_text()).get("spec") if manifest.is_file() else None
+    if spec is None:
+        spec = {"eval_month": "2020-08", "history_month": "2020-07",
+                "horizons": sorted(int(h) for h in horizons)}
+    return load_inputs(spec)
+
 
 def fundamental_law(results: Path) -> dict:
-    """Realized per-period IR over TC * IC * sqrt(N), per construction."""
+    """Realized IR of the random-error oracle's held books against the law, in one set of units.
+
+    The rows are E1x's random-placement oracles (E1's when there is no E1x),
+    held to the horizon, at EFQ 0 since gross does not depend on it, on the
+    books :data:`LAW_WEIGHTINGS` names. Each book is rebuilt from the run's
+    spec -- the forecast from the row's ``f_`` columns, the configuration from
+    its config columns -- and its saved gross series is checked against the
+    rebuild. The earlier version of this check read four mismatched factors
+    off the rows: a covariance-metric TC averaged over carried decisions
+    while P&L is booked only at formations, N the names held although the TC
+    spans the whole screen, and a rank IC over every decision; it reported
+    realized IR at 3-6 times the law. Here all of them are measured at the
+    formations (see :func:`law_draws`), and realized / predicted is reported
+    by IC as the median over seeds and books, with a 95% interval from one
+    set of day draws shared by every row.
+
+    The law is a small-IC approximation that a book's realized IR falls
+    short of as IC grows (Clarke, de Silva and Thorley 2005): the value IC
+    drops below the rank IC and the P&L inherits the dispersion's swings.
+    The value-IC x dispersion prediction keeps both, so it is held to
+    :data:`LAW_BAND` on both sides; the law only from above, a realized IR
+    beating it beyond its interval being what a look-ahead or a unit error
+    would produce. Either is a FLAG to investigate, not a pipeline failure;
+    a rebuild that does not reproduce the saved P&L is a FAIL.
+    """
     import pandas as pd
 
-    frames = [f for f in (_rows(results, "e6_sanity_checks"), _rows(results, "e1_transfer_map"))
-              if f is not None]
-    if not frames:
-        return _result("fundamental law", "SKIP", reason="no E6 or E1 rows")
-    rows = pd.concat(frames, ignore_index=True)
-    rows = rows[(rows["efq"] == 0.0) & (rows["information_coefficient"].abs() > 1e-3)
-                & np.isfinite(rows["transfer_coefficient"])]
+    from experiments.run import make_forecast
+    from stable_finance.evaluation import backtest
+
+    name = "fundamental law"
+    out = next((results / n for n in LAW_RUNS
+                if (results / n / "rows.parquet").is_file()
+                and (results / n / "series.npz").is_file()), None)
+    if out is None:
+        return _result(name, "SKIP", reason="no E1x or E1 run with series")
+    rows = pd.read_parquet(out / "rows.parquet")
+    rows = rows[(rows["forecast"] == "oracle") & (rows["f_noise"] == "random")
+                & (rows["rebalance"] == "horizon") & rows["weighting"].isin(LAW_WEIGHTINGS)
+                & (rows["efq"] == 0.0) & (rows["f_ic"] > 0) & (rows["f_ic"] < 0.5)]
     if rows.empty:
-        return _result("fundamental law", "SKIP", reason="no frictionless rows with an IC")
-    ir = rows["sharpe_mid"] / np.sqrt(rows["periods_per_year"])
-    law = rows["transfer_coefficient"] * rows["information_coefficient"] * np.sqrt(
-        rows["mean_names_held"])
-    rows = rows.assign(ratio=ir / law)
-    exact = rows["f_noise"].isin(["tails", "middle"]) if "f_noise" in rows else False
-    by = {}
-    for (kind, weighting), part in rows.groupby([np.where(exact, "exact IC", "expected IC"),
-                                                 "weighting"]):
-        by[f"{kind}/{weighting}"] = float(part["ratio"].median())
-    # Only small-IC, expected-IC rows are held to the band: the law is a
-    # small-IC approximation and does not describe an exact-IC oracle. A
-    # ratio outside it is a FLAG to investigate, not a pipeline failure.
-    expected_ic = {k: v for k, v in by.items() if k.startswith("expected")}
-    outside = [k for k, v in expected_ic.items() if not LAW_BAND[0] <= v <= LAW_BAND[1]]
-    status = "PASS" if expected_ic and not outside else ("FLAG" if outside else "SKIP")
-    return _result("fundamental law (expected-IC rows)", status,
-                   median_ratio_by_construction=by, outside_band=outside, band=list(LAW_BAND),
-                   n_rows=len(rows))
+        return _result(name, "SKIP", reason=f"no random-error held rows in {out.name}")
+    inputs = _law_inputs(out, rows["eval_horizon"].unique())
+    realized, series = inputs["realized"], np.load(out / "series.npz")
+    keys = [json.dumps(_row_forecast(r), sort_keys=True, default=str) for _, r in rows.iterrows()]
+    sigmas, draws, by_ic, entries, worst = {}, {}, {}, [], 0.0
+    for (key, horizon), part in rows.groupby([keys, "eval_horizon"], sort=False):
+        forecast = make_forecast(json.loads(key), inputs)
+        hi = int(np.flatnonzero(realized.horizons == horizon)[0])
+        context = backtest._prepare(forecast, realized, inputs["market"], inputs["days"], hi)
+        formed = backtest._formations(context)
+        mu, outcome = context["mu"][formed], context["outcome_values"][formed]
+        if horizon not in draws:
+            draws[horizon] = day_draws(context["day"][formed])
+        stats = {}
+        for _, row in part.iterrows():
+            config = _row_config(row)
+            gross = series[row["row_id"]][0] if row["row_id"] in series.files else None
+            if gross is None or len(gross) != formed.sum():
+                continue
+            risk = (hi, config.risk_model, config.shrinkage)
+            if risk not in sigmas:
+                sigmas[risk] = backtest._risk(context, config, inputs["history"], realized,
+                                              None, hi)
+            weights, alpha = backtest._book(context, config, sigmas[risk])
+            fills = backtest._fills_toward(context, backtest._hold_from(weights, formed), config)
+            held = sf.positions_from_fills(fills).values[:, :, 0][formed]
+            # The rebuild must be the row: its gross at each formation is the saved series.
+            rebuilt = np.where(np.isfinite(held) & np.isfinite(outcome), held * outcome,
+                               0.0).sum(axis=1)
+            worst = max(worst, float(np.max(np.abs(rebuilt - gross))))
+            screened = sf.apply_screen(config.universe, context["spread"],
+                                       shape=context["mu"].shape)[formed]
+            if config.universe not in stats:
+                stats[config.universe] = formation_statistics(mu, outcome, screened)
+            result = law_draws(gross, identity_tc(held, alpha[formed], screened),
+                               stats[config.universe], draws[horizon])
+            ratios = {p: result["ir"] / result[p] for p in LAW_PREDICTIONS}
+            by_ic.setdefault(float(row["f_ic"]), []).append(ratios)
+            entries.append({
+                "ic": float(row["f_ic"]), "seed": _scalar(row.get("f_seed")),
+                "horizon": int(horizon), "weighting": row["weighting"],
+                "selection": row["selection"],
+                **{k: float(result[k][0]) for k in ("ir", *LAW_PREDICTIONS, "tc", "ic_rank",
+                                                    "ic_value", "breadth")},
+                **{f"ratio_{p}": float(ratios[p][0]) for p in LAW_PREDICTIONS},
+                "names_held": float(row["mean_names_held"]),
+                "n_periods": int(result["n_periods"][0])})
+    if not entries:
+        return _result(name, "SKIP", reason=f"no row of {out.name} has a series to rebuild")
+    pooled = {}
+    for ic in sorted(by_ic):
+        pooled[f"{ic:g}"] = {"ic": ic, "n_rows": len(by_ic[ic]), **{
+            p: _ratio_interval(np.median(np.stack([r[p] for r in by_ic[ic]]), axis=0))
+            for p in LAW_PREDICTIONS}}
+    above = [k for k, e in pooled.items() if e["law"]["low"] > LAW_BAND[1]]
+    unexplained = [k for k, e in pooled.items() if e["value_dispersion"]["high"] < LAW_BAND[0]
+                   or e["value_dispersion"]["low"] > LAW_BAND[1]]
+    status = "FAIL" if worst > 1e-12 else ("FLAG" if above or unexplained else "PASS")
+    first, last = pooled[min(pooled, key=float)], pooled[max(pooled, key=float)]
+    span = {p: f"{first[p]['ratio']:.2f} at IC {first['ic']:g} -> "
+               f"{last[p]['ratio']:.2f} at IC {last['ic']:g}" for p in LAW_PREDICTIONS}
+    return _result(name, status, run=out.name, n_rows=len(entries),
+                   ratio_law=span["law"], ratio_value_dispersion=span["value_dispersion"],
+                   law_above_band=above, value_dispersion_outside_band=unexplained,
+                   band=list(LAW_BAND), rebuild_error=worst, pooled_by_ic=pooled, rows=entries)
+
+
+# ── checks on finished runs ────────────────────────────────────────────────
 
 
 def exact_ic_invariance(results: Path) -> dict:
@@ -341,7 +607,7 @@ def determinism() -> dict:
 #: Every check in report order, as (name, takes the results directory, loads a month).
 CHECKS = (
     ("analytic_transfer_coefficients", False, False),
-    ("fundamental_law", True, False),
+    ("fundamental_law", True, True),
     ("exact_ic_invariance", True, False),
     ("placebo", True, False),
     ("invariance_at_one", True, False),

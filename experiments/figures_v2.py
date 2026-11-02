@@ -5,9 +5,14 @@ walk-forward outputs) in light and dark variants with the palette and helpers
 of :mod:`experiments.figures`, and is skipped, with a note, when its inputs do
 not exist yet:
 
-* ``law``: realized per-period IR against ``TC * IC * sqrt(N)`` (the
-  fundamental law with the transfer coefficient), one point per row of the
-  expected-IC runs, coloured by construction, with the 45-degree line;
+* ``law``: realized IR per period against ``TC * IC * sqrt(N)`` (the
+  fundamental law with the transfer coefficient) with every factor measured
+  as ``experiments.sanity`` measures it -- the identity-metric TC and the rank
+  IC at the formations, N the screened universe -- one point per held book of
+  the random-error oracle, coloured by construction, beside the ratio
+  realized / predicted against IC with its 95% day-bootstrap interval, for
+  the law and for the value-IC x dispersion prediction; read from
+  ``<results>/sanity/report.json``;
 * ``daily_ci``: daily net Sharpe with its 95% day-bootstrap interval for each
   construction, at IC 0.03 and EFQ 0.7, per noise placement;
 * ``seeds``: the spread of daily Sharpe across oracle seeds, per construction,
@@ -54,34 +59,61 @@ def _weightings(frame) -> list[str]:
     return [w for w in WEIGHTING_ORDER if w in set(frame["weighting"])]
 
 
+#: The predictions the law figure draws the ratio for, as the legend names them.
+LAW_LINES = (("law", "law: TC x IC x sqrt(N)"),
+             ("value_dispersion", "value IC x dispersion"))
+
+
+def _law_report(results: Path) -> dict | None:
+    """The fundamental-law entry of the sanity report, when it has per-row numbers."""
+    import json
+
+    path = results / "sanity" / "report.json"
+    if not path.is_file():
+        return None
+    report = json.loads(path.read_text())
+    return next((r for r in report if r.get("check") == "fundamental law" and r.get("rows")),
+                None)
+
+
 def law(results: Path, out: Path, mode: str) -> list[Path]:
     import pandas as pd
 
-    frames = [f for f in (_rows(results, "e1x_expected_ic"), _rows(results, "e6_sanity_checks"))
-              if f is not None]
-    if not frames:
+    entry = _law_report(results)
+    if entry is None:
         return []
-    rows = pd.concat(frames, ignore_index=True)
-    rows = rows[(rows["efq"] == 0.0) & (rows["information_coefficient"].abs() > 1e-3)
-                & (rows["information_coefficient"] < 0.5)
-                & np.isfinite(rows["transfer_coefficient"])]
-    if rows.empty:
-        return []
+    rows = pd.DataFrame(entry["rows"])
+    pooled = pd.DataFrame(entry["pooled_by_ic"].values()).sort_values("ic")
     plt = _plt(mode)
-    ir = rows["sharpe_mid"] / np.sqrt(rows["periods_per_year"])
-    theory = rows["transfer_coefficient"] * rows["information_coefficient"] * np.sqrt(
-        rows["mean_names_held"])
-    fig, ax = plt.subplots(figsize=(5.2, 4.2))
+    fig, (left, right) = plt.subplots(1, 2, figsize=(10.4, 4.2))
     for w in _weightings(rows):
         part = rows["weighting"] == w
-        ax.scatter(theory[part], ir[part], s=14, alpha=0.8, color=_color(mode, w, WEIGHTING_ORDER),
-                   label=LABELS[w])
-    top = float(np.nanmax([theory.max(), ir.max()]))
-    ax.plot([0, top], [0, top], color=INK[mode]["axis"], linewidth=1, label="law")
-    ax.set_xlabel("TC x IC x sqrt(N)  (per period)")
-    ax.set_ylabel("Realized IR per period (gross)")
-    ax.set_title("The fundamental law, expected-IC oracles")
-    ax.legend(fontsize=7)
+        left.scatter(rows["law"][part], rows["ir"][part], s=14, alpha=0.8,
+                     color=_color(mode, w, WEIGHTING_ORDER), label=LABELS[w])
+    top = float(np.nanmax([rows["law"].max(), rows["ir"].max()]))
+    left.plot([0, top], [0, top], color=INK[mode]["axis"], linewidth=1, label="law")
+    left.set_xlabel("TC x IC x sqrt(N)  (identity-metric TC and rank IC at formations)")
+    left.set_ylabel("Realized IR per period (gross)")
+    left.set_title("Realized IR against the law, per held book")
+    left.legend(fontsize=7)
+    low, high = entry["band"]
+    right.axhspan(low, high, color=INK[mode]["grid"], label=f"sanity band {low:g}-{high:g}")
+    right.axhline(1.0, color=INK[mode]["axis"], linewidth=1)
+    for k, (name, label) in enumerate(LAW_LINES):
+        ratio, lower, upper = (np.array([g[key] for g in pooled[name]])
+                               for key in ("ratio", "low", "high"))
+        x = pooled["ic"].to_numpy() * (0.96 if k == 0 else 1.04)
+        right.errorbar(x, ratio, yerr=[ratio - lower, upper - ratio], fmt="o-", capsize=2,
+                       linewidth=1.2, color=(INK[mode]["primary"] if k == 0 else SEQUENTIAL[4]),
+                       label=label)
+    right.set_xscale("log")
+    right.set_xticks(pooled["ic"], [f"{ic:g}" for ic in pooled["ic"]])
+    right.minorticks_off()
+    right.set_xlabel("Forecast IC")
+    right.set_ylabel("Realized / predicted IR (95% CI)")
+    right.set_title("Median over seeds and constructions")
+    right.legend(fontsize=7)
+    fig.suptitle("The fundamental law in one set of units, random-error oracle")
     path = _save(fig, out, "law", mode)
     plt.close(fig)
     return [path]

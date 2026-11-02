@@ -1,0 +1,140 @@
+"""experiments/sanity.py: the checks' statistics, on synthetic panels with known answers.
+
+The checks themselves read finished runs and a cached month; what is tested
+here is the arithmetic each one rests on, where a wrong unit or a pooled
+sample would pass silently.
+"""
+
+import numpy as np
+import pytest
+
+import stable_finance as sf
+from experiments import run, sanity
+from stable_finance.evaluation.scoring.ic import grouped_rank_ic
+
+# ── the fundamental law ─────────────────────────────────────────────────────
+
+
+def _panel(seed=0, n_periods=400, n_assets=300, ic=0.1):
+    """Forecasts with a target value IC, outcomes whose dispersion varies by period."""
+    rng = np.random.default_rng(seed)
+    dispersion = np.exp(rng.normal(0.0, 0.4, n_periods))[:, None] * 1e-3
+    z = rng.standard_normal((n_periods, n_assets))
+    outcome = dispersion * z
+    mu = ic * z + np.sqrt(1 - ic**2) * rng.standard_normal((n_periods, n_assets))
+    return mu, outcome
+
+
+def test_row_correlation_matches_numpy_on_each_row_and_needs_three_names():
+    rng = np.random.default_rng(0)
+    left, right = rng.standard_normal((2, 5, 40))
+    mask = rng.random((5, 40)) > 0.3
+    mask[4] = False
+    mask[4, :2] = True
+    got = sanity._row_correlation(left, right, mask)
+    for t in range(4):
+        m = mask[t]
+        assert got[t] == pytest.approx(np.corrcoef(left[t, m], right[t, m])[0, 1], abs=1e-12)
+    assert np.isnan(got[4])
+
+
+def test_formation_statistics_score_the_harness_rank_ic_and_skip_an_unknown_outcome():
+    mu, outcome = _panel(n_periods=30)
+    outcome[-1] = np.nan                       # a formation whose forward return is never known
+    screened = np.ones(mu.shape, dtype=bool)
+    screened[:, :10] = False
+    stats = sanity.formation_statistics(mu, outcome, screened)
+    for t in range(29):
+        expected = grouped_rank_ic(np.where(screened, mu, np.nan)[t:t + 1], outcome[t:t + 1])
+        assert stats["ic_rank"][t] == pytest.approx(expected.mean, abs=1e-12)
+        assert stats["dispersion"][t] == pytest.approx(outcome[t, 10:].std(), rel=1e-12)
+    assert np.isnan(stats["ic_rank"][-1]) and np.isnan(stats["ic_value"][-1])
+    assert stats["breadth"][0] == 290 and stats["breadth"][-1] == 0
+
+
+def test_identity_tc_is_one_for_a_signal_book_and_sqrt_two_over_pi_for_signs():
+    rng = np.random.default_rng(1)
+    alpha = rng.standard_normal((50, 2000))
+    screened = np.ones(alpha.shape, dtype=bool)
+    signal = alpha - alpha.mean(axis=1, keepdims=True)
+    assert np.allclose(sanity.identity_tc(signal, alpha, screened), 1.0)
+    signs = np.sign(alpha) + 1e-13 * (alpha > 0)   # roundoff residue is not a position
+    assert np.mean(sanity.identity_tc(signs, alpha, screened)) == pytest.approx(
+        np.sqrt(2 / np.pi), abs=0.01)
+
+
+def test_day_draws_start_from_the_full_sample_and_resample_run_days():
+    day = np.repeat(np.arange(5), 3)
+    weights = sanity.day_draws(day, n_draws=200)
+    assert weights.shape == (201, 15)
+    assert np.all(weights[0] == 1.0)
+    assert np.all(weights[1:].sum(axis=1) == 15)                 # five days of three periods
+    assert np.all(weights[:, ::3] == weights[:, 1::3])           # a day is drawn whole
+    draws = np.random.default_rng(0).integers(0, 5, size=(200, 5))
+    assert weights[1, ::3].tolist() == np.bincount(draws[0], minlength=5).tolist()
+
+
+def test_moments_weight_periods_and_ignore_unknown_values():
+    values = np.array([1.0, 2.0, np.nan, 4.0])
+    weights = np.array([[1.0, 1.0, 1.0, 1.0], [2.0, 0.0, 5.0, 1.0]])
+    mean, sd = sanity._moments(weights, values)
+    assert mean[0] == pytest.approx(7 / 3) and sd[0] == pytest.approx(np.std([1, 2, 4], ddof=1))
+    assert mean[1] == pytest.approx(2.0) and sd[1] == pytest.approx(np.std([1, 1, 4], ddof=1))
+
+
+def test_law_draws_explain_a_signal_book_by_value_ic_times_dispersion():
+    mu, outcome = _panel(ic=0.1)
+    screened = np.ones(mu.shape, dtype=bool)
+    book = mu - mu.mean(axis=1, keepdims=True)
+    book *= 2.0 / np.abs(book).sum(axis=1, keepdims=True)
+    gross = (book * outcome).sum(axis=1)
+    stats = sanity.formation_statistics(mu, outcome, screened)
+    tc = sanity.identity_tc(book, mu, screened)
+    weights = sanity.day_draws(np.repeat(np.arange(20), 20))
+    result = sanity.law_draws(gross, tc, stats, weights)
+    # P&L is the value IC times the dispersion, up to the forecast's shape.
+    assert result["ir"][0] / result["value_dispersion"][0] == pytest.approx(1.0, abs=0.02)
+    # A varying dispersion costs IR the law does not see.
+    assert result["ir"][0] < result["law"][0]
+    assert result["breadth"][0] == 300 and result["n_periods"][0] == 400
+    assert np.all(np.isfinite(result["ir"]))
+
+
+def test_law_draws_leave_a_formation_without_a_known_return_out_of_every_factor():
+    mu, outcome = _panel(n_periods=60)
+    screened = np.ones(mu.shape, dtype=bool)
+    book = mu - mu.mean(axis=1, keepdims=True)
+    gross = (book * outcome).sum(axis=1)
+    weights = sanity.day_draws(np.repeat(np.arange(6), 10), n_draws=50)
+    kept = sanity.law_draws(gross, sanity.identity_tc(book, mu, screened),
+                            sanity.formation_statistics(mu, outcome, screened), weights)
+    dead = outcome.copy()
+    dead[9::10] = np.nan                       # the last formation of each day books nothing
+    gross_dead = np.where(np.isnan(dead).all(axis=1), 0.0, gross)
+    cut = sanity.law_draws(gross_dead, sanity.identity_tc(book, mu, screened),
+                           sanity.formation_statistics(mu, dead, screened), weights)
+    keep = ~np.isnan(dead).all(axis=1)
+    assert cut["n_periods"][0] == 54
+    assert cut["ir"][0] == pytest.approx(gross[keep].mean() / gross[keep].std(ddof=1), rel=1e-9)
+    assert cut["ir"][0] != pytest.approx(kept["ir"][0], rel=1e-6)
+
+
+def test_row_config_reads_back_the_configuration_a_row_was_written_from():
+    config = sf.BacktestConfig(weighting="rank", selection="decile", cost_model="cross", efq=0.7,
+                               risk_model="shrunk_sample", universe="all",
+                               annualization="decisions", rebalance="horizon")
+    row = {**config.__dict__, "sharpe_mid": 1.0, "equity": float("nan"), "alpha": None}
+    row = {k: (np.float64(v) if isinstance(v, float) else v) for k, v in row.items()}
+    assert sanity._row_config(row) == config
+
+
+def test_row_forecast_reads_back_an_oracle_spec():
+    pd = pytest.importorskip("pandas")
+    row = pd.Series({"forecast": "oracle", "f_ic": np.float64(0.03), "f_noise": "random",
+                     "f_scatter": None, "f_persistence": np.nan, "f_seed": np.int64(2),
+                     "weighting": "signal"})
+    spec = sanity._row_forecast(row)
+    assert spec == {"kind": "oracle", "ic": 0.03, "noise": "random", "seed": 2}
+    assert type(spec["seed"]) is int
+    assert run.forecast_specs({"forecasts": {"kind": "oracle", "ic": 0.03, "noise": "random",
+                                             "seed": 2}})[0]["seed"] == spec["seed"]
