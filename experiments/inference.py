@@ -45,9 +45,16 @@ book is built -- the daily net P&L is tested jointly:
   of trials set to the EFFECTIVE number of independent configurations, the
   participation ratio ``(sum lambda)^2 / sum lambda^2`` of the eigenvalues of
   the configurations' return correlation matrix: twenty configurations that
-  hold nearly the same book are closer to one trial than to twenty;
+  hold nearly the same book are closer to one trial than to twenty. The
+  variance of a skill-less trial's Sharpe comes from the null -- each
+  configuration's daily P&L demeaned and resampled by the stationary
+  bootstrap -- not from the spread of the configurations' own Sharpe
+  ratios, which their different costs dominate. The hurdle and the Sharpe
+  it is compared with are per day (``*_per_day``); ``best_sharpe_daily``
+  and ``*_annual`` are the same annualized by ``sqrt(252)``;
 * the probability of backtest overfitting by combinatorially symmetric
-  cross-validation over blocks of days.
+  cross-validation over blocks of days. It and the deflated Sharpe's trials
+  count distinct configurations only, as the confidence sets do.
 
 MCS, SPA and StepM come from ``arch``, with its stationary bootstrap. Its
 SPA (and StepM, which runs it) does not divide the statistic by the loss
@@ -722,6 +729,30 @@ def mcs_by_loss(loss: np.ndarray, ids: list[str], first: np.ndarray, representat
     return summary, rows
 
 
+def null_sharpe_variance(matrix: np.ndarray, index: np.ndarray, chunk: int = 64) -> np.ndarray:
+    """Each column's sampling variance of the per-day Sharpe under a zero mean.
+
+    The deflated Sharpe's hurdle is the best Sharpe a sweep of SKILL-LESS
+    trials would show, so the variance it needs is that of a trial whose true
+    Sharpe is zero. Each column is demeaned -- its true Sharpe set to zero,
+    its volatility, fat tails and serial correlation kept -- and resampled on
+    ``index`` (``(reps, days)``, the group's stationary-bootstrap draws, the
+    same days for every column); the variance of the resampled per-day
+    Sharpe ratios is the column's null variance, about ``1 / days`` for iid
+    P&L. NaN for a flat column. Taken ``chunk`` columns at a time.
+    """
+    demeaned = matrix - matrix.mean(axis=0)
+    out = np.full(matrix.shape[1], np.nan)
+    for start in range(0, matrix.shape[1], chunk):
+        x = demeaned[:, start:start + chunk][index]  # (reps, days, columns)
+        with np.errstate(invalid="ignore", divide="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            sharpe = x.mean(axis=1) / x.std(axis=1, ddof=1)
+            sharpe[~np.isfinite(sharpe)] = np.nan
+            out[start:start + chunk] = np.nanvar(sharpe, axis=0, ddof=1)
+    return out
+
+
 def studentized_differences(benchmark: np.ndarray, models: np.ndarray,
                             block: int) -> np.ndarray:
     """``(L_benchmark - L_model) / omega``, the loss differentials Hansen's SPA tests.
@@ -846,6 +877,7 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
     # count. The first configuration with that P&L represents it; a
     # duplicate names it in duplicate_of and mirrors its results.
     first, representative = distinct_columns(pnl)
+    live = np.sort(first)
     summary["distinct_models"] = len(first)
     for j, r in enumerate(ids):
         per_row[r]["duplicate_of"] = None if representative[j] == j else ids[representative[j]]
@@ -907,18 +939,27 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
                     "sharpe_diff_low": test["low"] * scale,
                     "sharpe_diff_high": test["high"] * scale})
 
-    # Deflated Sharpe with the effective number of trials.
+    # Deflated Sharpe over the distinct configurations, with the effective
+    # number of trials and the variance of a skill-less trial's Sharpe taken
+    # from the null (null_sharpe_variance). The spread of the configurations'
+    # own Sharpes, the variance used before, measures how differently they
+    # pay costs, not how far noise moves a Sharpe; it is kept for comparison,
+    # as is 1 / (days - 1), the null variance of iid normal P&L.
+    scale = math.sqrt(DAYS_A_YEAR)
     sharpes = np.array([_sharpe(pnl[:, j]) for j in range(pnl.shape[1])])
-    finite = sharpes[np.isfinite(sharpes)]
-    variance = float(finite.var(ddof=1)) if len(finite) >= 2 else 0.0
-    n_eff_day, top_day = effective_trials(pnl)
+    finite = sharpes[live][np.isfinite(sharpes[live])]
+    cross = float(finite.var(ddof=1)) if len(finite) >= 2 else 0.0
+    index = stationary_indices(n, block_sb, reps, seed)
+    null = null_sharpe_variance(pnl[:, live], index)
+    variance = float(np.mean(null[np.isfinite(null)])) if np.isfinite(null).any() else 0.0
+    n_eff_day, top_day = effective_trials(pnl[:, live])
     n_eff_block = top_block = None
     if block_data is not None:
-        n_eff_block, top_block = effective_trials(block_data)
+        n_eff_block, top_block = effective_trials(block_data[:, live])
     n_eff = n_eff_block if n_eff_block is not None else n_eff_day
     trials = max(1, round(n_eff))
     hurdle = sf.expected_max_sharpe(trials, variance)
-    hurdle_all = sf.expected_max_sharpe(len(ids), variance)
+    hurdle_all = sf.expected_max_sharpe(len(live), variance)
     for j, r in enumerate(ids):
         per_row[r]["dsr_daily"] = sf.probabilistic_sharpe(pnl[:, j], benchmark=hurdle)
         per_row[r]["dsr_daily_all_trials"] = sf.probabilistic_sharpe(pnl[:, j],
@@ -928,17 +969,28 @@ def group_statistics(group, daily: dict, *, benchmark: str, which: int,
         "n_eff_day": n_eff_day, "top_eigen_share_day": top_day,
         "n_eff_block": n_eff_block, "top_eigen_share_block": top_block,
         "n_block_periods": None if block_data is None else int(block_data.shape[0]),
-        "n_eff_used": n_eff, "n_trials": trials, "sharpe_var_daily": variance,
-        "hurdle_daily": hurdle, "hurdle_annual": hurdle * math.sqrt(DAYS_A_YEAR),
-        "best_row_id": ids[best], "best_sharpe_daily": sharpes[best] * math.sqrt(DAYS_A_YEAR),
+        "n_eff_used": n_eff, "n_trials": trials, "n_trials_all": len(live),
+        "sharpe_var_per_day": variance,
+        "sharpe_var_source": ("null: each distinct configuration's daily P&L demeaned and "
+                              "resampled by the group's stationary bootstrap, the mean of "
+                              "their Sharpe variances"),
+        "sharpe_var_cross_per_day": cross, "sharpe_var_iid_per_day": 1.0 / (n - 1),
+        "hurdle_per_day": hurdle, "hurdle_annual": hurdle * scale,
+        "hurdle_cross_annual": sf.expected_max_sharpe(trials, cross) * scale,
+        "best_row_id": ids[best], "best_sharpe_per_day": sharpes[best],
+        "best_sharpe_daily": sharpes[best] * scale,
         "best_dsr": per_row[ids[best]]["dsr_daily"],
-        "best_dsr_all_trials": per_row[ids[best]]["dsr_daily_all_trials"]}
+        "best_dsr_all_trials": per_row[ids[best]]["dsr_daily_all_trials"],
+        "units": ("*_per_day: Sharpe of daily P&L, not annualized (the DSR compares "
+                  "best_sharpe_per_day with hurdle_per_day); best_sharpe_daily and *_annual: "
+                  f"the same Sharpe times sqrt({DAYS_A_YEAR:g}); variances per day squared")}
 
-    # Probability of backtest overfitting over blocks of days.
+    # Probability of backtest overfitting over blocks of days, distinct
+    # configurations only: a copy would take a rank of its own.
     blocks = pbo_blocks(n, pbo_n)
     if blocks >= 2:
         try:
-            result = sf.pbo(pnl, n_blocks=blocks)
+            result = sf.pbo(pnl[:, live], n_blocks=blocks)
             summary["pbo"] = {"probability": result.probability,
                               "probability_of_loss": result.probability_of_loss,
                               "n_blocks": blocks, "block_days": result.block_length,

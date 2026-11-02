@@ -114,3 +114,44 @@ def test_stepm_counts_distinct_superior_configurations():
         block=1, pbo_n=None, block_data=None)
     assert summary["stepm"]["superior"] == ["x", "y"]
     assert summary["stepm"]["superior_distinct"] == 1
+
+
+# ── the deflated Sharpe's null ──────────────────────────────────────────────
+
+def test_null_sharpe_variance_is_about_one_over_days_for_iid_pnl():
+    rng = np.random.default_rng(6)
+    pnl = np.column_stack([rng.normal(0.5, 1.0, N_DAYS), rng.normal(-3.0, 0.1, N_DAYS),
+                           np.zeros(N_DAYS)])
+    index = rng.integers(0, N_DAYS, size=(4000, N_DAYS))
+    variance = inference.null_sharpe_variance(pnl, index, chunk=2)
+    # Demeaned first, so neither column's own (large) Sharpe enters.
+    np.testing.assert_allclose(variance[:2], 1.0 / N_DAYS, rtol=0.15)
+    assert np.isnan(variance[2])
+
+
+def test_the_dsr_hurdle_comes_from_the_null_not_the_spread_of_costs():
+    rng = np.random.default_rng(7)
+    noise = rng.normal(0.0, 1.0, (N_DAYS, 4))
+    # Four books whose means differ by their cost: a wide cross-sectional
+    # spread of Sharpe ratios that says nothing about selection noise.
+    columns = {name: noise[:, k] - cost for k, (name, cost)
+               in enumerate(zip("abcd", (0.0, 0.5, 1.0, 1.5)))}
+    summary, per_row = _statistics(columns)
+    dsr = summary["dsr"]
+    assert dsr["sharpe_var_cross_per_day"] > 10 * dsr["sharpe_var_per_day"]
+    np.testing.assert_allclose(dsr["sharpe_var_per_day"], 1.0 / N_DAYS, rtol=0.3)
+    assert dsr["sharpe_var_iid_per_day"] == 1.0 / (N_DAYS - 1)
+    assert dsr["hurdle_per_day"] == inference.sf.expected_max_sharpe(
+        dsr["n_trials"], dsr["sharpe_var_per_day"])
+    scale = np.sqrt(inference.DAYS_A_YEAR)
+    assert dsr["hurdle_annual"] == dsr["hurdle_per_day"] * scale
+    assert dsr["best_sharpe_daily"] == dsr["best_sharpe_per_day"] * scale
+    assert dsr["best_dsr"] == per_row[dsr["best_row_id"]]["dsr_daily"]
+
+
+def test_dsr_and_pbo_count_a_copy_once():
+    rng = np.random.default_rng(8)
+    a, b = rng.normal(0.1, 1.0, N_DAYS), rng.normal(0.0, 1.0, N_DAYS)
+    summary, _ = _statistics({"a": a, "b": b, "a2": a.copy(), "a3": a.copy()})
+    assert summary["dsr"]["n_trials_all"] == 2
+    assert summary["dsr"]["n_eff_day"] <= 2.0
