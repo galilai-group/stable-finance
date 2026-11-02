@@ -26,8 +26,11 @@ decisions' P&L correlated. Three corrections are reported side by side:
 
 THE SECOND IS READING THE BEST OF A GRID AS AN ESTIMATE. Within each group of
 configurations that saw the same forecast -- by default every
-(forecast, horizon, EFQ) cell, so the configurations differ only in how the
-book is built -- the daily net P&L is tested jointly:
+(forecast, horizon, EFQ) cell, split further by any setting that changes
+what a book is scored on (returns label, latency, cost model, book size,
+fees) when the run varies it, so the configurations differ only in how the
+book is built; ``--group``/``--group-add`` or the spec's ``"inference"``
+entry change it -- the daily net P&L is tested jointly:
 
 * the Hansen-Lunde-Nason (2011) Model Confidence Set at 90%: the
   configurations statistically indistinguishable from the best, twice, each
@@ -154,6 +157,14 @@ MCS_LOSSES = {
                "ranks by daily {pnl} Sharpe"),
 }
 
+#: Row columns that set what a book is scored on -- the data (the returns
+#: label, the latency) or the cost it pays (cost model, book size, impact
+#: schedule, fees) -- rather than how it is built. Like the EFQ, a confidence
+#: set must not rank one value of them against another (the same book is
+#: always cheaper without fees or at a smaller size), so the default grouping
+#: adds each of them that varies within the run.
+SCORING_COLUMNS = ("returns", "latency", "cost_model", "equity", "execution_days", "fee_bps",
+                   "fee_per_share", "sec_fee_rate")
 #: Lag counts the Lo-adjusted Sharpe is also reported at, beside the default
 #: (``row_lags``), each in the row's periods (:func:`lo_lags`).
 LO_LAGS = {
@@ -1132,9 +1143,38 @@ def time_of_day(row_id: str, values: np.ndarray, labels) -> list[dict]:
 # ── the analysis ────────────────────────────────────────────────────────────
 
 def default_group(rows) -> list[str]:
-    """(forecast, horizon, EFQ): every forecast parameter, the horizon and the EFQ."""
+    """(forecast, horizon, EFQ), split by every scoring setting the rows do not share.
+
+    Every forecast parameter, the horizon and the EFQ, then each of
+    :data:`SCORING_COLUMNS` that takes more than one value in the run (a
+    missing value counts as one), so a group's configurations differ only in
+    how the book is built. A run that varies none of them keeps the
+    (forecast, horizon, EFQ) cells.
+    """
     keys = ["forecast", *[c for c in rows.columns if c.startswith("f_")], "eval_horizon", "efq"]
+    keys += [c for c in SCORING_COLUMNS
+             if c in rows and rows[c].astype(str).nunique(dropna=False) > 1]
     return [k for k in keys if k in rows]
+
+
+def group_keys(rows, spec: dict | None, group_by: list[str] | None = None,
+               group_add: list[str] | None = None) -> list[str]:
+    """The columns a run's groups are keyed by; ``["all"]`` for one group.
+
+    ``group_by`` (``--group``) replaces :func:`default_group`, and so does a
+    spec's ``"inference": {"group_by": [...]}`` when it is not given;
+    ``group_add`` (``--group-add``, else the spec's ``"group_add"``) appends
+    columns to whichever applies, as for a spec that varies a setting the
+    default would compare. Named columns must exist.
+    """
+    options = (spec or {}).get("inference", {})
+    keys = list(group_by or options.get("group_by") or default_group(rows))
+    added = list(group_add or options.get("group_add") or [])
+    keys = [k for k in keys if k != "all"] + [k for k in added if k not in keys]
+    missing = [k for k in keys if k not in rows]
+    if missing:
+        raise ValueError(f"cannot group by {missing}: not columns of the run's rows")
+    return keys or ["all"]
 
 
 def _group_name(keys: list[str], values) -> str:
@@ -1142,8 +1182,9 @@ def _group_name(keys: list[str], values) -> str:
 
 
 def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str] | None = None,
-            pnl: str = "net", reps: int = REPS, seed: int = 0, block: int | None = None,
-            lags: int | None = None, pbo_n: int | None = None) -> dict:
+            group_add: list[str] | None = None, pnl: str = "net", reps: int = REPS,
+            seed: int = 0, block: int | None = None, lags: int | None = None,
+            pbo_n: int | None = None) -> dict:
     """Run every statistic on ``results/<name>`` and write the outputs; returns the JSON."""
     import pandas as pd
 
@@ -1214,7 +1255,7 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
     stats_frame = pd.DataFrame(records)
 
     # Groups.
-    group_by = group_by or default_group(rows)
+    group_by = group_keys(rows, spec, group_by, group_add)
     which = PNL.index(pnl)
     horizons = {r: (int(h) if reb == "horizon" else 0)
                 for r, h, reb in zip(rows["row_id"], rows["eval_horizon"], rows["rebalance"])}
@@ -1396,7 +1437,11 @@ def main(argv=None) -> int:
                              f"group; ties go to the first row (default {DEFAULT_BENCHMARK!r})")
     parser.add_argument("--group", default=None,
                         help="comma-separated row columns to group by, or 'all' for one group "
-                             "(default: forecast, its parameters, eval_horizon, efq)")
+                             "(default: the spec's inference.group_by, else forecast, its "
+                             "parameters, eval_horizon, efq and any scoring setting that varies)")
+    parser.add_argument("--group-add", default=None,
+                        help="comma-separated row columns added to the grouping (default: the "
+                             "spec's inference.group_add)")
     parser.add_argument("--pnl", choices=PNL, default="net", help="series the group tests use")
     parser.add_argument("--reps", type=int, default=REPS)
     parser.add_argument("--seed", type=int, default=0)
@@ -1407,8 +1452,10 @@ def main(argv=None) -> int:
     parser.add_argument("--pbo-blocks", type=int, default=None)
     args = parser.parse_args(argv)
     group = args.group.split(",") if args.group else None
-    analyze(args.name, benchmark=args.benchmark, group_by=group, pnl=args.pnl, reps=args.reps,
-            seed=args.seed, block=args.block, lags=args.lags, pbo_n=args.pbo_blocks)
+    added = args.group_add.split(",") if args.group_add else None
+    analyze(args.name, benchmark=args.benchmark, group_by=group, group_add=added, pnl=args.pnl,
+            reps=args.reps, seed=args.seed, block=args.block, lags=args.lags,
+            pbo_n=args.pbo_blocks)
     return 0
 
 

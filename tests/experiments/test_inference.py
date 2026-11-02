@@ -183,3 +183,35 @@ def test_lo_ratio_under_corrects_an_overlapping_book_until_the_lags_cover_it():
     stats = inference.series_statistics(x, q=q, lags=k - 1)
     assert found["lo_ratio_cover"] == stats["lo_ratio"]
     assert found["sharpe_lo_cover"] == stats["sharpe_lo"]
+
+
+# ── grouping ────────────────────────────────────────────────────────────────
+
+def _grid_rows(**columns):
+    base = {"row_id": ["a", "b", "c", "d"], "forecast": ["oracle"] * 4, "f_ic": [0.03] * 4,
+            "eval_horizon": [900] * 4, "efq": [0.7] * 4, "weighting": ["signal", "hrp"] * 2,
+            "cost_model": ["cross"] * 4}
+    return pd.DataFrame({**base, **columns})
+
+
+def test_default_group_splits_by_a_scoring_setting_only_when_it_varies():
+    plain = _grid_rows(equity=[1e6] * 4)
+    assert inference.default_group(plain) == ["forecast", "f_ic", "eval_horizon", "efq"]
+    sizes = _grid_rows(equity=[1e5, 1e5, 1e6, 1e6])
+    assert inference.default_group(sizes)[-1] == "equity"
+    fees = _grid_rows(fee_per_share=[None, None, 0.003, 0.003])   # unset counts as a value
+    assert inference.default_group(fees)[-1] == "fee_per_share"
+
+
+def test_group_keys_take_the_cli_then_the_spec_then_the_default_and_append_additions():
+    rows = _grid_rows(universe=["all", "all", "tight", "tight"])
+    default = inference.default_group(rows)
+    assert inference.group_keys(rows, None) == default
+    spec = {"inference": {"group_by": ["forecast", "efq"], "group_add": ["universe"]}}
+    assert inference.group_keys(rows, spec) == ["forecast", "efq", "universe"]
+    assert inference.group_keys(rows, spec, ["f_ic"]) == ["f_ic", "universe"]
+    assert inference.group_keys(rows, None, group_add=["universe"]) == [*default, "universe"]
+    assert inference.group_keys(rows, None, ["all"]) == ["all"]
+    assert inference.group_keys(rows, None, ["all"], ["universe"]) == ["universe"]
+    with pytest.raises(ValueError, match="cannot group by"):
+        inference.group_keys(rows, None, group_add=["equity"])
