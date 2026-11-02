@@ -48,7 +48,8 @@ evaluation and from the risk history. The opening cross's quotes are stale and
 wide -- the half-spread there is several times any other decision's -- so a
 spec can ask whether a result is an artifact of trading into the open. The
 universe is chosen before the drop, so a run with and without the open scores
-the same names, and every row of such a run carries ``skip_open``.
+the same names, and every row of such a run carries ``skip_open``, which
+also enters its ``row_id``, so its rows never share an id with the open's.
 
 The two runs are not paired, though, so a difference between them is not the
 open's effect alone. Each day's grid starts at 09:35 instead, and a book held
@@ -567,7 +568,7 @@ def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0,
         row.update(_inference(report.series))
         row["row_id"] = hashlib.sha256(json.dumps(
             {k: row[k] for k in sorted(row) if k.startswith("f_") or k in
-             ("eval_horizon", *variant)} | {"label": report.config.label},
+             ("eval_horizon", *variant, "skip_open")} | {"label": report.config.label},
             sort_keys=True, default=str).encode()).hexdigest()[:16]
         rows.append(row)
         series[row["row_id"]] = np.stack([report.series.gross, report.series.net,

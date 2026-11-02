@@ -179,15 +179,15 @@ COST_MODEL_REQUIRES: dict[str, tuple[str, ...]] = {
 #: at 2.4%). The calibration covers 0.1% to 13% of daily volume.
 IMPACT_COEFFICIENTS = (0.0, -0.53, 11.21)
 
-#: A fourth ``impact`` coefficient, when given, is a FLOOR in basis points:
-#: every filled dollar pays at least it, whatever the schedule. Below the
-#: calibration's 0.1% of daily volume the square root drives the fitted cost
-#: toward ``a`` (zero by default), which a real order -- paying at least part
-#: of the spread and a fee -- does not reach; a floor such as the quoted
-#: half-spread keeps a small book from looking free. Under a schedule the
-#: impact is netted over each name's parent order but the floor is not (see
-#: :func:`_impact_fills`), so an order that shrinks or reverses its parent
-#: still pays it. Three coefficients mean no floor.
+# A fourth ``impact`` coefficient, when given, is a FLOOR in basis points:
+# every filled dollar pays at least it, whatever the schedule. Below the
+# calibration's 0.1% of daily volume the square root drives the fitted cost
+# toward ``a`` (zero by default), which a real order -- paying at least part
+# of the spread and a fee -- does not reach; a floor such as the quoted
+# half-spread keeps a small book from looking free. Under a schedule the
+# impact is netted over each name's parent order but the floor is not (see
+# :func:`_impact_fills`), so an order that shrinks or reverses its parent
+# still pays it. Three coefficients mean no floor.
 
 
 class ImpactStockCoefficients(NamedTuple):
@@ -668,7 +668,7 @@ def _equity(equity, model: str) -> float:
     return float(equity)
 
 
-def impact_cost(size: ArrayLike, *, coefficients: tuple[float, float, float] | None = None
+def impact_cost(size: ArrayLike, *, coefficients: tuple[float, ...] | None = None
                 ) -> NDArray[np.float64]:
     """Price impact of an order, as a fraction of the dollars traded.
 
@@ -702,6 +702,8 @@ def impact_cost(size: ArrayLike, *, coefficients: tuple[float, float, float] | N
     on every filled dollar even where a schedule nets the impact.
     """
     a, b, c, *rest = IMPACT_COEFFICIENTS if coefficients is None else coefficients
+    if len(rest) > 1:
+        raise ValueError("impact takes three coefficients, or four with a floor")
     x = np.asarray(size, dtype=np.float64)
     if (x < 0).any():
         raise ValueError("size is unsigned")
