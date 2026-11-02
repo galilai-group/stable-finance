@@ -150,6 +150,17 @@ class BacktestReport:
     the raw one because the transforms are what the book was asked to express;
     the IC is what scores the raw forecast. Below the forecast level there is
     no forecast to transfer, and it is NaN.
+
+    UNITS. ``mean_gross_return_bps`` and ``mean_cost_bps`` are means over the
+    periods of the profit path, in basis points of equity: per decision, per
+    held book under ``rebalance="horizon"``, or per day under
+    ``annualization="daily"``. ``mean_turnover`` is the two-way traded weight
+    -- the sum over names of the absolute change in weight, in units of
+    equity -- per decision, or per held book under ``rebalance="horizon"``,
+    whatever the annualization. Under the default ``annualization="decisions"``
+    the two share a basis, so ``mean_cost_bps / mean_turnover`` is the cost
+    per unit traded. ``mean_gross_exposure`` and ``mean_names_held`` are
+    means over decisions.
     """
 
     config: BacktestConfig
@@ -681,6 +692,11 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
     """
     mu, spread, day = context["mu"], context["spread"], context["day"]
     net = gross - costs
+    turnover = turnover_per_asset.sum(axis=1)
+    if config.rebalance == "horizon":
+        # Turnover per held book, the basis its cost is reported on: the
+        # trades into a book and any while it is carried are one rebalance.
+        turnover = np.add.reduceat(turnover, np.flatnonzero(_formations(context)))
 
     if config.annualization == "daily":
         order = np.argsort(day, kind="stable")
@@ -740,7 +756,7 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
         sharpe_net=sharpe_ratio(net, periods_per_year=periods_per_year),
         mean_gross_return_bps=float(np.nanmean(gross) * 1e4),
         mean_cost_bps=float(np.nanmean(costs_series) * 1e4),
-        mean_turnover=float(turnover_per_asset.sum(axis=1).mean()),
+        mean_turnover=float(turnover.mean()),
         mean_gross_exposure=float(np.abs(values).sum(axis=1).mean()),
         periods_per_year=float(periods_per_year),
         n_periods=int(len(net)),

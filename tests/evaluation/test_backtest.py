@@ -788,6 +788,25 @@ def test_a_held_cost_aware_book_drops_its_view_where_the_return_is_never_known()
     assert [r.as_dict() for r in swept] == [r.as_dict() for r in alone]
 
 
+def test_a_held_book_reports_its_turnover_per_book_as_it_does_its_cost():
+    # The trades of a held book are folded into one period per book, and its
+    # turnover is too, so cost over turnover is the cost per unit traded.
+    setup = held_world(unknown=np.zeros(80, bool))
+    report = run_backtest(**setup, config=HELD)
+    mu = setup["forecast"].values[:, :, 0]
+    weights = weight_book("equal", select_book("all", mu, np.ones(mu.shape, bool)), mu,
+                          np.eye(6), gross_exposure=HELD.gross_exposure)
+    held = weights[np.arange(80) - np.tile(np.arange(8), 10) % 3]
+    traded = run_backtest(PortfolioWeights(held[:, :, None], setup["forecast"].decisions,
+                                           ASSETS, AXIS),
+                          setup["realized"], half_spread=setup["half_spread"],
+                          days=setup["days"], config=HELD.replace(rebalance="every_decision"))
+    assert report.n_periods == 30
+    assert report.mean_turnover == pytest.approx(traded.mean_turnover * 80 / 30, rel=1e-12)
+    assert report.mean_cost_bps / report.mean_turnover == pytest.approx(
+        traded.mean_cost_bps / traded.mean_turnover, rel=1e-12)
+
+
 def test_horizon_rebalancing_needs_decision_times_and_one_step_drift_is_refused():
     w = world()
     named = np.array([f"d{i}" for i in range(80)])
