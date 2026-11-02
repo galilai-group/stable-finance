@@ -36,9 +36,12 @@ advance, and prints PASS, FAIL or SKIP with the numbers behind it:
 * INVARIANCE AT IC 1. E6's tails, middle and random oracles at IC 1 are the
   same forecast and must give identical rows.
 * LOOK-AHEAD CANARIES, on the real month: the realized forward return used as
-  its own forecast must give an absurd Sharpe; each extra decision of lag must
-  lower it; the forecast shifted by one day (yesterday's move at the same
-  time) must give about nothing.
+  its own forecast must give an absurd Sharpe, and the same return shifted
+  far enough to end before the decision -- the first lag clear of the
+  forward window, and one day -- must stay an order of magnitude below it.
+  Lag 1 shares the post-decision VWAP minute with its target and is reported
+  only. The canary catches a misalignment of whole decisions, not a leak of
+  seconds or one entering outside the forecast.
 * COST IDENTITY. From every saved series: net is exactly gross minus cost, and
   each row's break-even EFQ is recomputed from its own series, with how many
   rows each covers.
@@ -597,27 +600,82 @@ def _shifted(values: np.ndarray, lag: int) -> np.ndarray:
     return out
 
 
+#: The store's forward returns run between 60-second VWAPs, the first starting
+#: strictly after the decision (:mod:`experiments.month_cache`), so the return
+#: booked at a decision ends this long after the decision plus its horizon.
+VWAP_SECONDS = 60
+
+
+def _decision_spacing(decisions) -> float:
+    """Seconds between consecutive decisions of one day, from ``"date|anchor"`` labels."""
+    parts = np.char.partition(np.asarray(decisions).astype(str), "|")
+    gaps = np.diff(parts[:, 2].astype(np.float64))[parts[1:, 0] == parts[:-1, 0]]
+    return float(np.median(gaps[gaps > 0]))
+
+
+def first_causal_lag(horizon: int, spacing: float, vwap_seconds: int = VWAP_SECONDS) -> int:
+    """The fewest decisions a realized return must be shifted by to end before the decision.
+
+    The return booked ``lag`` decisions earlier ends ``horizon + vwap_seconds``
+    after that decision, so it is known at this one once ``lag * spacing``
+    covers that: lag 2 for a 300-second horizon on 300-second decisions.
+    """
+    return max(math.ceil((horizon + vwap_seconds) / spacing), 1)
+
+
 def lookahead_canaries() -> dict:
-    """Perfect foresight is absurd, lags decay, a one-day shift is about nothing."""
+    """Perfect foresight is absurd; a shifted return that ends before the decision is far below it.
+
+    The forecast is the realized forward return itself, shifted by:
+
+    * 0 decisions, perfect foresight, which must be absurd: the forecast and
+      the return it is scored against are aligned;
+    * 1 decision, reported only. With a 300-second horizon that return ends
+      at the VWAP minute after THIS decision, the window the scored return
+      starts from, so it shares it with its target and is not causal;
+    * :func:`first_causal_lag` decisions and one day (the same time
+      yesterday), whose returns ended before the decision: causal forecasts,
+      which must stay an order of magnitude below perfect foresight.
+
+    WHAT IT CAN DETECT: a misalignment of whole decisions between forecast
+    and outcome, a forecast that sees its own return or a return series
+    shifted so that a causal forecast does, which turns one of the causal
+    Sharpe ratios absurd. WHAT IT CANNOT: a leak of seconds (a feature that
+    reads part of the post-decision VWAP minute, as lag 1 does), information
+    that enters through the universe screen, the risk history or the cost
+    quotes instead of the forecast, or a leak far weaker than foresight. Nor
+    does it test that the lags decay: their Sharpe ratios are noise around
+    zero (each one's iid t is reported), and so is any gap between them.
+    """
+    from experiments.run import _inference
+
     inputs = _month()
     realized = inputs["realized"]
     config = sf.BacktestConfig(weighting="signal", selection="all", cost_model="mid",
                                risk_model="diagonal", annualization="decisions")
+    causal = first_causal_lag(int(realized.horizons[0]), _decision_spacing(realized.decisions))
     per_day = int(np.median(np.unique(inputs["days"], return_counts=True)[1]))
-    sharpe = {}
-    for name, lag in (("same decision", 0), ("lag 1", 1), ("lag 2", 2), ("one day", per_day)):
+    shifts = {"same decision": 0, "lag 1": 1, f"lag {causal}": causal, "one day": per_day}
+    sharpe, t_iid, daily = {}, {}, {}
+    for name, lag in shifts.items():
         values = _shifted(realized.values, lag)
         forecast = sf.ForwardReturns(values, realized.decisions, realized.assets,
                                      realized.horizons)
         report = sf.run_backtest(forecast, realized, market=inputs["market"],
-                                 history=inputs["history"], days=inputs["days"], config=config)
+                                 history=inputs["history"], days=inputs["days"], config=config,
+                                 with_series=True)
+        gross = report.series.gross
         sharpe[name] = float(report.sharpe_mid)
-    ok = (sharpe["same decision"] > 10 * max(abs(sharpe["lag 1"]), 1.0)
-          and abs(sharpe["lag 1"]) >= abs(sharpe["lag 2"]) * 0.5
-          and abs(sharpe["one day"]) < 0.25 * sharpe["same decision"])
-    return _result("look-ahead canaries", "PASS" if ok else "FAIL", sharpe=sharpe,
+        t_iid[name] = float(np.mean(gross) / np.std(gross, ddof=1) * np.sqrt(len(gross)))
+        days = _inference(report.series)
+        daily[name] = [days[f"sharpe_daily_mid{s}"] for s in ("", "_low", "_high")]
+    worst_causal = max(abs(sharpe[f"lag {causal}"]), abs(sharpe["one day"]), 1.0)
+    ok = sharpe["same decision"] > 10 * worst_causal
+    return _result("look-ahead canaries", "PASS" if ok else "FAIL",
                    same_decision=sharpe["same decision"], lag_1=sharpe["lag 1"],
-                   lag_2=sharpe["lag 2"], one_day=sharpe["one day"])
+                   first_causal_lag=causal, first_causal=sharpe[f"lag {causal}"],
+                   one_day=sharpe["one day"], t_iid=t_iid, sharpe=sharpe,
+                   sharpe_daily_with_interval=daily)
 
 
 #: Execution delays the latency check compares, in seconds: the v2 cache's quotes.

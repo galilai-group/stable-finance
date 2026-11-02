@@ -170,6 +170,23 @@ def test_cost_and_sharpe_leave_the_open_out_of_every_number():
     assert every["sharpe_daily_gross"] == pytest.approx(float(_sharpe(daily)))
 
 
+
+# ── look-ahead canaries ─────────────────────────────────────────────────────
+
+
+def test_decision_spacing_reads_the_gap_within_a_day():
+    labels = ["2020-08-03|0000", "2020-08-03|0300", "2020-08-03|0600", "2020-08-04|0000",
+              "2020-08-04|0300"]
+    assert sanity._decision_spacing(labels) == 300.0
+
+
+def test_first_causal_lag_clears_the_horizon_and_the_exit_vwap_minute():
+    assert sanity.first_causal_lag(300, 300.0) == 2       # lag 1 ends 60 s after the decision
+    assert sanity.first_causal_lag(240, 300.0) == 1       # ends exactly at the decision
+    assert sanity.first_causal_lag(900, 300.0) == 4
+    assert sanity.first_causal_lag(0, 300.0, vwap_seconds=0) == 1
+
+
 # ── checks on finished runs ─────────────────────────────────────────────────
 
 
