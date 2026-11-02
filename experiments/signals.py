@@ -31,6 +31,12 @@ applied unchanged to the evaluation month:
 * ``lasso``: scikit-learn's coordinate-descent LASSO per horizon (cyclic, so
   deterministic), penalty chosen the same way.
 
+A feature with no value at a decision -- the 30-minute reversal and
+volatility before 10:00, say -- enters as zero, the neutral normal score, so
+the first half hour of each session is forecast from the features it has
+rather than left unscored; a row with no feature at all has no forecast. The
+table reports the share of rows forecast at each time of day.
+
 Writes one forecast file per model for ``run.py`` (``kind: "file"``) and an
 IC-by-horizon table.
 
@@ -59,7 +65,7 @@ from experiments.month_cache import load_month
 OUT = Path(__file__).resolve().parent / "results" / "signals"
 TRAIN, EVALUATE = "2020-07", "2020-08"
 HORIZONS = (300, 600, 900, 1800, 3600, 7200)
-ALPHAS = (1.0, 10.0, 100.0, 1_000.0, 10_000.0)
+ALPHAS = (1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0)
 LASSO_ALPHAS = (1e-8, 1e-7, 3e-7, 1e-6, 3e-6, 1e-5)
 
 
@@ -78,6 +84,26 @@ def normal_scores(values: np.ndarray) -> np.ndarray:
             grid = np.array([normal.inv_cdf(r / (n + 1)) for r in range(1, n + 1)])
             out[t, np.flatnonzero(finite), k] = grid[ranks - 1]
     return out
+
+
+def impute(scores: np.ndarray) -> np.ndarray:
+    """Missing normal scores as zero, the neutral score, where a row has any feature at all.
+
+    The scores are per-decision cross-sectional ranks, so zero is the middle
+    of every feature's distribution: a missing feature then says nothing about
+    the name, and the row is forecast from the features it has. A row with no
+    finite feature stays all NaN and gets no forecast. Causal: it reads only
+    the decision's own row.
+    """
+    any_feature = np.isfinite(scores).any(axis=-1, keepdims=True)
+    return np.where(any_feature, np.nan_to_num(scores, nan=0.0), np.nan)
+
+
+def coverage_by_time(forecast: np.ndarray, decisions) -> dict[str, float]:
+    """The share of (decision, asset) rows with a forecast, by time of day (seconds after the open)."""
+    offsets = np.asarray([str(d).split("|", 1)[1] for d in np.asarray(decisions).astype(str)])
+    has = np.isfinite(forecast[:, :, 0])
+    return {o: float(has[offsets == o].mean()) for o in sorted(set(offsets), key=int)}
 
 
 def demeaned(realized: np.ndarray) -> np.ndarray:
@@ -118,7 +144,8 @@ def main() -> int:
     names = evaluation["feature_names"]
     f_train, r_train = align(train, assets)
     f_eval, r_eval = align(evaluation, assets)
-    z_train, z_eval = normal_scores(f_train), normal_scores(f_eval)
+    raw_train, raw_eval = normal_scores(f_train), normal_scores(f_eval)
+    z_train, z_eval = impute(raw_train), impute(raw_eval)
     y_train = demeaned(r_train)
 
     # Penalties are chosen on the last week of the training month, fit on the rest.
@@ -189,11 +216,16 @@ def main() -> int:
 
     table = {"horizons": list(HORIZONS), "train": TRAIN, "evaluate": EVALUATE,
              "assets": len(assets), "ridge_alpha": ridge_alpha, "lasso_alpha": lasso_alpha,
+             "ridge_alpha_grid": list(ALPHAS),
+             "ridge_alpha_at_grid_edge": [a in (ALPHAS[0], ALPHAS[-1]) for a in ridge_alpha],
              "ic": {}, "ridge_coefficients": {}, "lasso_coefficients": {}}
     decisions = evaluation["realized"].decisions
     for name, values in forecasts.items():
         cube = values.reshape(len(decisions), len(assets), len(HORIZONS))
         table["ic"][name] = rank_ic(cube, r_eval)
+        if name == "ridge":
+            table["coverage_by_time"] = coverage_by_time(cube, decisions)
+            table["coverage"] = float(np.isfinite(cube[:, :, 0]).mean())
         np.savez(OUT / f"{name}.npz", forecast=cube, assets=assets,
                  horizons=np.asarray(HORIZONS), decisions=decisions)
     # coefficients_ is (horizons, features).
@@ -202,7 +234,7 @@ def main() -> int:
     table["lasso_coefficients"] = {n: [float(m.coef_[i]) for m in lasso_models]
                                    for i, n in enumerate(names)}
     table["single_feature_ic"] = {
-        n: rank_ic(np.repeat(z_eval[:, :, i:i + 1], len(HORIZONS), axis=2), r_eval)
+        n: rank_ic(np.repeat(raw_eval[:, :, i:i + 1], len(HORIZONS), axis=2), r_eval)
         for i, n in enumerate(names)}
     (OUT / "ic_table.json").write_text(json.dumps(table, indent=2))
     print(json.dumps({"ic": table["ic"], "ridge_alpha": ridge_alpha,
