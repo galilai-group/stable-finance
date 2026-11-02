@@ -236,7 +236,7 @@ def policies(target: sf.PortfolioWeights, month: dict, *, rate: float, band: flo
              ) -> dict[str, sf.PortfolioWeights]:
     return {"target": target,
             "partial": sf.partial_adjustment(target, rate),
-            "band": sf.no_trade_band(target, band, cost=month["cost"])}
+            "band": sf.no_trade_band(target, band, cost_belief=month["cost"])}
 
 
 def tune(forecast: sf.ForwardReturns, month: dict, costs: str, *, quick: bool = False) -> dict:
@@ -250,7 +250,7 @@ def tune(forecast: sf.ForwardReturns, month: dict, costs: str, *, quick: bool = 
     target = aim(forecast, month, 0.0)
     score = lambda held: evaluate(held, month, costs)["sharpe_net"]
     by_rate = {r: score(sf.partial_adjustment(target, r)) for r in rates}
-    by_band = {b: score(sf.no_trade_band(target, b, cost=month["cost"])) for b in bands}
+    by_band = {b: score(sf.no_trade_band(target, b, cost_belief=month["cost"])) for b in bands}
     by_aim = {}
     for k in aversions:
         book = aim(forecast, month, k)

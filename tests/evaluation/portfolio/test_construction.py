@@ -6,7 +6,12 @@ import itertools
 import numpy as np
 import pytest
 
-from stable_finance import ForwardReturns, mean_variance_target, weight_book
+from stable_finance import (
+    ForwardReturns,
+    aim_portfolio,
+    mean_variance_target,
+    weight_book,
+)
 from stable_finance.evaluation.portfolio import construction
 from stable_finance.evaluation.portfolio.construction import (
     WEIGHTING_REQUIRES,
@@ -573,3 +578,59 @@ def test_mean_variance_target_rejects_a_malformed_risk_aversion(bad, message):
     forecast, sigma = mv_panel()
     with pytest.raises(ValueError, match=message):
         mean_variance_target(forecast, sigma, risk_aversion=bad)
+
+
+# ── the aim portfolio ────────────────────────────────────────────────────────
+
+
+def aim_problem(seed=0, n_decisions=30, n_assets=5, horizons=(300,)):
+    rng = np.random.default_rng(seed)
+    factors = rng.normal(size=(n_assets, 2))
+    sigma = factors @ factors.T * 1e-4 + np.diag(rng.uniform(1e-4, 3e-4, n_assets))
+    mu = rng.normal(0, 1e-3, (n_decisions, n_assets, len(horizons)))
+    forecast = ForwardReturns(mu, np.arange(n_decisions), [f"A{i}" for i in range(n_assets)],
+                              list(horizons))
+    return forecast, sigma
+
+
+def test_one_horizon_without_cost_aversion_is_the_mean_variance_target():
+    forecast, sigma = aim_problem()
+    aim = aim_portfolio(forecast, sigma, risk_aversion=3.0)
+    expected = mean_variance_target(forecast, sigma[None], risk_aversion=3.0)
+    np.testing.assert_allclose(aim.values, expected.values, rtol=1e-10, atol=1e-14)
+
+
+def test_horizons_enter_per_decision_and_cost_aversion_shrinks_the_fast_signal():
+    forecast, sigma = aim_problem(horizons=(300, 3600))
+    free = aim_portfolio(forecast, sigma, risk_aversion=2.0)
+    per_decision = forecast.values[:, :, 0] + forecast.values[:, :, 1] * 300 / 3600
+    np.testing.assert_allclose(free.values[:, :, 0],
+                               np.linalg.solve(sigma, per_decision.T).T / 2.0, rtol=1e-10)
+    costly = aim_portfolio(forecast, sigma, risk_aversion=2.0, cost_aversion=10.0)
+    fast, slow = 1 / (1 + np.log(2) * 10.0), 1 / (1 + np.log(2) / 12 * 10.0)
+    mixed = forecast.values[:, :, 0] * fast + forecast.values[:, :, 1] * 300 / 3600 * slow
+    np.testing.assert_allclose(costly.values[:, :, 0], np.linalg.solve(sigma, mixed.T).T / 2.0,
+                               rtol=1e-10)
+    assert slow > fast
+
+
+def test_a_name_without_any_forecast_has_no_aim_and_a_missing_horizon_contributes_nothing():
+    forecast, sigma = aim_problem(horizons=(300, 900))
+    values = forecast.values.copy()
+    values[3, 1, :] = np.nan
+    values[4, 2, 1] = np.nan
+    gapped = ForwardReturns(values, forecast.decisions, forecast.assets, forecast.horizons)
+    aim = aim_portfolio(gapped, sigma, risk_aversion=1.0)
+    assert np.isnan(aim.values[3, 1, 0])
+    assert np.isfinite(aim.values[4]).all()
+
+
+@pytest.mark.parametrize("kwargs, message", [
+    ({"risk_aversion": 0.0}, "risk_aversion"),
+    ({"risk_aversion": 1.0, "cost_aversion": -1.0}, "cost_aversion"),
+    ({"risk_aversion": 1.0, "half_lives": [1.0, 2.0]}, "half_lives"),
+])
+def test_aim_portfolio_validates_its_arguments(kwargs, message):
+    forecast, sigma = aim_problem()
+    with pytest.raises(ValueError, match=message):
+        aim_portfolio(forecast, sigma, **kwargs)

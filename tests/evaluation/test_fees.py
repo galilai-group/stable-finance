@@ -14,9 +14,7 @@ import pytest
 
 import stable_finance as sf
 from stable_finance import (
-    ACCESS_FEE_CAP_2020,
     DEFAULT_BACKTEST,
-    SEC_FEE_RATE_FY2020,
     BacktestConfig,
     ForwardReturns,
     MarketData,
@@ -104,9 +102,9 @@ def test_the_frictionless_benchmark_refuses_fees():
 
 
 def test_a_per_share_fee_needs_a_price_and_says_so():
-    config = CROSS.replace(fee_per_share=ACCESS_FEE_CAP_2020)
+    config = CROSS.replace(fee_per_share=0.003)
     assert config.requires == {"cost_model": ("half_spread",), "fee_per_share": ("mid",)}
-    assert CROSS.replace(fee_bps=1.0, sec_fee_rate=SEC_FEE_RATE_FY2020).requires == CROSS.requires
+    assert CROSS.replace(fee_bps=1.0, sec_fee_rate=22.10e-6).requires == CROSS.requires
     spread_only = MarketData({"half_spread": np.full((D, A), 1e-4)}, DECISIONS, ASSETS)
     with pytest.raises(MissingRolesError, match="fee_per_share=0.003.*share price"):
         check_config(config, spread_only)
@@ -148,10 +146,8 @@ def test_the_allocator_charge_is_a_round_trip_split_evenly_between_its_legs():
     trip = fee_cost(np.array([[0.1], [-0.1]]), 20.0, fee_bps=0.5, fee_per_share=0.003,
                     sec_fee_rate=22.10e-6).sum()
     assert trip == pytest.approx(2 * 0.1 * per_unit[0, 0], rel=1e-13)
-    # The 2020 values, as the docstring shows them on a $20 stock.
-    assert (ACCESS_FEE_CAP_2020, SEC_FEE_RATE_FY2020) == (0.003, 22.10e-6)
-    assert fee_per_unit(20.0, fee_per_share=ACCESS_FEE_CAP_2020,
-                        sec_fee_rate=SEC_FEE_RATE_FY2020) == pytest.approx(1.6105e-4)
+    # 2020's access-fee cap and Section 31 rate, as the docstring shows them on a $20 stock.
+    assert fee_per_unit(20.0, fee_per_share=0.003, sec_fee_rate=22.10e-6) == pytest.approx(1.6105e-4)
     assert fee_per_unit(fee_bps=2.0) == pytest.approx(2e-4)
 
 
@@ -169,9 +165,9 @@ def test_trading_cost_adds_the_fees_and_keeps_unquoted_names_untradable():
 
 @pytest.mark.parametrize("fees", [
     {"fee_bps": 0.7},
-    {"fee_per_share": ACCESS_FEE_CAP_2020},
-    {"sec_fee_rate": SEC_FEE_RATE_FY2020},
-    {"fee_bps": 0.7, "fee_per_share": ACCESS_FEE_CAP_2020, "sec_fee_rate": SEC_FEE_RATE_FY2020},
+    {"fee_per_share": 0.003},
+    {"sec_fee_rate": 22.10e-6},
+    {"fee_bps": 0.7, "fee_per_share": 0.003, "sec_fee_rate": 22.10e-6},
 ])
 def test_fees_add_exactly_fee_times_the_weight_traded_to_each_periods_cost(fees):
     w = _world()
@@ -278,7 +274,7 @@ def test_a_sweep_with_fees_agrees_with_running_each_alone():
     space = enumerate_configs(universe="all", selection="all", risk_model="diagonal",
                               weighting=("mean_variance", "equal"),
                               efq=(0.5, 1.0), rebalance="every_decision",
-                              fee_bps=(None, 1.0), sec_fee_rate=(None, SEC_FEE_RATE_FY2020),
+                              fee_bps=(None, 1.0), sec_fee_rate=(None, 22.10e-6),
                               fee_per_share=(None, 0.003))
     assert len(space) == 2 * 2 * 2 * 2 * 2
     swept = sweep_configs(w["forecast"], w["realized"], space, market=market,
@@ -296,7 +292,7 @@ def test_cost_is_linear_in_efq_with_the_fees_as_its_intercept_and_the_break_even
     # A book that peeks at its own return, so there is an edge to break even on.
     path = w["path"] * 0.2 + 0.02 * np.sign(w["realized"].values[:, :, 0])
     weights = _panel(path, PortfolioWeights)
-    fees = {"fee_bps": 0.2, "fee_per_share": 0.001, "sec_fee_rate": SEC_FEE_RATE_FY2020}
+    fees = {"fee_bps": 0.2, "fee_per_share": 0.001, "sec_fee_rate": 22.10e-6}
     run = lambda efq: run_backtest(weights, w["realized"], market=w["market"],
                                    config=CROSS.replace(efq=efq, **fees), with_series=True)
     one, half = run(1.0), run(0.5)
@@ -365,7 +361,7 @@ def test_an_event_ledger_charges_each_trade_its_own_fees():
     config = DEFAULT_BACKTEST.replace(cost_model="cross", efq=0.5)
     plain = event_backtest(trades, tape, config=config)
     charged = event_backtest(trades, tape, config=config.replace(
-        fee_per_share=ACCESS_FEE_CAP_2020, sec_fee_rate=SEC_FEE_RATE_FY2020))
+        fee_per_share=0.003, sec_fee_rate=22.10e-6))
     exit_size = 0.01 * 110 / 100                                   # the position drifted with the price
     fees = 0.01 * 0.003 / 100 + exit_size * (0.003 / 110 + 22.10e-6)
     assert charged.ledger.cost[0] - plain.ledger.cost[0] == pytest.approx(fees, rel=1e-9)
@@ -374,8 +370,9 @@ def test_an_event_ledger_charges_each_trade_its_own_fees():
 
 
 def test_the_fee_api_is_exported():
-    for name in ("ACCESS_FEE_CAP_2020", "SEC_FEE_RATE_FY2020", "FEE_SETTINGS", "FEE_REQUIRES",
-                 "fee_cost", "fee_per_unit"):
+    for name in ("FEE_SETTINGS", "FEE_REQUIRES", "fee_cost", "fee_per_unit"):
         assert name in sf.__all__
+    # Dataset facts such as the 2020 fee levels are passed by the caller, not exported.
+    assert not any("2020" in name for name in sf.__all__)
     assert sf.FEE_SETTINGS == ("fee_bps", "fee_per_share", "sec_fee_rate")
     assert set(sf.FEE_SETTINGS) <= set(sf.OPTIONAL_SETTINGS)
