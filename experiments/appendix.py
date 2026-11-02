@@ -75,7 +75,7 @@ def lookup(results: Path):
             each = np.array([breakeven_ic(part[part["f_seed"] == s].groupby("f_ic")["sharpe_net"].mean())
                              for s in seeds])
             crossed = each[np.isfinite(each)]
-            record.update(n_seeds=len(seeds), seeds_crossing=int(len(crossed)),
+            record.update(n_seeds=len(seeds), seeds_crossing=len(crossed),
                           breakeven_ic_min=float(crossed.min()) if len(crossed) else np.nan,
                           breakeven_ic_max=float(crossed.max()) if len(crossed) else np.nan)
         if "sharpe_daily_net" in part:
