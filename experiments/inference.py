@@ -82,7 +82,9 @@ months (``walkforward.py``) is what tightens it.
 
 Also reported, from the same series: the seed-to-seed spread of a forecast
 run under several seeds beside the time-sampling standard error, the
-rejection rate of zero-IC placebo rows at the 5% level (the tests' size), a
+rejection rate of zero-IC placebo rows at the 5% level (the tests' size;
+``--size-check`` adds the SPA, StepM, MCS and DSR, run on the placebo's
+gross P&L, with intervals that respect its seeds), a
 bootstrap interval for each break-even EFQ (a ratio of mean gross P&L to
 mean cost, resampled on days), and each row's mean P&L by half hour of the
 session, since five-minute P&L is far from stationary within the day.
@@ -123,6 +125,7 @@ import math
 import sys
 import warnings
 from pathlib import Path
+from statistics import NormalDist
 
 import numpy as np
 
@@ -1106,7 +1109,10 @@ def size_check(table) -> dict:
     The gross (mid) P&L of an IC-0 forecast has mean zero, so a test of the
     right size rejects about 5% of the time; the iid test, which ignores the
     serial correlation, shows how far that assumption over-rejects. Net P&L
-    is left out: it carries the cost, so its mean is not zero.
+    is left out: it carries the cost, so its mean is not zero. Every row
+    counts as an independent trial, copies across EFQ included;
+    :func:`placebo_size` (``--size-check``) counts distinct configurations,
+    clusters the interval by group and adds the joint tests.
     """
     if "f_ic" not in table:
         return {}
@@ -1120,6 +1126,125 @@ def size_check(table) -> dict:
         values = values[np.isfinite(values)]
         out[f"reject_{column}"] = float(np.mean(np.abs(values) > critical)) if len(values) else None
     return out
+
+
+def wilson_interval(hits: int, n: int) -> tuple[float, float]:
+    """Wilson's 95% interval for a proportion ``hits / n``; NaN for no trials.
+
+    It reaches exactly 0 with no hits and 1 with all, where the arithmetic
+    would leave a rounding error.
+    """
+    if n == 0:
+        return np.nan, np.nan
+    z = NormalDist().inv_cdf(1.0 - TEST_SIZE / 2)
+    p = hits / n
+    centre = (p + z ** 2 / (2 * n)) / (1 + z ** 2 / n)
+    half = z * math.sqrt(p * (1 - p) / n + z ** 2 / (4 * n ** 2)) / (1 + z ** 2 / n)
+    return (0.0 if hits == 0 else max(centre - half, 0.0),
+            1.0 if hits == n else min(centre + half, 1.0))
+
+
+def _rate(hits: list[bool], level: float | None, unit: str) -> dict:
+    """A rejection rate over independent trials, with Wilson's interval."""
+    low, high = wilson_interval(int(np.sum(hits)), len(hits))
+    return {"level": level, "unit": unit, "n": len(hits),
+            "rate": float(np.mean(hits)) if hits else None, "low": low, "high": high}
+
+
+def placebo_size(rows, daily: dict, *, group_by: list[str], benchmark: str, reps: int,
+                 seed: int, block: int | None, pbo_n: int | None, block_data=None) -> dict:
+    """How often each test rejects on zero-IC placebo rows, against its nominal level.
+
+    A forecast with IC 0 has no skill, so every construction's gross (mid)
+    P&L has mean zero and no configuration is better than another; each test
+    is run on it exactly as the analysis runs it (:func:`group_statistics`)
+    and should reject about as often as its level says. Net P&L is not used:
+    its costs make its mean negative and different across constructions, a
+    true difference. Only the placebo rows at their lowest EFQ are used (0,
+    where net is gross, in E6): another EFQ repeats the same books, exactly
+    when held and nearly when booked every decision, whose gross moves
+    slightly with the EFQ, so it is no new trial, and next to the first its
+    near-copies are books the joint tests can tell apart. They are grouped
+    as the analysis groups them, each group (a seed, say) one independent
+    trial of the joint tests:
+
+    * ``daily_t``: the daily gross Sharpe's HAC t beyond the two-sided 5%
+      critical value, per distinct configuration; its interval is clustered
+      by group, whose books share one forecast. ``daily_t_any`` is the share
+      of groups with any such rejection, the family-wise rate the joint
+      tests exist to hold down (no nominal level);
+    * ``spa`` (consistent p-value) and ``stepm`` (any superior configuration)
+      at 5%, in groups that hold the benchmark;
+    * ``mcs_<loss>``: the 90% set drops a configuration, which under the
+      placebo should happen in at most 10% of groups;
+    * ``dsr``: the best configuration's deflated Sharpe above 95%.
+
+    Group-level rates carry Wilson's 95% interval. ``block_data`` maps a
+    group's row ids to its block matrix (or None), as the analysis builds
+    it for the effective number of trials. Empty without IC-0 rows.
+    """
+    if "f_ic" not in rows:
+        return {}
+    placebo = rows[(rows["f_ic"].astype(float) == 0.0) & rows["row_id"].isin(list(daily))]
+    if placebo.empty:
+        return {}
+    efq = None
+    if "efq" in placebo:
+        efq = float(placebo["efq"].min())
+        placebo = placebo[placebo["efq"] == efq]
+    keys = [k for k in group_by if k != "all"]
+    grouped = placebo.groupby(keys, dropna=False, sort=False) if keys else [((), placebo)]
+    critical = NormalDist().inv_cdf(1.0 - TEST_SIZE / 2)
+    t_hits, t_any = [], []
+    joint: dict[str, list[bool]] = {"spa": [], "stepm": [], "dsr": [],
+                                    **{f"mcs_{kind}": [] for kind in MCS_LOSSES}}
+    skipped = 0
+    for _, members in grouped:
+        ids = members["row_id"].tolist()
+        summary, results = group_statistics(
+            members, daily, benchmark=benchmark, which=0, reps=reps, seed=seed, block=block,
+            pbo_n=pbo_n, block_data=block_data(ids) if block_data else None)
+        if "dsr" not in summary:
+            skipped += 1
+            continue
+        distinct = [r for r in ids if r in results and results[r].get("duplicate_of") is None]
+        t = np.array([daily_statistics(daily[r][0])["sharpe_daily_t_hac"] for r in distinct])
+        rejected = np.abs(t[np.isfinite(t)]) > critical
+        t_hits.append((int(rejected.sum()), len(rejected)))
+        t_any.append(bool(rejected.any()))
+        if "spa" in summary:
+            joint["spa"].append(summary["spa"]["consistent"] < TEST_SIZE)
+            joint["stepm"].append(len(summary["stepm"]["superior"]) > 0)
+        for kind in MCS_LOSSES:
+            found = summary[f"mcs_{kind}"]
+            if "included_distinct" in found and "skipped" not in found:
+                joint[f"mcs_{kind}"].append(found["included_distinct"] < found["distinct_models"])
+        best = summary["dsr"]["best_dsr"]
+        if best is not None and np.isfinite(best):
+            joint["dsr"].append(best > 1.0 - TEST_SIZE)
+
+    # The daily t test's rate pools configurations, so its interval is
+    # clustered by group: the ratio estimator's sandwich variance.
+    hits, n = np.array(t_hits, dtype=float).reshape(-1, 2).T
+    rate = hits.sum() / n.sum() if n.sum() else np.nan
+    groups = len(t_hits)
+    half = np.nan
+    if groups >= 2 and n.sum():
+        se = math.sqrt(groups / (groups - 1) * np.sum((hits - rate * n) ** 2)) / n.sum()
+        half = critical * se
+    tests = {"daily_t": {"level": TEST_SIZE, "unit": "distinct configuration", "n": int(n.sum()),
+                         "rate": rate, "low": max(rate - half, 0.0), "high": min(rate + half, 1.0),
+                         "interval": "clustered by group"},
+             "daily_t_any": _rate(t_any, None, "group"),
+             "spa": _rate(joint["spa"], TEST_SIZE, "group"),
+             "stepm": _rate(joint["stepm"], TEST_SIZE, "group"),
+             **{f"mcs_{kind}": _rate(joint[f"mcs_{kind}"], MCS_SIZE, "group")
+                for kind in MCS_LOSSES},
+             "dsr": _rate(joint["dsr"], TEST_SIZE, "group")}
+    return {"n_rows": len(placebo), "efq": efq, "n_groups": groups, "n_skipped": skipped,
+            "group_by": keys or ["all"], "pnl": PNL[0], "tests": tests,
+            "note": ("a test of the right size rejects at about its level; a rate whose "
+                     "interval lies above the level over-rejects, one below is conservative")}
 
 
 def time_of_day(row_id: str, values: np.ndarray, labels) -> list[dict]:
@@ -1184,8 +1309,12 @@ def _group_name(keys: list[str], values) -> str:
 def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str] | None = None,
             group_add: list[str] | None = None, pnl: str = "net", reps: int = REPS,
             seed: int = 0, block: int | None = None, lags: int | None = None,
-            pbo_n: int | None = None) -> dict:
-    """Run every statistic on ``results/<name>`` and write the outputs; returns the JSON."""
+            pbo_n: int | None = None, size: bool = False) -> dict:
+    """Run every statistic on ``results/<name>`` and write the outputs; returns the JSON.
+
+    ``size`` also runs the joint tests on the run's IC-0 placebo rows
+    (:func:`placebo_size`), reported under ``placebo_size``.
+    """
     import pandas as pd
 
     out = run_dir(name)
@@ -1259,19 +1388,22 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
     which = PNL.index(pnl)
     horizons = {r: (int(h) if reb == "horizon" else 0)
                 for r, h, reb in zip(rows["row_id"], rows["eval_horizon"], rows["rebalance"])}
+    def block_data(member_ids: list[str], which: int = which):
+        member_ids = [r for r in member_ids if r in daily]
+        if grid and all(r in labels for r in member_ids) and member_ids:
+            return block_matrix(member_ids, horizons, labels,
+                                {r: series[r][which] for r in member_ids}, grid, spacing)
+        return None
+
     groups, per_row = [], {}
     keys = group_by if group_by != ["all"] else []
     grouped = rows.groupby(keys, dropna=False, sort=False) if keys else [((), rows)]
     for key, members in grouped:
         key = key if isinstance(key, tuple) else (key,)
         member_ids = [r for r in members["row_id"] if r in daily]
-        block_data = None
-        if grid and all(r in labels for r in member_ids) and member_ids:
-            block_data = block_matrix(member_ids, horizons, labels,
-                                      {r: series[r][which] for r in member_ids}, grid, spacing)
         summary, results = group_statistics(
             members, daily, benchmark=benchmark, which=which, reps=reps, seed=seed,
-            block=block, pbo_n=pbo_n, block_data=block_data)
+            block=block, pbo_n=pbo_n, block_data=block_data(member_ids))
         gid = _group_name(keys, key) if keys else "all"
         summary = {"group": gid, "keys": {k: _scalar(v) for k, v in zip(keys, key)}, **summary}
         groups.append(summary)
@@ -1339,6 +1471,10 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
         "seed_dispersion": seed_dispersion(table),
         "size_check": size_check(table),
     }
+    if size:
+        report["placebo_size"] = placebo_size(
+            rows, daily, group_by=group_by, benchmark=benchmark, reps=reps, seed=seed,
+            block=block, pbo_n=pbo_n, block_data=lambda ids: block_data(ids, which=0))
     (out / "inference.json").write_text(json.dumps(_clean(report), indent=2))
     print_summary(report, table)
     return report
@@ -1421,6 +1557,16 @@ def print_summary(report: dict, table) -> None:
         print(f"  size check on {size['n_rows']} IC-0 rows (gross, 5% level): "
               + ", ".join(f"{k[len('reject_'):]} {v:.2f}" for k, v in size.items()
                           if k.startswith("reject_") and v is not None))
+    placebo = report.get("placebo_size")
+    if placebo:
+        print(f"  placebo size on {placebo['n_groups']} groups of IC-0 rows (gross P&L): "
+              f"rejection rate [95%] against the level")
+        for name, t in placebo["tests"].items():
+            print(f"    {name:<12} {_number(t['rate'], '.3f')} [{_number(t['low'], '.3f')}, "
+                  f"{_number(t['high'], '.3f')}] over {t['n']} {t['unit']}s; level "
+                  f"{_number(t['level'], '.2f')}")
+    elif placebo is not None:
+        print("  placebo size: no IC-0 rows")
     seeds = report["seed_dispersion"]
     if seeds:
         ratio = [s["sharpe_daily_net_sd"] / s["sharpe_daily_se_hac_net_mean"] for s in seeds
@@ -1450,12 +1596,15 @@ def main(argv=None) -> int:
     parser.add_argument("--lags", type=int, default=None,
                         help="fixed HAC lags for the per-period series (default: see the docstring)")
     parser.add_argument("--pbo-blocks", type=int, default=None)
+    parser.add_argument("--size-check", action="store_true",
+                        help="also run the joint tests on the IC-0 placebo rows' gross P&L and "
+                             "report how often each rejects against its level")
     args = parser.parse_args(argv)
     group = args.group.split(",") if args.group else None
     added = args.group_add.split(",") if args.group_add else None
     analyze(args.name, benchmark=args.benchmark, group_by=group, group_add=added, pnl=args.pnl,
             reps=args.reps, seed=args.seed, block=args.block, lags=args.lags,
-            pbo_n=args.pbo_blocks)
+            pbo_n=args.pbo_blocks, size=args.size_check)
     return 0
 
 

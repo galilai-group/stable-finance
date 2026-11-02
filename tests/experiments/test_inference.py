@@ -215,3 +215,81 @@ def test_group_keys_take_the_cli_then_the_spec_then_the_default_and_append_addit
     assert inference.group_keys(rows, None, ["all"], ["universe"]) == ["universe"]
     with pytest.raises(ValueError, match="cannot group by"):
         inference.group_keys(rows, None, group_add=["equity"])
+
+
+# ── the placebo size check ──────────────────────────────────────────────────
+
+def test_wilson_interval_brackets_the_rate_and_stays_in_the_unit_interval():
+    low, high = inference.wilson_interval(1, 20)
+    assert 0.0 < low < 0.05 < high < 0.3
+    assert inference.wilson_interval(0, 10)[0] == 0.0
+    assert inference.wilson_interval(10, 10)[1] == 1.0
+    assert all(np.isnan(inference.wilson_interval(0, 0)))
+
+
+def _placebo_run(path, *, seeds=6, days=30, per_day=4, spec=None):
+    """A synthetic IC-0 run on disk: three weightings under ``seeds`` seeds at EFQ 0 and 0.7.
+
+    Gross P&L is pure noise, identical at both EFQs; the cost is charged at
+    EFQ 0.7 only, so net differs. Labels are saved, as run.py saves them.
+    """
+    import json
+
+    rng = np.random.default_rng(10)
+    labels = np.array([f"d{d:02d}|{34200 + 300 * k}" for d in range(days) for k in range(per_day)])
+    q = per_day * inference.DAYS_A_YEAR
+    rows, series = [], {}
+    for seed in range(seeds):
+        for weighting in ("rank", "signal", "equal"):
+            gross = rng.normal(0.0, 1e-3, len(labels))
+            cost = np.abs(rng.normal(1e-4, 2e-5, len(labels)))
+            for efq in (0.0, 0.7):
+                row_id = f"s{seed}{weighting}{efq}"
+                net = gross - efq * cost
+                series[row_id] = np.stack([gross, net, efq * cost])
+                rows.append({"row_id": row_id, "forecast": "copula", "f_ic": 0.0, "f_seed": seed,
+                             "eval_horizon": 300, "selection": "all", "weighting": weighting,
+                             "cost_model": "cross", "efq": efq, "rebalance": "every_decision",
+                             "annualization": "decisions", "periods_per_year": q,
+                             "sharpe_mid": gross.mean() / gross.std(ddof=1) * np.sqrt(q),
+                             "sharpe_net": net.mean() / net.std(ddof=1) * np.sqrt(q)})
+    path.mkdir()
+    pd.DataFrame(rows).to_parquet(path / "rows.parquet", index=False)
+    np.savez(path / "series.npz", **series)
+    np.savez(path / "periods.npz", row_id=np.array(list(series)),
+             set=np.zeros(len(series), dtype=int), set_0=labels)
+    if spec is not None:
+        (path / "manifest.json").write_text(json.dumps({"spec": spec}))
+    return path
+
+
+def test_size_check_runs_the_joint_tests_on_the_placebo_at_its_lowest_efq(tmp_path):
+    pytest.importorskip("arch")
+    out = _placebo_run(tmp_path / "placebo")
+    report = inference.analyze(str(out), reps=50, size=True)
+    size = report["placebo_size"]
+    assert size["efq"] == 0.0 and size["pnl"] == "mid"
+    assert size["n_rows"] == 18 and size["n_groups"] == 6 and size["n_skipped"] == 0
+    tests = size["tests"]
+    assert tests["daily_t"]["n"] == 18 and tests["daily_t"]["unit"] == "distinct configuration"
+    assert {name: t["n"] for name, t in tests.items() if name != "daily_t"} == dict.fromkeys(
+        ("daily_t_any", "spa", "stepm", "mcs_pnl", "mcs_sharpe", "dsr"), 6)
+    assert tests["mcs_pnl"]["level"] == inference.MCS_SIZE
+    assert tests["spa"]["level"] == tests["dsr"]["level"] == inference.TEST_SIZE
+    for t in tests.values():
+        assert 0.0 <= t["low"] <= t["rate"] <= t["high"] <= 1.0
+    # Every group, skipped or not, says how many distinct configurations it had.
+    assert all("distinct_models" in g for g in report["groups"])
+    assert report["checks"]["distinct_models"] == sum(g["distinct_models"]
+                                                      for g in report["groups"])
+    assert "placebo_size" not in inference.analyze(str(out), reps=50)
+
+
+def test_a_spec_can_set_the_grouping(tmp_path):
+    pytest.importorskip("arch")
+    out = _placebo_run(tmp_path / "grouped", seeds=2, spec={"inference": {"group_by": ["f_seed"]}})
+    report = inference.analyze(str(out), reps=50)
+    assert report["settings"]["group_by"] == ["f_seed"]
+    assert [g["n_configs"] for g in report["groups"]] == [6, 6]
+    # Gross is shared across EFQ but net is not, so all six are distinct.
+    assert [g["distinct_models"] for g in report["groups"]] == [6, 6]
