@@ -168,3 +168,30 @@ def test_cost_and_sharpe_leave_the_open_out_of_every_number():
     assert rest["sharpe_daily_net"] == pytest.approx(float(_sharpe(daily)))
     daily = gross.reshape(6, 3).sum(axis=1)
     assert every["sharpe_daily_gross"] == pytest.approx(float(_sharpe(daily)))
+
+
+# ── checks on finished runs ─────────────────────────────────────────────────
+
+
+def _write_rows(results, name, rows):
+    pd = pytest.importorskip("pandas")
+    (results / name).mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(results / name / "rows.parquet", index=False)
+
+
+def test_exact_ic_invariance_keeps_placements_and_horizons_apart(tmp_path):
+    rows = []
+    for noise, sign in (("tails", -1.0), ("middle", 1.0)):
+        for horizon, scale in ((900, 125.0), (3600, 53.0)):
+            for k, ic in enumerate((0.005, 0.03, 0.1)):
+                rows.append({"f_noise": noise, "weighting": "signal", "selection": "all",
+                             "efq": 0.0, "eval_horizon": horizon, "rebalance": "horizon",
+                             "f_ic": ic, "sharpe_mid": sign * scale * (1 + 0.01 * k)})
+    _write_rows(tmp_path, "e1_transfer_map", rows)
+    result = sanity.exact_ic_invariance(tmp_path)
+    assert result["status"] == "INFO" and result["n_curves"] == 4
+    curve = result["curves"]["tails/900s/horizon"]
+    assert curve["sharpe_by_ic"] == pytest.approx({"0.005": -125.0, "0.03": -126.25,
+                                                   "0.1": -127.5})
+    assert curve["relative_range"] == pytest.approx(2.5 / 126.25)
+    assert result["max_relative_range"] == pytest.approx(0.02 / 1.01)

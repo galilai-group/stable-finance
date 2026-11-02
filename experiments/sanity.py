@@ -24,10 +24,11 @@ advance, and prints PASS, FAIL or SKIP with the numbers behind it:
   at every decision is outside the law altogether (each period's P&L is
   about ``N * IC * sd(w) * sd(r)``, almost never negative), which the
   exact-IC invariance diagnostic below makes visible.
-* EXACT-IC INVARIANCE. Gross Sharpe of the exact-IC (tails, middle) signal
-  book across ICs, from E1. If it is roughly flat in IC, exact-IC gross
-  Sharpe measures the dispersion process, not forecast quality, and should be
-  read only as a cost-ratio device.
+* EXACT-IC INVARIANCE. Gross Sharpe of the exact-IC signal book across ICs,
+  from E1, one curve per placement (tails, middle), horizon and rebalance
+  rule. If the curves are roughly flat in IC, exact-IC gross Sharpe measures
+  the dispersion process, not forecast quality, and should be read only as
+  a cost-ratio device.
 * PLACEBO. E6's IC-0 forecasts under ten seeds: the daily Sharpe must centre
   on zero relative to its spread, and the 95% intervals must cover zero.
 * INVARIANCE AT IC 1. E6's tails, middle and random oracles at IC 1 are the
@@ -425,20 +426,34 @@ def fundamental_law(results: Path) -> dict:
 
 
 def exact_ic_invariance(results: Path) -> dict:
-    """Gross Sharpe of the exact-IC signal book across ICs: flat means dispersion-driven."""
+    """Gross Sharpe of the exact-IC signal book across ICs, per curve: flat is dispersion-driven.
+
+    Tails and middle are opposite books -- one holds the extremes inverted,
+    the other right -- so their Sharpe ratios have opposite signs, and the
+    horizon and rebalance rule set their scale. Pooled, the median sits near
+    zero and a max-over-min ratio is undefined; each placement, horizon and
+    rebalance rule is therefore its own curve, summarized by its range over
+    its mean absolute Sharpe (per decision, as the rows annualize).
+    """
+    name = "exact-IC invariance diagnostic"
     rows = _rows(results, "e1_transfer_map")
     if rows is None:
-        return _result("exact-IC invariance diagnostic", "SKIP", reason="no E1 rows")
+        return _result(name, "SKIP", reason="no E1 rows")
     part = rows[rows["f_noise"].isin(["tails", "middle"]) & (rows["weighting"] == "signal")
                 & (rows["selection"] == "all") & (rows["efq"] == 0.0)]
     if part.empty:
-        return _result("exact-IC invariance diagnostic", "SKIP", reason="no exact-IC signal rows")
-    curve = part.groupby("f_ic")["sharpe_mid"].median()
-    spread = float(curve.max() / curve.min()) if curve.min() > 0 else float("nan")
-    # Informational: a ratio near 1 across a twenty-fold range of IC is the warning sign.
-    return _result("exact-IC invariance diagnostic", "INFO",
-                   sharpe_by_ic={str(k): float(v) for k, v in curve.items()},
-                   max_over_min=spread)
+        return _result(name, "SKIP", reason="no exact-IC signal rows")
+    curves = {}
+    for (noise, horizon, rebalance), group in part.groupby(["f_noise", "eval_horizon",
+                                                            "rebalance"]):
+        curve = group.groupby("f_ic")["sharpe_mid"].median()
+        curves[f"{noise}/{horizon}s/{rebalance}"] = {
+            "sharpe_by_ic": {f"{k:g}": float(v) for k, v in curve.items()},
+            "relative_range": float((curve.max() - curve.min()) / curve.abs().mean())}
+    # Informational: a range of a few percent across a twenty-fold range of IC is the warning sign.
+    ranges = [c["relative_range"] for c in curves.values()]
+    return _result(name, "INFO", n_curves=len(curves), max_relative_range=max(ranges),
+                   median_relative_range=float(np.median(ranges)), curves=curves)
 
 
 def placebo(results: Path) -> dict:
