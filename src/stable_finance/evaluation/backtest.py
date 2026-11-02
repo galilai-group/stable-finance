@@ -141,6 +141,18 @@ class BacktestReport:
     ``information_coefficient`` is measured on the same forecast over the same
     screened universe, so the pair is comparable by construction.
 
+    ``sharpe_mid`` is the gross of the book this configuration HOLDS, which is
+    not always the book a cost-free configuration would hold. The
+    mean-variance allocator plans against the cost it is billed (the cost
+    model with its ``efq``, ``equity`` and ``impact``, and the fees), so a
+    dearer configuration holds a book that trades less, and its gross Sharpe
+    moves with EFQ BY DESIGN: that is the allocator doing its job, not cost
+    leaking into the gross. Compare a configuration's gross with its own net;
+    a gross at one EFQ against a net at another mixes two books. Every other
+    weighting holds the same book at any cost, and its gross differs across
+    EFQ only where a name without a usable quote fills at the mid (EFQ 0) but
+    not across the spread.
+
     ``transfer_coefficient`` is how much of the forecast the book expresses
     (:func:`~stable_finance.evaluation.scoring.tc.transfer_coefficient`): the
     correlation, over the screened names, of the positions actually HELD --

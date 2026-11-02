@@ -171,6 +171,14 @@ def sharpe_vs_execution_quality(
     linear in EFQ, the whole curve is ``gross - efq * cost`` and needs no
     re-running: one backtest produces the entire sensitivity.
 
+    That is the sensitivity of ONE BOOK, held fixed while its fills get
+    dearer. A cost-aware allocator (``weighting="mean_variance"``) plans
+    against the cost it is billed, so at another EFQ it would hold another
+    book, with another gross: its gross Sharpe depends on EFQ by design. For
+    such a book this curve says what the book run at one EFQ would earn at
+    the others, not what the allocator would; that needs a run at each EFQ,
+    which is why the experiments sweep EFQ as a configuration axis.
+
     This is the honest way to present a Sharpe ratio that a cost assumption
     can dominate. Rather than defending one number, it reports where the
     result lives as a function of the single assumption that matters, and
