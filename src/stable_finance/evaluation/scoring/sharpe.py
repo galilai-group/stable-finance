@@ -187,6 +187,15 @@ def sharpe_vs_execution_quality(
     -- commissions, access and regulatory fees -- paid at every EFQ, so the
     curve is ``gross - fees - efq * cost`` and ``gross_sharpe`` stays the
     frictionless one. ``cost_at_unit_efq`` must then exclude them.
+
+    A period's cost may be NEGATIVE. A crossing fill priced off the touch the
+    order meets on arrival (``exec_bid_price`` and ``exec_ask_price``; see
+    :func:`~stable_finance.evaluation.execution.simulate_fills`) is measured
+    against the mid at the decision, so when the quote moved in the order's
+    favour in between, the period was paid rather than charged -- price
+    improvement, which the netting keeps as it is. A period whose gross,
+    cost or fee is not finite is left out of every point of the curve. Fees
+    are a charge and cannot be negative.
     """
     gross = np.asarray(gross, dtype=np.float64).ravel()
     cost = np.asarray(cost_at_unit_efq, dtype=np.float64).ravel()
@@ -204,8 +213,6 @@ def sharpe_vs_execution_quality(
     gross, cost = gross[keep], cost[keep]
     if len(gross) < 2:
         raise ValueError("need at least two periods")
-    if np.any(cost < 0):
-        raise ValueError("cost cannot be negative")
 
     grid = (np.linspace(0.0, 1.5, 61) if efq_grid is None
             else np.asarray(efq_grid, dtype=np.float64).ravel())
