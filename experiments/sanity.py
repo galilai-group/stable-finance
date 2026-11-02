@@ -53,7 +53,7 @@ advance, and prints PASS, FAIL or SKIP with the numbers behind it:
   wide for its first seconds; a delay that lowers cost is a FLAG. Skipped
   without one.
 * DETERMINISM. One small task run twice, and with one and four BLAS threads,
-  must give byte-identical rows.
+  must give byte-identical rows and per-period series.
 
     uv run --extra experiments python -m experiments.sanity [--results DIR] [--quick]
         [--only CHECK ...]
@@ -788,40 +788,76 @@ TINY_SPEC = {
 }
 
 
+def _arrays_hash(*paths: Path) -> str:
+    """A hash of every array the ``.npz`` files hold, key by key.
+
+    The arrays rather than the files: an archive records when it was
+    written, so two identical runs never give identical bytes.
+    """
+    digest = hashlib.sha256()
+    for path in paths:
+        with np.load(path, allow_pickle=False) as data:
+            for key in sorted(data.files):
+                array = np.ascontiguousarray(data[key])
+                digest.update(f"{path.name}|{key}|{array.dtype}|{array.shape}|".encode())
+                digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
 def determinism() -> dict:
-    """The same task twice, and with one and four BLAS threads: identical rows."""
+    """The same task twice, and with one and four BLAS threads: identical rows and series.
+
+    The rows are each configuration's summary; ``series.npz`` holds the
+    per-period gross, net and cost that every daily statistic, the inference
+    and the figures are computed from, and ``periods.npz`` their labels. A
+    rerun that matched the rows could still differ there, so both are
+    compared: the rows by their pandas hash, the series array by array.
+    """
+    import shutil
+
+    import pandas as pd
+
     root = Path(__file__).resolve().parent.parent
-    hashes, frames = [], []
+    runs = []
     with tempfile.TemporaryDirectory() as tmp:
-        for threads in ("1", "1", "4"):
-            spec = dict(TINY_SPEC, name=f"sanity_determinism_{len(hashes)}")
+        for k, threads in enumerate(("1", "1", "4")):
+            spec = dict(TINY_SPEC, name=f"sanity_determinism_{k}")
             path = Path(tmp) / f"{spec['name']}.json"
             path.write_text(json.dumps(spec))
             env = {**os.environ, "OMP_NUM_THREADS": threads, "OPENBLAS_NUM_THREADS": threads,
                    "MKL_NUM_THREADS": threads}
             subprocess.run([sys.executable, "-m", "experiments.run", str(path), "--workers", "1"],
                            cwd=root, env=env, check=True, capture_output=True)
-            rows = RESULTS / spec["name"] / "rows.parquet"
-            import pandas as pd
-
-            frame = pd.read_parquet(rows)
-            frames.append(frame)
-            hashes.append(hashlib.sha256(
-                pd.util.hash_pandas_object(frame, index=False).to_numpy().tobytes()).hexdigest())
-            import shutil
-
-            shutil.rmtree(RESULTS / spec["name"], ignore_errors=True)
-    sharpe_gap = float(np.nanmax(np.abs(frames[0][["sharpe_mid", "sharpe_net"]].to_numpy()
-                                        - frames[2][["sharpe_mid", "sharpe_net"]].to_numpy())))
-    same_run = hashes[0] == hashes[1]
-    same_threads = hashes[0] == hashes[2]
+            out = RESULTS / spec["name"]
+            frame = pd.read_parquet(out / "rows.parquet")
+            with np.load(out / "series.npz", allow_pickle=False) as data:
+                series = {key: data[key] for key in data.files}
+            saved = [p for p in (out / "series.npz", out / "periods.npz") if p.is_file()]
+            rows = pd.util.hash_pandas_object(frame, index=False).to_numpy().tobytes()
+            runs.append({"frame": frame, "series": series,
+                         "rows_hash": hashlib.sha256(rows).hexdigest(),
+                         "series_hash": _arrays_hash(*saved)})
+            shutil.rmtree(out, ignore_errors=True)
+    one, again, four = runs
+    columns = ["sharpe_mid", "sharpe_net"]
+    sharpe_gap = float(np.nanmax(np.abs(one["frame"][columns].to_numpy()
+                                        - four["frame"][columns].to_numpy())))
+    series_gap = max(float(np.nanmax(np.abs(values - four["series"][key])))
+                     for key, values in one["series"].items())
+    same = {f"{kind}_{name}": first[f"{kind}_hash"] == other[f"{kind}_hash"]
+            for name, first, other in (("rerun", one, again), ("threads", one, four))
+            for kind in ("rows", "series")}
     # Reruns must be identical. Thread count is reported, not required: a
     # multithreaded BLAS sums in a thread-dependent order, which is why
     # run.py pins one thread; a WARN says the pin is what reproduction needs.
-    status = "FAIL" if not same_run else ("PASS" if same_threads else "WARN")
-    return _result("determinism", status, rerun_identical=same_run,
-                   one_vs_four_threads_identical=same_threads,
-                   max_sharpe_difference_threads=sharpe_gap)
+    status = ("FAIL" if not (same["rows_rerun"] and same["series_rerun"])
+              else "PASS" if same["rows_threads"] and same["series_threads"] else "WARN")
+    return _result("determinism", status, rerun_rows_identical=same["rows_rerun"],
+                   rerun_series_identical=same["series_rerun"],
+                   one_vs_four_threads_rows_identical=same["rows_threads"],
+                   one_vs_four_threads_series_identical=same["series_threads"],
+                   max_sharpe_difference_threads=sharpe_gap,
+                   max_series_difference_threads=series_gap)
 
 
 #: Every check in report order, as (name, takes the results directory, loads a month).

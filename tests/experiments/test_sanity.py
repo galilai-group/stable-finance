@@ -282,3 +282,20 @@ def test_wilson_interval_matches_its_closed_form():
     low, high = sanity._wilson(4, 60)
     assert (low, high) == pytest.approx((0.0262, 0.1592), abs=1e-4)
     assert sanity._wilson(0, 60)[0] == 0.0
+
+
+# ── determinism ─────────────────────────────────────────────────────────────
+
+
+def test_arrays_hash_reads_the_arrays_not_the_archive(tmp_path):
+    a, b = np.arange(6.0).reshape(2, 3), np.array(["2020-08-03|0000", "2020-08-03|0300"])
+    saved = {}
+    for name, write, arrays in (("first", np.savez_compressed, {"a": a, "b": b}),
+                                ("reordered", np.savez, {"b": b, "a": a}),
+                                ("changed", np.savez, {"a": a + 1e-15, "b": b}),
+                                ("recast", np.savez, {"a": a.astype(np.float32), "b": b})):
+        (tmp_path / name).mkdir()
+        write(tmp_path / name / "series.npz", **arrays)
+        saved[name] = sanity._arrays_hash(tmp_path / name / "series.npz")
+    assert saved["reordered"] == saved["first"]       # another order, another compression
+    assert saved["changed"] != saved["first"] and saved["recast"] != saved["first"]
