@@ -37,11 +37,13 @@ advance, and prints PASS, FAIL or SKIP with the numbers behind it:
   must give byte-identical rows.
 
     uv run --extra experiments python -m experiments.sanity [--results DIR] [--quick]
+        [--only CHECK ...]
 
 ``--results`` points at the directory holding finished runs (default
 ``experiments/results``); the report goes to ``<results>/sanity/report.json``
 unless ``--out`` says otherwise. ``--quick`` skips the canaries and the
-determinism runs, which load a month and run backtests.
+determinism runs, which load a month and run backtests. ``--only`` runs just
+the named checks (see :data:`CHECKS`).
 """
 
 from __future__ import annotations
@@ -336,6 +338,20 @@ def determinism() -> dict:
                    max_sharpe_difference_threads=sharpe_gap)
 
 
+#: Every check in report order, as (name, takes the results directory, loads a month).
+CHECKS = (
+    ("analytic_transfer_coefficients", False, False),
+    ("fundamental_law", True, False),
+    ("exact_ic_invariance", True, False),
+    ("placebo", True, False),
+    ("invariance_at_one", True, False),
+    ("cost_identity", True, False),
+    ("lookahead_canaries", False, True),
+    ("latency_monotone", False, True),
+    ("determinism", False, True),
+)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--results", default=str(RESULTS),
@@ -343,13 +359,17 @@ def main(argv=None) -> int:
     parser.add_argument("--out", default=None, help="report directory (default <results>/sanity)")
     parser.add_argument("--quick", action="store_true",
                         help="skip the checks that load a month and run backtests")
+    parser.add_argument("--only", nargs="+", metavar="CHECK",
+                        choices=[name for name, _, _ in CHECKS],
+                        help="run just these checks: " + ", ".join(n for n, _, _ in CHECKS))
     args = parser.parse_args(argv)
     results = Path(args.results)
-    report = [analytic_transfer_coefficients(), fundamental_law(results),
-              exact_ic_invariance(results), placebo(results), invariance_at_one(results),
-              cost_identity(results)]
-    if not args.quick:
-        report += [lookahead_canaries(), latency_monotone(), determinism()]
+    report = []
+    for name, reads_results, loads_month in CHECKS:
+        if (args.only and name not in args.only) or (args.quick and loads_month):
+            continue
+        check = globals()[name]
+        report.append(check(results) if reads_results else check())
     out = Path(args.out) if args.out else results / "sanity"
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.json").write_text(json.dumps(report, indent=2, default=float))
