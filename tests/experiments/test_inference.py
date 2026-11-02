@@ -94,12 +94,27 @@ def test_the_two_losses_rank_a_volatile_book_and_a_steady_one_differently():
 def test_series_the_scaled_loss_cannot_tell_apart_share_one_p_value():
     rng = np.random.default_rng(4)
     base = rng.normal(0.2, 1.0, N_DAYS)
-    summary, per_row = _statistics({"a": base, "b": 2.0 * base,
+    # Scaled by their own sd, 3x and 0.7x the base equal it only up to
+    # rounding (2x would round identically), and are still one series.
+    summary, per_row = _statistics({"a": base, "b": 3.0 * base, "e": 0.7 * base,
                                     "c": rng.normal(0.1, 1.0, N_DAYS)})
-    assert summary["distinct_models"] == 3            # different P&L, so distinct
-    assert summary["mcs_sharpe"]["tied_by_loss"] == 1
-    assert per_row["a"]["mcs_pvalue_sharpe"] == per_row["b"]["mcs_pvalue_sharpe"]
-    assert per_row["b"]["duplicate_of"] is None
+    assert summary["distinct_models"] == 4            # different P&L, so distinct
+    assert summary["mcs_sharpe"]["tied_by_loss"] == 2
+    assert "errors" not in summary["mcs_sharpe"]
+    for r in "be":
+        assert per_row[r]["mcs_pvalue_sharpe"] == per_row["a"]["mcs_pvalue_sharpe"]
+        assert per_row[r]["in_mcs_sharpe"] == per_row["a"]["in_mcs_sharpe"]
+        assert per_row[r]["duplicate_of"] is None
+    assert "tied_by_loss" not in summary["mcs_pnl"]   # their P&L differs
+
+
+def test_tied_columns_ties_series_equal_up_to_rounding_only():
+    rng = np.random.default_rng(11)
+    x = rng.normal(size=50)
+    scaled = inference.scaled_losses(np.column_stack([x, 3.0 * x, x + 1e-6, np.zeros(50),
+                                                      np.zeros(50)]))
+    assert not np.array_equal(scaled[:, 0], scaled[:, 1])
+    assert inference.tied_columns(scaled).tolist() == [0, 0, 2, 3, 3]
 
 
 def test_stepm_counts_distinct_superior_configurations():

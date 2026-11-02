@@ -159,6 +159,10 @@ MCS_LOSSES = {
     "sharpe": ("minus the day's {pnl} P&L over the configuration's full-sample sd: "
                "ranks by daily {pnl} Sharpe"),
 }
+#: Relative gap below which two columns of a loss are one series to the
+#: confidence set (:func:`tied_columns`): rounding is about 1e-16, while two
+#: books that differ at all differ far above this.
+TIE_RTOL = 1e-9
 
 #: Row columns that set what a book is scored on -- the data (the returns
 #: label, the latency) or the cost it pays (cost model, book size, impact
@@ -718,6 +722,27 @@ def distinct_columns(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return first, first[np.ravel(inverse)]
 
 
+def tied_columns(matrix: np.ndarray, rtol: float = TIE_RTOL) -> np.ndarray:
+    """``tied[j]``: the first column equal to column ``j`` up to rounding, else ``j``.
+
+    Two columns are tied when no entry differs by more than ``rtol`` times
+    the larger of their largest magnitudes. A loss built from distinct P&L
+    can still repeat a series up to its last bits -- ``x`` and ``3 x`` once
+    each is divided by its own standard deviation -- which exact equality
+    would hold apart (only a power-of-two multiple rounds identically).
+    """
+    n = matrix.shape[1]
+    tied = np.arange(n)
+    scale = np.abs(matrix).max(axis=0)
+    for j in range(1, n):
+        owners = np.flatnonzero(tied[:j] == np.arange(j))
+        gap = np.abs(matrix[:, owners] - matrix[:, [j]]).max(axis=0)
+        close = np.flatnonzero(gap <= rtol * np.maximum(scale[owners], scale[j]))
+        if len(close):
+            tied[j] = owners[close[0]]
+    return tied
+
+
 def scaled_losses(pnl: np.ndarray) -> np.ndarray:
     """Minus each column of daily P&L over that column's full-sample standard deviation.
 
@@ -763,16 +788,17 @@ def mcs_by_loss(loss: np.ndarray, ids: list[str], first: np.ndarray, representat
     ``loss`` is ``(days, configurations)``; ``first`` and ``representative``
     come from :func:`distinct_columns` on the group's P&L. The set is run on
     the representatives alone. Two that the loss itself cannot tell apart (a
-    vol-scaled loss equates P&L series that are multiples of each other) are
-    tested once and share a p-value. A duplicate mirrors its
+    vol-scaled loss equates P&L series that are multiples of each other, up
+    to rounding: :func:`tied_columns`) are tested once and share a p-value;
+    fed both, the set would divide rounding noise by rounding noise and could
+    keep one and drop the other. A duplicate mirrors its
     representative's p-value and membership, but every count and share in
     the summary is over distinct configurations. Returns the summary and
     ``{row id: (p-value, in the set)}``; no rows when the statistic failed.
     """
     import pandas as pd
 
-    tied_first, tied = distinct_columns(loss[:, first])
-    owner = first if len(tied_first) == len(first) else first[tied]
+    owner = first[tied_columns(loss[:, first])]
     models = list(dict.fromkeys(owner.tolist()))
     summary = {"size": MCS_SIZE, "n_configs": len(ids), "distinct_models": len(first)}
     if len(models) < 2:
