@@ -50,6 +50,10 @@ spec can ask whether a result is an artifact of trading into the open. The
 universe is chosen before the drop, so a run with and without the open scores
 the same names, and every row of such a run carries ``skip_open``.
 
+Every row of the ``impact`` cost model carries ``impact_floor``, the floor in
+basis points its cost carries (0 for none), a scalar a group can be keyed by;
+the ``impact`` column holds the whole coefficient tuple.
+
 Beside ``series.npz`` (each row's gross, net and cost per period) the run
 writes ``periods.npz``, the label of every one of those periods, so the
 day and time of day of each period can be read back afterwards
@@ -508,6 +512,17 @@ def _daily(series) -> tuple[np.ndarray, np.ndarray]:
     return labels, sums
 
 
+def _impact_floor(config: sf.BacktestConfig) -> float:
+    """The floor, in basis points, under an ``impact`` row's cost; 0 for none.
+
+    The row's ``impact`` column holds the whole coefficient tuple, which comes
+    back from ``rows.parquet`` as an array and cannot key a group; this scalar
+    can (``"inference": {"group_add": ["impact_floor"]}`` in a spec).
+    """
+    impact = config.impact or ()
+    return float(impact[3]) if len(impact) == 4 else 0.0
+
+
 def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0,
              variant: dict | None = None) -> tuple[list[dict], dict]:
     key, variant = variant_key(variant), variant or {}
@@ -533,6 +548,8 @@ def run_task(spec: dict, fspec: dict, horizon: int, chunk: int = 0,
                "eval_horizon": horizon, **report.as_dict()}
         if spec.get("skip_open"):
             row["skip_open"] = True
+        if report.config.cost_model == "impact":
+            row["impact_floor"] = _impact_floor(report.config)
         if report.config.cost_model != "mid":
             row["breakeven_efq"] = _breakeven(report.series, report.config.efq)
         row.update(_inference(report.series))
