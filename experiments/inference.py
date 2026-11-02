@@ -14,7 +14,10 @@ decisions' P&L correlated. Three corrections are reported side by side:
   independent across days), with its own Sharpe ratio;
 * Lo's (2002) autocorrelation-adjusted annualization of the per-period
   Sharpe, ``SR * q / sqrt(q + 2 sum_k (q - k) rho_k)`` with ``q`` periods a
-  year and the autocorrelations ``rho_k`` estimated up to ``lags``;
+  year and the autocorrelations ``rho_k`` estimated up to ``lags``. The
+  ratio to the naive Sharpe depends on that count, so it is also reported
+  at lags spanning one horizon, two horizons and one session
+  (``*_hold``, ``*_hold2``, ``*_day``; ``lo`` in the JSON, with a note);
 * a Newey-West (Bartlett-kernel) standard error of the Sharpe ratio by the
   delta method on the first two moments (Lo 2002's GMM form), with
   ``lags = max(floor(4 (T/100)^(2/9)), h / spacing)`` for a book booked every
@@ -150,6 +153,26 @@ MCS_LOSSES = {
     "sharpe": ("minus the day's {pnl} P&L over the configuration's full-sample sd: "
                "ranks by daily {pnl} Sharpe"),
 }
+
+#: Lag counts the Lo-adjusted Sharpe is also reported at, beside the default
+#: (``row_lags``), each in the row's periods (:func:`lo_lags`).
+LO_LAGS = {
+    "hold": "the periods one horizon spans: its overlap, ceil(h / spacing), for a book booked "
+            "every decision; one for a held book or a daily series",
+    "hold2": "twice the hold choice",
+    "day": "the periods in one session, periods_per_year / 252",
+}
+#: Why the Lo ratio is reported at several lag counts.
+LO_NOTE = ("Lo's adjustment sums the autocorrelations up to the lag count and treats the "
+           "rest as zero, so its ratio depends on that count. One horizon (hold) covers "
+           "only the overlap an every-decision book has by construction; persistent "
+           "forecast errors and the intraday volatility pattern correlate P&L across many "
+           "holds, which the hold choice and a held book's default (4-6 periods) leave out, "
+           "so they under-correct. One session (day) reaches them but estimates many noisy "
+           "autocorrelations from about twenty days, and on heteroskedastic intraday P&L "
+           "their sum can come out negative, a ratio above one. Read the ratio as a range "
+           "across lag counts; the daily Sharpe (sharpe_daily_*) needs no lag choice and "
+           "is the primary unit.")
 
 CONFIG_FIELDS = tuple(f.name for f in dataclasses.fields(sf.BacktestConfig))
 PNL = ("mid", "net")  # the series' first two rows: gross (marked at the mid) and net
@@ -435,6 +458,23 @@ def series_statistics(x: np.ndarray, *, q: float, lags: int) -> dict:
                 "sharpe_t_iid": sr0 / iid if iid > 0 else np.nan}
 
 
+def lo_at_lags(x: np.ndarray, *, q: float, lags: dict[str, int]) -> dict:
+    """The Lo-adjusted annual Sharpe and its ratio to the naive one at several lag counts.
+
+    ``lags`` maps a name to a lag count; the keys returned are
+    ``sharpe_lo_<name>`` and ``lo_ratio_<name>``, computed as
+    :func:`series_statistics` computes ``sharpe_lo`` and ``lo_ratio``.
+    """
+    x = x[np.isfinite(x)]
+    sr = _sharpe(x)
+    out = {}
+    for name, n_lags in lags.items():
+        scale = lo_scale(autocorrelations(x, n_lags), q) if np.isfinite(sr) else np.nan
+        out[f"sharpe_lo_{name}"] = sr * scale
+        out[f"lo_ratio_{name}"] = scale / math.sqrt(q)
+    return out
+
+
 def daily_statistics(x: np.ndarray) -> dict:
     """Annual Sharpe of daily P&L, its HAC standard error and probabilistic Sharpe."""
     x = x[np.isfinite(x)]
@@ -461,6 +501,24 @@ def row_lags(row, n_periods: int, spacing: float | None, fixed: int | None) -> i
     if (spacing and row["rebalance"] != "horizon" and row["annualization"] != "daily"):
         lags = max(lags, math.ceil(float(row["eval_horizon"]) / spacing))
     return min(lags, max(n_periods - 2, 0))
+
+
+def lo_lags(row, n_periods: int, spacing: float | None) -> dict[str, int]:
+    """The lag counts of :data:`LO_LAGS` for a row, in its own periods.
+
+    ``hold`` spans one horizon: ``ceil(h / spacing)`` periods for a book
+    booked every decision (the overlap :func:`row_lags` also covers), one
+    for a held book, whose next period starts as the hold ends, or a daily
+    series; one when the spacing is unknown. ``hold2`` is twice that, and
+    ``day`` is the periods in a session, ``periods_per_year / 252``. Each is
+    capped at ``n_periods - 2``, as the default is.
+    """
+    hold = 1
+    if spacing and row["rebalance"] != "horizon" and row["annualization"] != "daily":
+        hold = max(math.ceil(float(row["eval_horizon"]) / spacing), 1)
+    day = max(round(float(row["periods_per_year"]) / DAYS_A_YEAR), 1)
+    cap = max(n_periods - 2, 0)
+    return {"hold": min(hold, cap), "hold2": min(2 * hold, cap), "day": min(day, cap)}
 
 
 # ── bootstrap helpers ───────────────────────────────────────────────────────
@@ -1137,8 +1195,11 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
         record = {"row_id": r, "label_source": source.get(r)}
         n_lags = row_lags(row, values.shape[1], spacing, lags)
         record["lags"] = n_lags
+        choices = lo_lags(row, values.shape[1], spacing)
+        record.update({f"lo_lags_{name}": v for name, v in choices.items()})
         for i, kind in enumerate(PNL):
             stats = series_statistics(values[i], q=q, lags=n_lags)
+            stats.update(lo_at_lags(values[i], q=q, lags=choices))
             record.update({f"{key}_{kind}": v for key, v in stats.items()})
             if r in daily:
                 stats = daily_statistics(daily[r][i][np.isfinite(daily[r][i])])
@@ -1204,6 +1265,14 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
     if daily:
         np.savez_compressed(out / "inference_daily.npz", __days__=all_days, **daily)
 
+    # Lo's ratio at each lag count, the median over rows: how far the choice moves it.
+    lo = {"note": LO_NOTE, "lags": {"default": "the lags column (module docstring)", **LO_LAGS}}
+    for kind in PNL:
+        lo[f"median_ratio_{kind}"] = {
+            "default": float(np.nanmedian(table[f"lo_ratio_{kind}"].to_numpy(float))),
+            **{name: float(np.nanmedian(table[f"lo_ratio_{name}_{kind}"].to_numpy(float)))
+               for name in LO_LAGS}}
+
     report = {
         "name": name, "spec_name": spec.get("name") if spec else None,
         "settings": {"benchmark": benchmark, "group_by": group_by, "pnl": pnl, "reps": reps,
@@ -1224,6 +1293,7 @@ def analyze(name: str, *, benchmark: str = DEFAULT_BENCHMARK, group_by: list[str
             "configs_in_groups": sum(g["n_configs"] for g in groups),
             "distinct_models": sum(g.get("distinct_models", 0) for g in groups),
         },
+        "lo": lo,
         "groups": groups,
         "seed_dispersion": seed_dispersion(table),
         "size_check": size_check(table),
@@ -1270,6 +1340,9 @@ def print_summary(report: dict, table) -> None:
     print(f"  per-period net Sharpe, Lo / naive (median [p10, p90]): "
           f"{_quantiles(table['lo_ratio_net'])}; HAC / iid s.e.: "
           f"{_quantiles(table['sharpe_se_hac_net'] / table['sharpe_se_iid_net'])}")
+    print("  Lo / naive by lag count (median, net; it depends on the count, see lo.note): "
+          + ", ".join(f"{name} {_number(v, '.2f')}"
+                      for name, v in report["lo"]["median_ratio_net"].items()))
     # Name groups and configurations by what varies, not by what every row shares.
     group_keys = [k for k in report["settings"]["group_by"]
                   if len({str(g["keys"].get(k)) for g in report["groups"]}) > 1]

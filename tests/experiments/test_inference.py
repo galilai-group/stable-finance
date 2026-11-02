@@ -155,3 +155,31 @@ def test_dsr_and_pbo_count_a_copy_once():
     summary, _ = _statistics({"a": a, "b": b, "a2": a.copy(), "a3": a.copy()})
     assert summary["dsr"]["n_trials_all"] == 2
     assert summary["dsr"]["n_eff_day"] <= 2.0
+
+
+# ── Lo's ratio at several lag counts ────────────────────────────────────────
+
+def test_lo_lags_span_one_horizon_two_and_a_session_in_the_rows_periods():
+    every = {"rebalance": "every_decision", "annualization": "decisions",
+             "eval_horizon": 900, "periods_per_year": 78 * 252.0}
+    held = {**every, "rebalance": "horizon", "periods_per_year": 26 * 252.0}
+    daily = {**every, "annualization": "daily", "periods_per_year": 252.0}
+    assert inference.lo_lags(every, 1638, 300.0) == {"hold": 3, "hold2": 6, "day": 78}
+    assert inference.lo_lags(held, 546, 300.0) == {"hold": 1, "hold2": 2, "day": 26}
+    assert inference.lo_lags(daily, 21, 300.0) == {"hold": 1, "hold2": 2, "day": 1}
+    assert inference.lo_lags(every, 1638, None)["hold"] == 1
+    assert inference.lo_lags(every, 30, 300.0)["day"] == 28       # capped at n - 2
+
+
+def test_lo_ratio_under_corrects_an_overlapping_book_until_the_lags_cover_it():
+    rng = np.random.default_rng(9)
+    k = 6                       # each period's P&L sums six one-step returns
+    x = np.convolve(rng.normal(0.01, 1.0, 40_000), np.ones(k), mode="valid")
+    q = 10_000.0
+    found = inference.lo_at_lags(x, q=q, lags={"short": 1, "cover": k - 1, "long": 4 * k})
+    np.testing.assert_allclose(found["lo_ratio_cover"], 1.0 / np.sqrt(k), rtol=0.1)
+    np.testing.assert_allclose(found["lo_ratio_long"], 1.0 / np.sqrt(k), rtol=0.1)
+    assert found["lo_ratio_short"] > 1.3 * found["lo_ratio_cover"]
+    stats = inference.series_statistics(x, q=q, lags=k - 1)
+    assert found["lo_ratio_cover"] == stats["lo_ratio"]
+    assert found["sharpe_lo_cover"] == stats["sharpe_lo"]
