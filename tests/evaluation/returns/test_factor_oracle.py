@@ -8,7 +8,7 @@ import pytest
 import stable_finance as sf
 from stable_finance import ForwardReturns, MarketData, MissingRolesError
 from stable_finance.evaluation.returns import copula_forecast, factor_forecast
-from stable_finance.evaluation.returns.oracle import _factor_loadings, _factor_shares
+from stable_finance.evaluation.returns.oracle import factor_loadings, _factor_shares
 
 
 def iid_panel(seed=0, n_decisions=300, n_assets=150, n_horizons=1, vol=None):
@@ -131,7 +131,7 @@ def test_factor_errors_widen_the_ic_spread_when_returns_share_the_factors():
 def test_factor_share_raises_error_correlation_along_the_factors():
     realized = iid_panel(n_decisions=400, n_assets=120)
     _, history = factor_panel(n_assets=120)
-    loadings = _factor_loadings(history.values[:, :, 0], 3)
+    loadings = factor_loadings(history.values[:, :, 0], 3)
     unit = loadings / np.linalg.norm(loadings, axis=1, keepdims=True)
     pairs = np.triu_indices(len(loadings), 1)
     for share in (0.0, 0.5, 1.0):
@@ -317,8 +317,8 @@ def test_loadings_do_not_depend_on_the_order_of_the_history():
     _, history = factor_panel()
     returns = history.values[:, :, 0]
     shuffled = returns[np.random.default_rng(0).permutation(len(returns))]
-    loadings = _factor_loadings(returns, 3)
-    np.testing.assert_allclose(_factor_loadings(shuffled, 3), loadings, atol=1e-10)
+    loadings = factor_loadings(returns, 3)
+    np.testing.assert_allclose(factor_loadings(shuffled, 3), loadings, atol=1e-10)
     assert (loadings**2).sum(axis=1).mean() == pytest.approx(1.0)
 
 

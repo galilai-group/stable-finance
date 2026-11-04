@@ -149,15 +149,15 @@ decisions are solved in order and each starts from the previous solution. The
 problem is convex and solved by accelerated proximal gradient descent, whose
 proximal step is the trade rule itself.
 
-By default that solver is FISTA with a fixed iteration budget (`max_iter`),
-which on a real month of some 650 names runs out at every decision: the book is
-where the iterations stopped, not the optimum. `solver="restart"` (on
-`rebalance`, `allocate` and `MeanVarianceAllocator`; `mv_solver="restart"` in
-`BacktestConfig`) solves to the step tolerance instead, with the adaptive
-restart of O'Donoghue and Candes (2015) in a metric scaled by each name's
-variance, and warns (`ConvergenceWarning`) if it ever reaches its cap of at
-least `RESTART_MAX_ITER` iterations. `return_n_iter=True` returns each
-decision's iteration count beside the weights.
+The solver runs to the step tolerance: accelerated proximal gradient with the
+adaptive restart of O'Donoghue and Candes (2015) in a metric scaled by each
+name's variance, which warns (`ConvergenceWarning`) if it ever reaches its cap
+of at least `RESTART_MAX_ITER` iterations. `solver="fista"` (on `rebalance`,
+`allocate` and `MeanVarianceAllocator`; `mv_solver="fista"` in
+`BacktestConfig`) is plain FISTA stopped at the `max_iter` budget, kept for
+measuring what that budget costs: on a real month it runs out at every
+decision, so its book is where the iterations stopped, not the optimum.
+`return_n_iter=True` returns each decision's iteration count beside the weights.
 
 ```python
 from stable_finance import (
@@ -332,10 +332,9 @@ principal components of past returns (`n_factors`, `factor_share`), so a
 forecast is wrong about many names at once and neutralization or a risk
 model has something to remove. Its IC drifts: the per-decision target is an
 AR(1) around `ic` (`ic_dispersion`, `ic_persistence`). And its accuracy can
-rise with a name's spread or volatility (`quality="spread"` or `"vol"`). On
-August 2020, `factor_share=0.3` widens the per-decision IC's spread from the
-copula's 0.04 to 0.15, about what real signals show there. With all three
-off it is `copula_forecast`, draw for draw.
+rise with a name's spread or volatility (`quality="spread"` or `"vol"`). The
+factor errors widen the per-decision IC's spread to about what real signals
+show. With all three off it is `copula_forecast`, draw for draw.
 
 ```python
 from stable_finance import factor_forecast
@@ -381,7 +380,7 @@ predictors.
 | `universe` | `all`, `tight_50pct`, `tight_25pct` — a cross-sectional screen on each name's own quoted half-spread |
 | `selection` | `all`, `quintile`, `decile`, `decile_long_only` — how much of the ranking to trade |
 | `weighting` | `mean_variance` (cost-aware, path-dependent), `equal`, `inverse_vol`, `min_var`, `erc`, `rank`, `signal` (proportional to the forecast's distance from the median), `min_var_qp` (the long-only minimum-variance optimum `min_var` approximates), `hrp` (hierarchical risk parity) |
-| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `nonlinear_shrinkage` (Ledoit and Wolf, 2020), `embedding` — the last forecasts correlations from the encoder's own representation; `factor` (statistical and, when the market has an `industry` column, industry factors plus specific risk; `factor_covariance`) is asked for by name and is outside the default space |
+| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `nonlinear_shrinkage` (Ledoit and Wolf, 2020), `embedding` — forecasts correlations from the encoder's own representation — and `factor` (statistical and, when the market has an `industry` column, industry factors plus specific risk; `factor_covariance`) |
 | `cost_model` | `mid`, `cross` — free, or the name's own quoted half-spread times `efq` |
 | `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it; `horizon` is outside the default space (see below) |
 | `annualization` | `decisions`, `daily` — whether every decision is an independent period |
@@ -415,7 +414,7 @@ label in it are unchanged:
 |---|---|
 | `alpha` | `"grinold"` or `"grinold_rank"`, with `alpha_ic` — rescale the forecast to `alpha_ic * sigma * z` before construction, `z` the cross-sectional z-score or, for `grinold_rank`, the Gaussian rank score |
 | `neutralize` | `"beta"`, `"industry"`, `"beta_industry"` — residualise the forecast on those exposures before construction |
-| `mv_solver` | `"restart"` — solve the mean-variance rebalance to convergence rather than within the `max_iter` budget (a numerical setting; only `weighting="mean_variance"` reads it) |
+| `mv_solver` | `"fista"` — solve the mean-variance rebalance within the `max_iter` budget instead of to convergence, which is the default (a numerical setting; only `weighting="mean_variance"` reads it) |
 
 ### Signal transforms
 
@@ -675,7 +674,7 @@ name's average daily dollar volume, with the U.S. estimates `b = -0.53` and
 The position ramps linearly over the next trading day, read from the `days`
 labels, so an intraday signal earns only the part of its return it has
 actually bought; and each slice fills at that decision's own mid plus the
-formula's impact. Orders in the same name within one day are one parent
+formula's impact. Orders in the same name within one schedule (two days by default) are one parent
 order, since concavity would otherwise reward slicing. `execution_days=0`
 fills everything at the decision, which is the paper's own accounting. The
 cost does not depend on how long you take: the paper's patience is in its

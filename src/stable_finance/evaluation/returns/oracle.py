@@ -130,6 +130,7 @@ __all__ = [
     "QUALITY_VARIABLES",
     "copula_forecast",
     "factor_forecast",
+    "factor_loadings",
     "oracle_forecast",
 ]
 
@@ -549,34 +550,28 @@ def factor_forecast(
     the IC's spread widens slightly even on pure noise.
 
     **What factor errors do to the IC.** They widen its per-decision spread.
-    When the realized returns load on the same factors -- they do: on August
-    2020 the 5-minute cross-section correlates with the first three loading
-    vectors by 0.26, 0.17 and 0.13 in absolute value on average -- an error
-    that bets on a factor is right or wrong about many names at once. The
-    IC then moves with ``rho_t``, the cross-sectional correlation of the
-    error with the realized normal scores, whose variance is about
+    When the realized returns load on the same factors -- and at intraday
+    horizons they do -- an error that bets on a factor is right or wrong
+    about many names at once. The IC then moves with ``rho_t``, the
+    cross-sectional correlation of the error with the realized normal
+    scores, whose variance is about
     ``factor_share * E[r_t**2] + (1 - factor_share) / (n - 1)``, with
     ``r_t`` the correlation of ``g_t`` with the realized cross-section, and
     the IC's standard deviation is about ``sqrt(1 - c**2)`` times its root.
-    On August 2020 with three factors ``E[r_t**2]`` is 0.068 at
-    ``factor_share=0.3``, which predicts 0.146 and measures 0.151, against
-    the copula's 0.039; real forecasts show 0.12 (ridge, LASSO) to 0.15
-    (15-minute reversal) on the same month. The same nonlinearity that gives
-    the copula its ``O(1 / n)`` shortfall then lowers the mean: the expected
-    cross-sectional correlation is about ``c (1 - Var(rho_t))``, so the mean
-    IC falls short of the copula's by a relative amount of about
-    ``factor_share * (E[r_t**2] - 1 / (n - 1))``: 2% at
-    ``factor_share=0.3`` and 4% at 0.6 on August 2020, 2.5% and 2% measured
-    over four seeds, each within its 2% seed error. That is inside one
-    month's standard error of the mean IC, which the wider spread has
-    itself grown to about 0.0037. It is left in, not calibrated away: it is
-    a property of a forecast whose errors are bets, and every scored row
+    The same nonlinearity that gives the copula its ``O(1 / n)`` shortfall
+    then lowers the mean: the expected cross-sectional correlation is about
+    ``c (1 - Var(rho_t))``, so the mean IC falls short of the copula's by a
+    relative amount of about ``factor_share * (E[r_t**2] - 1 / (n - 1))``,
+    a few percent at the default share on a real month, inside one month's
+    standard error of the mean IC. It is left in, not calibrated away: it
+    is a property of a forecast whose errors are bets, and every scored row
     reports the IC it actually had. On realized returns with no factor
     structure the factor errors barely change the IC's law: the spread is
     the copula's, and the mean is within about a percent of the copula's at
-    ``factor_share=0.3`` and a few percent at ``factor_share=1``, where the
+    the default share and a few percent at ``factor_share=1``, where the
     error is an ``n_factors``-dimensional pattern whose spread across names
-    is far from Gaussian. See ``docs/oracle_forecast_math.md`` (section 8).
+    is far from Gaussian. See ``docs/oracle_forecast_math.md`` (section 8)
+    and ``experiments.sanity`` for the measurements.
 
     **Time-varying IC.** With ``ic_dispersion > 0`` the target is no longer
     ``ic`` at every decision but ``kappa_t = ic + ic_dispersion * a_t``, with
@@ -716,7 +711,7 @@ def factor_forecast(
 
     loadings = directions = shares = own_weight = None
     if factor_share > 0.0:
-        loadings = _factor_loadings(past, int(n_factors))
+        loadings = factor_loadings(past, int(n_factors))
         shares = _factor_shares(loadings, factor_share)
         size = np.linalg.norm(loadings, axis=1, keepdims=True)
         directions = np.divide(np.sqrt(shares)[:, None] * loadings, size,
@@ -807,7 +802,7 @@ def _first_horizon(history: ForwardReturns | None, realized: ForwardReturns) -> 
     return source.values[:, :, 0]
 
 
-def _factor_loadings(returns: NDArray, n_factors: int) -> NDArray:
+def factor_loadings(returns: NDArray, n_factors: int) -> NDArray:
     """Each name's loadings on the first principal components, mean square one.
 
     The components are those of the normal scores of each cross-section,

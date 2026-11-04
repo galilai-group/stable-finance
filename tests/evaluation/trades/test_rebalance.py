@@ -68,11 +68,18 @@ def test_rebalances_are_path_dependent_under_costs():
     )
     covariance = np.array([[[0.01]]])
     weights = allocate(forecast, covariance, cost=0.002).values[:, 0, 0]
+    # One name has a closed form: trade to where the marginal alpha equals
+    # the cost, (mu - c) / (lambda sigma^2), short of the frictionless 1.0.
+    assert weights[0] == pytest.approx(0.8, abs=1e-6)
+    assert allocate(forecast, covariance).values[0, 0, 0] == pytest.approx(1.0, abs=1e-6)
     # Same forecast twice: no reason to trade again at the second decision.
     assert weights[0] == pytest.approx(weights[1])
-    # A reversal trades through the cost band from the held position.
-    assert weights[2] < 0
-    assert abs(weights[2]) < abs(weights[0])
+    # A reversal trades through the cost band from the held position to the
+    # mirror image, since the band is symmetric.
+    assert weights[2] == pytest.approx(-0.8, abs=1e-6)
+    # Path dependence: a book already inside the band is held where it is.
+    held = allocate(forecast, covariance, cost=0.002, initial=[[0.9]]).values[0, 0, 0]
+    assert held == pytest.approx(0.9, abs=1e-6)
 
 
 def test_missing_forecasts_are_zero_expected_return_and_cost_still_applies():
@@ -267,7 +274,7 @@ def test_the_restart_solver_converges_where_the_fixed_budget_runs_out():
     exact = allocate(forecast, sigma, risk_aversion=3.0, cost=cost, max_iter=100000,
                      tol=1e-14).values
     capped, capped_iter = allocate(forecast, sigma, risk_aversion=3.0, cost=cost,
-                                   max_iter=50, return_n_iter=True)
+                                   max_iter=50, solver="fista", return_n_iter=True)
     restart, restart_iter = allocate(forecast, sigma, risk_aversion=3.0, cost=cost,
                                      solver="restart", return_n_iter=True)
     capped, restart = capped.values, restart.values
@@ -316,7 +323,8 @@ def test_a_name_without_variance_keeps_the_unscaled_step():
                               [300])
     cost = np.array([[1e-4, 1e-4, 1e-3]])  # C's edge never pays its cost
     restart = allocate(forecast, sigma[None], cost=cost, solver="restart").values
-    fista = allocate(forecast, sigma[None], cost=cost, max_iter=20000, tol=1e-14).values
+    fista = allocate(forecast, sigma[None], cost=cost, max_iter=20000, tol=1e-14,
+                     solver="fista").values
     assert np.isfinite(restart).all()
     assert restart[0, 2, 0] == 0.0
     np.testing.assert_allclose(restart, fista, rtol=1e-7, atol=1e-9)
@@ -328,22 +336,24 @@ def test_iteration_counts_have_one_entry_per_decision_and_horizon():
     forecast = ForwardReturns(np.random.default_rng(6).normal(0, 1e-3, (7, 4, 2)),
                               np.arange(7), returns.assets, returns.horizons)
     cost = np.full((7, 4), 1e-4)
-    for solver in (None, "restart"):
+    for solver in ("fista", "restart"):
         held, n_iter = allocate(forecast, sigma, cost=cost, solver=solver,
                                 return_n_iter=True)
         assert n_iter.shape == (7, 2) and n_iter.dtype == np.int64
         assert (n_iter >= 1).all()
         np.testing.assert_array_equal(
             held.values, allocate(forecast, sigma, cost=cost, solver=solver).values)
-    _, capped = allocate(forecast, sigma, cost=cost, max_iter=3, return_n_iter=True)
+    _, capped = allocate(forecast, sigma, cost=cost, max_iter=3, solver="fista",
+                         return_n_iter=True)
     assert (capped == 3).all()
 
 
-def test_the_default_solver_is_the_fixed_budget_solver_bit_for_bit():
+def test_the_default_solver_is_the_restart_solver_bit_for_bit():
     forecast, sigma, cost = ill_conditioned(seed=4)
     implicit = allocate(forecast, sigma, cost=cost, max_iter=40).values
-    explicit = allocate(forecast, sigma, cost=cost, max_iter=40, solver=None).values
+    explicit = allocate(forecast, sigma, cost=cost, max_iter=40, solver="restart").values
     np.testing.assert_array_equal(implicit, explicit)
+    assert implicit.shape == explicit.shape and np.isfinite(implicit).all()
 
 
 def test_reaching_the_restart_cap_warns_and_max_iter_can_only_raise_it(monkeypatch):
@@ -368,7 +378,7 @@ def test_reaching_the_restart_cap_warns_and_max_iter_can_only_raise_it(monkeypat
 
 def test_the_fixed_budget_solver_never_warns(recwarn):
     forecast, sigma, cost = ill_conditioned(seed=5, n_decisions=2)
-    allocate(forecast, sigma, cost=cost, max_iter=2)
+    allocate(forecast, sigma, cost=cost, max_iter=2, solver="fista")
     assert not recwarn.list
 
 
@@ -392,4 +402,4 @@ def test_the_allocator_passes_its_solver_through():
     direct = allocate(forecast, allocator.covariance_, risk_aversion=2.0, cost=1e-4,
                       solver="restart")
     np.testing.assert_array_equal(held.values, direct.values)
-    assert MeanVarianceAllocator().get_params()["solver"] is None
+    assert MeanVarianceAllocator().get_params()["solver"] == "restart"

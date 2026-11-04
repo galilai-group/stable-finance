@@ -462,10 +462,8 @@ def estimate_risk(
     raise ValueError(f"unknown risk model {name!r}; choose from {RISK_MODELS}")
 
 
-#: The risk models a backtest configuration may name. ``factor`` is named
-#: but not swept: :data:`~stable_finance.evaluation.config.CONFIG_SPACE` lists
-#: the others explicitly, so adding it left the default space and every label
-#: as they were, and a study asks for it by name.
+#: The risk models a backtest configuration may name, and the ones
+#: :data:`~stable_finance.evaluation.config.CONFIG_SPACE` sweeps.
 RISK_MODELS = (
     "diagonal", "shrunk_sample", "ledoit_wolf", "nonlinear_shrinkage", "embedding",
     "factor",

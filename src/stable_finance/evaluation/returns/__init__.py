@@ -8,6 +8,7 @@ from stable_finance.evaluation.returns.oracle import (
     QUALITY_VARIABLES,
     copula_forecast,
     factor_forecast,
+    factor_loadings,
     oracle_forecast,
 )
 from stable_finance.evaluation.returns.probes import (
@@ -28,6 +29,7 @@ __all__ = [
     "StreamingRidge",
     "copula_forecast",
     "factor_forecast",
+    "factor_loadings",
     "fit",
     "oracle_forecast",
 ]

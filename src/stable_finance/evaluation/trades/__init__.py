@@ -5,6 +5,7 @@ from stable_finance.evaluation.trades.dynamic import (
     partial_adjustment,
 )
 from stable_finance.evaluation.trades.rebalance import (
+    DEFAULT_SOLVER,
     REBALANCE_SOLVERS,
     RESTART_MAX_ITER,
     MeanVarianceAllocator,
@@ -19,6 +20,7 @@ from stable_finance.evaluation.trades.rules import (
 )
 
 __all__ = [
+    "DEFAULT_SOLVER",
     "REBALANCE_SOLVERS",
     "RESTART_MAX_ITER",
     "MeanVarianceAllocator",

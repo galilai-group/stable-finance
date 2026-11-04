@@ -989,13 +989,16 @@ def test_a_sweep_reports_the_transfer_coefficient_each_run_would():
 
 # ── the mean-variance solver ────────────────────────────────────────────────
 
-def test_an_unset_solver_leaves_every_label_and_row_unchanged():
+def test_an_unset_solver_is_the_default_and_stays_out_of_the_label():
     assert "mv_solver" not in DEFAULT_BACKTEST.label
     setup = world()
-    assert "mv_solver" not in run_backtest(**setup, config=DEFAULT_BACKTEST).as_dict()
-    converged = DEFAULT_BACKTEST.replace(mv_solver="restart")
-    assert converged.label == DEFAULT_BACKTEST.label + "|mv_solver=restart"
-    assert run_backtest(**setup, config=converged).as_dict()["mv_solver"] == "restart"
+    unset = run_backtest(**setup, config=DEFAULT_BACKTEST).as_dict()
+    assert "mv_solver" not in unset
+    named = DEFAULT_BACKTEST.replace(mv_solver="restart")
+    assert named.label == DEFAULT_BACKTEST.label + "|mv_solver=restart"
+    explicit = run_backtest(**setup, config=named).as_dict()
+    assert explicit.pop("mv_solver") == "restart"
+    assert explicit == unset
 
 
 def test_the_solver_setting_is_validated():
@@ -1010,10 +1013,11 @@ def test_the_converged_book_does_not_depend_on_the_iteration_budget():
     def run(**changes):
         return run_backtest(**setup, config=DEFAULT_BACKTEST.replace(**changes))
 
-    assert run(max_iter=1).mean_turnover != pytest.approx(run(max_iter=400).mean_turnover)
-    low, high = run(mv_solver="restart", max_iter=1), run(mv_solver="restart", max_iter=400)
+    assert run(mv_solver="fista", max_iter=1).mean_turnover != pytest.approx(
+        run(mv_solver="fista", max_iter=400).mean_turnover)
+    low, high = run(max_iter=1), run(max_iter=400)
     assert {**low.as_dict(), "max_iter": 0} == {**high.as_dict(), "max_iter": 0}
-    tight = run(max_iter=100000)
+    tight = run(mv_solver="fista", max_iter=100000)
     assert low.sharpe_net == pytest.approx(tight.sharpe_net, rel=1e-6)
     assert low.mean_turnover == pytest.approx(tight.mean_turnover, rel=1e-6)
 
@@ -1031,7 +1035,7 @@ def test_the_solver_is_read_only_by_the_mean_variance_allocator():
 def test_a_sweep_keeps_the_two_solvers_books_apart():
     setup = world()
     configs = [DEFAULT_BACKTEST.replace(max_iter=5, mv_solver=solver, efq=efq)
-               for solver in (None, "restart") for efq in (0.0, 1.0)]
+               for solver in ("fista", "restart") for efq in (0.0, 1.0)]
     swept = sweep_configs(setup["forecast"], setup["realized"], configs,
                           half_spread=setup["half_spread"], history=setup["history"],
                           days=setup["days"])

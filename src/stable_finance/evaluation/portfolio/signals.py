@@ -46,7 +46,7 @@ from numpy.typing import ArrayLike, NDArray
 
 from stable_finance.evaluation._grid import _rankdata
 from stable_finance.evaluation.returns.contract import ForwardReturns
-from stable_finance.evaluation.returns.oracle import _factor_loadings
+from stable_finance.evaluation.returns.oracle import factor_loadings
 
 __all__ = [
     "ALPHA_RULES",
@@ -261,7 +261,7 @@ def estimate_loadings(history: ForwardReturns, n_components: int = PCA_COMPONENT
     loads zero on every component.
     """
     values = np.asarray(history.values, dtype=np.float64)
-    return np.stack([_factor_loadings(values[:, :, h], int(n_components))
+    return np.stack([factor_loadings(values[:, :, h], int(n_components))
                      for h in range(values.shape[2])])
 
 

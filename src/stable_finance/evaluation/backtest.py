@@ -79,7 +79,7 @@ from stable_finance.evaluation.scoring.ic import grouped_rank_ic
 from stable_finance.evaluation.scoring.pnl import positions_from_fills
 from stable_finance.evaluation.scoring.sharpe import sharpe_ratio
 from stable_finance.evaluation.scoring.tc import transfer_coefficient
-from stable_finance.evaluation.trades.rebalance import rebalance
+from stable_finance.evaluation.trades.rebalance import DEFAULT_SOLVER, rebalance
 
 __all__ = ["LEVELS", "BacktestReport", "run_backtest", "sweep_configs"]
 
@@ -446,7 +446,7 @@ def _book(context: dict, config: BacktestConfig, sigma: NDArray[np.float64]
     return rebalance(
         target, sigma[None], risk_aversion=risk_aversion,
         cost=np.where(screened, np.nan_to_num(cost, nan=0.0), np.inf),
-        max_iter=config.max_iter, solver=config.mv_solver,
+        max_iter=config.max_iter, solver=config.mv_solver or DEFAULT_SOLVER,
     ).values[:, :, 0], mu
 
 
@@ -670,8 +670,9 @@ def _schedule(context: dict, config: BacktestConfig) -> int:
 
     One trading day is however many decisions the data has in a day, read
     from the ``days`` labels; a run without them cannot say what a day is.
+    The default is two days, about the horizon of the paper's own trades.
     """
-    days = 1.0 if config.execution_days is None else config.execution_days
+    days = 2.0 if config.execution_days is None else config.execution_days
     if days == 0:
         return 0
     if not context["days_given"]:

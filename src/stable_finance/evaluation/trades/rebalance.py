@@ -31,17 +31,11 @@ own ``lambda_t``, step size included, and a scalar is the constant special case.
 
 There are two solvers, and the choice is numerical, never a modelling one: both
 aim at the same unique optimum (the objective is strongly convex whenever
-``Sigma`` is positive definite). The default, ``solver=None``, is FISTA with a
-fixed iteration budget ``max_iter``. On a real month of about 650 names with a
-covariance whose condition number is near 1900 that budget is spent on every
-decision: FISTA's momentum makes it oscillate around the optimum of a strongly
-convex problem rather than settle, so the capped answer is an approximation
-whose error carries forward, because each decision starts from the last. It is
-kept, unchanged, because every published number was computed with it.
+``Sigma`` is positive definite).
 
-``solver="restart"`` runs to the step tolerance instead. It is the same
-accelerated proximal gradient method with the adaptive restart of O'Donoghue
-and Candes (2015, "Adaptive restart for accelerated gradient schemes", Found.
+The default, ``solver="restart"``, runs to the step tolerance. It is
+accelerated proximal gradient with the adaptive restart of O'Donoghue and
+Candes (2015, "Adaptive restart for accelerated gradient schemes", Found.
 Comput. Math. 15:715-732): whenever the step just taken points against the
 generalized gradient, the momentum has carried the iterate past the valley
 floor and is reset. That one test recovers the linear rate an accelerated
@@ -50,20 +44,21 @@ strong-convexity constant, which a shrunk covariance does not advertise. It
 also works in a metric scaled by each name's variance -- a diagonal (Jacobi)
 preconditioner, so each name takes a step sized to its own curvature rather
 than to the riskiest direction in the book. The scaled problem's condition
-number is that of the correlation matrix, about five times smaller than the
-covariance's on the real month, and the accelerated rate improves with its
-square root. The proximal step stays the per-name soft threshold, with each
-name's own step. Its iteration cap, :data:`RESTART_MAX_ITER` or ``max_iter`` if
-larger, is a safety net and not a budget: a run-to-tolerance solver capped
-low is the capped solver again. A solve that reaches it raises a
-:class:`~sklearn.exceptions.ConvergenceWarning`, and ``return_n_iter=True``
-reports every decision's iteration count.
+number is that of the correlation matrix, smaller than the covariance's, and
+the accelerated rate improves with its square root. The proximal step stays
+the per-name soft threshold, with each name's own step. Its iteration cap,
+:data:`RESTART_MAX_ITER` or ``max_iter`` if larger, is a safety net and not a
+budget: a run-to-tolerance solver capped low is the capped solver again. A
+solve that reaches it raises a :class:`~sklearn.exceptions.ConvergenceWarning`,
+and ``return_n_iter=True`` reports every decision's iteration count.
 
-Measured on August 2020 (646 names, 1638 decisions, ``experiments.mv_solver``):
-the default spends all 400 iterations at every decision and lands up to 6e-3
-in weight (median 3e-4) from the optimum given the same previous book; the
-restart solver meets the tolerance at every decision in 167 to 497
-iterations, within 4e-8 of that optimum, in slightly less time in total.
+``solver="fista"`` is plain FISTA stopped after ``max_iter`` iterations. On a
+real cross-section of several hundred names that budget runs out at every
+decision: FISTA's momentum makes it oscillate around the optimum of a strongly
+convex problem rather than settle, so the capped answer is an approximation
+whose error carries forward, because each decision starts from the last. It is
+kept so that the cost of a fixed budget can be measured
+(``experiments.mv_solver``), not as a way to run the allocator.
 """
 
 from __future__ import annotations
@@ -82,6 +77,7 @@ from stable_finance.evaluation.portfolio.risk import estimate_covariance
 from stable_finance.evaluation.returns.contract import ForwardReturns
 
 __all__ = [
+    "DEFAULT_SOLVER",
     "REBALANCE_SOLVERS",
     "RESTART_MAX_ITER",
     "MeanVarianceAllocator",
@@ -89,10 +85,13 @@ __all__ = [
     "rebalance",
 ]
 
-#: The named alternatives to the default solver (``solver=None``, FISTA with a
-#: fixed budget). ``"restart"`` is accelerated proximal gradient with adaptive
-#: restart in a variance-scaled metric, run until the step falls below ``tol``.
-REBALANCE_SOLVERS = ("restart",)
+#: The solvers, by name. ``"restart"`` is accelerated proximal gradient with
+#: adaptive restart in a variance-scaled metric, run until the step falls
+#: below ``tol``; ``"fista"`` is FISTA stopped at the ``max_iter`` budget.
+REBALANCE_SOLVERS = ("restart", "fista")
+
+#: The solver every rebalance uses unless told otherwise.
+DEFAULT_SOLVER = "restart"
 
 #: The least iteration cap the ``"restart"`` solver runs under. On the real
 #: month it converges in a few hundred iterations per decision; the cap exists
@@ -190,9 +189,9 @@ def _rebalance_restart(
     return weights, max_iter, False
 
 
-def _check_solver(solver: str | None) -> None:
-    if solver is not None and solver not in REBALANCE_SOLVERS:
-        raise ValueError(f"solver={solver!r} is not None or one of {REBALANCE_SOLVERS}")
+def _check_solver(solver: str) -> None:
+    if solver not in REBALANCE_SOLVERS:
+        raise ValueError(f"solver={solver!r} is not one of {REBALANCE_SOLVERS}")
 
 
 def _variance_scaled_curvature(sigma: np.ndarray, largest: float) -> tuple[np.ndarray, float]:
@@ -245,7 +244,7 @@ def _broadcast_initial(
 
 
 def _track(signal: np.ndarray, covariance: ArrayLike, *, risk_aversion: float | ArrayLike,
-           cost, initial, max_iter: int, tol: float, solver: str | None = None
+           cost, initial, max_iter: int, tol: float, solver: str = DEFAULT_SOLVER
            ) -> tuple[np.ndarray, np.ndarray]:
     """Every decision's rebalance, in order, from ``signal = lambda_t * Sigma @ w*``.
 
@@ -257,8 +256,9 @@ def _track(signal: np.ndarray, covariance: ArrayLike, *, risk_aversion: float | 
     ``L`` the covariance's largest eigenvalue, is that decision's own, since
     the gradient's Lipschitz constant scales with ``lambda_t``.
 
-    ``solver="restart"`` scales that step per name by its variance (see
-    :func:`_rebalance_restart`). Returns the weights and each decision's
+    The default solver scales that step per name by its variance (see
+    :func:`_rebalance_restart`); ``"fista"`` takes the unscaled step within
+    the ``max_iter`` budget. Returns the weights and each decision's
     iteration count, ``(n_decisions, n_horizons)``.
     """
     _check_solver(solver)
@@ -322,7 +322,7 @@ def rebalance(
     initial: ArrayLike | None = None,
     max_iter: int = 1000,
     tol: float = 1e-10,
-    solver: str | None = None,
+    solver: str = DEFAULT_SOLVER,
     return_n_iter: bool = False,
 ) -> PortfolioWeights | tuple[PortfolioWeights, np.ndarray]:
     """The weights actually held, moving toward ``target`` only as far as cost allows.
@@ -338,15 +338,15 @@ def rebalance(
     ``(n_assets, n_horizons)`` and defaults to cash. A missing target is a
     target of zero. ``cost=None`` moves straight to the target.
 
-    ``solver=None`` is FISTA stopped after ``max_iter`` iterations or once the
-    largest weight change in an iteration falls below ``tol``, whichever is
-    first; ``solver="restart"`` runs accelerated proximal gradient with
-    adaptive restart until that change falls below ``tol``, under a cap of
-    ``max(max_iter, RESTART_MAX_ITER)`` (see the module docstring). With
-    ``return_n_iter=True`` the result is ``(weights, n_iter)``, ``n_iter``
-    holding the iterations each decision's solve ran, ``(n_decisions,
-    n_horizons)``: under the default solver a count equal to ``max_iter``
-    means the budget, not the tolerance, ended the solve.
+    ``solver="restart"`` (the default) runs accelerated proximal gradient with
+    adaptive restart until the largest weight change in an iteration falls
+    below ``tol``, under a cap of ``max(max_iter, RESTART_MAX_ITER)``;
+    ``solver="fista"`` is FISTA stopped after ``max_iter`` iterations or once
+    that change falls below ``tol``, whichever is first (see the module
+    docstring). With ``return_n_iter=True`` the result is ``(weights,
+    n_iter)``, ``n_iter`` holding the iterations each decision's solve ran,
+    ``(n_decisions, n_horizons)``: under ``"fista"`` a count equal to
+    ``max_iter`` means the budget, not the tolerance, ended the solve.
     """
     _check_solver(solver)
     cost = market_quantity(cost, "half_spread", stage=rebalance, like=target)
@@ -372,7 +372,7 @@ def allocate(
     initial: ArrayLike | None = None,
     max_iter: int = 1000,
     tol: float = 1e-10,
-    solver: str | None = None,
+    solver: str = DEFAULT_SOLVER,
     return_n_iter: bool = False,
 ) -> PortfolioWeights | tuple[PortfolioWeights, np.ndarray]:
     """Forecasts to held weights in one solve: the mean-variance target, rebalanced toward.
@@ -422,7 +422,7 @@ class MeanVarianceAllocator(BaseEstimator):
         min_samples: int = 2,
         max_iter: int = 1000,
         tol: float = 1e-10,
-        solver: str | None = None,
+        solver: str = DEFAULT_SOLVER,
     ) -> None:
         self.risk_aversion = risk_aversion
         self.shrinkage = shrinkage
