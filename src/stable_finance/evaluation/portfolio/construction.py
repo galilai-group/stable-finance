@@ -745,11 +745,78 @@ def _per_decision_risk_aversion(
     return array
 
 
+def _bounded_target(target, sigma, loadings, lower, upper, root):
+    """Project one frictionless target into its factor bounds in the risk metric."""
+    from scipy.linalg import qr, solve_triangular
+    from scipy.optimize import LinearConstraint, minimize
+
+    bounded = np.isfinite(lower) | np.isfinite(upper)
+    loadings, lower, upper = loadings[:, bounded], lower[bounded], upper[bounded]
+    known = np.isfinite(loadings).all(axis=1)
+    weights = np.zeros_like(target)
+    matrix = loadings[known].T
+    if not known.all():
+        # Unknown exposure is not zero exposure: leave those names out of the
+        # target, and refit the remaining names rather than clipping a hedge.
+        target = np.linalg.solve(sigma[np.ix_(known, known)], (sigma @ target)[known])
+        sigma = sigma[np.ix_(known, known)]
+        if known.any():
+            root = np.linalg.cholesky(sigma / np.max(np.diag(sigma)))
+    scale = np.max(np.abs(matrix), axis=1, initial=0.0)
+    empty = scale == 0
+    if np.any(empty & ((lower > 0) | (upper < 0))):
+        raise ValueError("factor bounds are infeasible")
+    matrix = matrix[~empty] / scale[~empty, None]
+    lower, upper = lower[~empty] / scale[~empty], upper[~empty] / scale[~empty]
+    exposure = matrix @ target
+    if np.all(exposure >= lower) and np.all(exposure <= upper):
+        weights[known] = target
+        return weights
+
+    # In risk coordinates z = L' (w - target), curvature is the identity.
+    # Solving directly in weights can stop far from the optimum in a weak
+    # risk direction even when the factor constraints are satisfied.
+    design = solve_triangular(root, matrix.T, lower=True).T
+    norm = np.linalg.norm(design, axis=1)
+    design = design / norm[:, None]
+    low, high = (lower - exposure) / norm, (upper - exposure) / norm
+    equal = lower == upper
+    constraints = []
+    if equal.any():
+        equations, values = design[equal], low[equal]
+        # Industry columns and caller matrices can be redundant. SLSQP needs
+        # an independent equality system; keep the same feasible set.
+        _, triangular, order = qr(equations.T, mode="economic", pivoting=True)
+        rank = np.linalg.matrix_rank(triangular)
+        independent = order[:rank]
+        feasible = np.linalg.lstsq(equations, values, rcond=None)[0]
+        if not np.allclose(equations @ feasible, values, atol=1e-9, rtol=1e-9):
+            raise ValueError("factor bounds are infeasible")
+        constraints.append(LinearConstraint(equations[independent], values[independent],
+                                            values[independent]))
+    if (~equal).any():
+        constraints.append(LinearConstraint(design[~equal], low[~equal], high[~equal]))
+
+    solved = minimize(lambda z: (0.5 * z @ z, z), np.zeros_like(target),
+                      jac=True, constraints=constraints,
+                      method="SLSQP", options=dict(ftol=1e-12, maxiter=500))
+    candidate = target + solve_triangular(root.T, solved.x, lower=False)
+    exposure = matrix @ candidate
+    if (not solved.success or np.any(exposure < lower - 1e-8)
+            or np.any(exposure > upper + 1e-8)):
+        raise ValueError(f"factor bounds could not be satisfied: {solved.message}")
+    weights[known] = candidate
+    return weights
+
+
 def mean_variance_target(
     forecast: ForwardReturns,
     covariance: ArrayLike,
     *,
     risk_aversion: float | ArrayLike = 1.0,
+    factor_loadings: ArrayLike | None = None,
+    factor_lower: ArrayLike | None = None,
+    factor_upper: ArrayLike | None = None,
 ) -> PortfolioWeights:
     """The frictionless mean-variance holding, ``Sigma^-1 mu_t / lambda_t``.
 
@@ -762,6 +829,17 @@ def mean_variance_target(
     return. How far to actually move toward this target, given costs, is the
     trades stage's decision
     (:func:`~stable_finance.evaluation.trades.rebalance.rebalance`).
+
+    Optional ``factor_loadings`` have shape ``(asset, factor)`` or
+    ``(decision, asset, factor)`` and bound the target's factor exposures by
+    ``factor_lower <= loadings.T @ weights <= factor_upper``. Bounds are
+    scalars or one value per factor. Equal bounds fix exposure at that value;
+    equal zero bounds impose factor neutrality.
+    This solves the constrained mean-variance problem with positive definite
+    covariance and does not rescale the weights afterwards. Names with unknown
+    loadings receive zero weight.
+    These are TARGET bounds: trading costs and execution may leave the held
+    book outside them, which is measured separately in the backtest report.
     """
     mu = np.nan_to_num(np.asarray(forecast.values, dtype=np.float64), nan=0.0)
     aversion = _per_decision_risk_aversion(risk_aversion, mu.shape[0])
@@ -774,6 +852,31 @@ def mean_variance_target(
     for horizon in range(mu.shape[2]):
         target[:, :, horizon] = (
             np.linalg.solve(sigma[horizon], mu[:, :, horizon].T).T / aversion[:, None])
+    if factor_loadings is not None:
+        loadings = np.asarray(factor_loadings, dtype=np.float64)
+        if loadings.ndim not in (2, 3) or loadings.shape[-2] != mu.shape[1]:
+            raise ValueError("factor_loadings must have shape (asset, factor) or "
+                             "(decision, asset, factor)")
+        loadings = np.broadcast_to(loadings, (mu.shape[0], mu.shape[1], loadings.shape[-1]))
+        if factor_lower is None or factor_upper is None:
+            raise ValueError("factor_loadings needs factor_lower and factor_upper")
+        lower = np.broadcast_to(np.asarray(factor_lower, dtype=np.float64), (loadings.shape[-1],))
+        upper = np.broadcast_to(np.asarray(factor_upper, dtype=np.float64), (loadings.shape[-1],))
+        if np.any(np.isnan(lower) | np.isnan(upper) | (lower > upper)
+                  | np.isposinf(lower) | np.isneginf(upper)):
+            raise ValueError("factor bounds must be ordered and not NaN")
+        scale = np.max(np.diagonal(sigma, axis1=1, axis2=2), axis=1)
+        try:
+            roots = np.linalg.cholesky(sigma / scale[:, None, None])
+        except np.linalg.LinAlgError:
+            raise ValueError("factor bounds need positive definite covariance")
+        for horizon in range(mu.shape[2]):
+            for decision in range(mu.shape[0]):
+                target[decision, :, horizon] = _bounded_target(
+                    target[decision, :, horizon], sigma[horizon], loadings[decision],
+                    lower, upper, roots[horizon])
+    elif factor_lower is not None or factor_upper is not None:
+        raise ValueError("factor bounds need factor_loadings")
     return PortfolioWeights(target, forecast.decisions, forecast.assets, forecast.horizons)
 
 

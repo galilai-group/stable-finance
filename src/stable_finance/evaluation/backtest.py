@@ -71,11 +71,12 @@ from stable_finance.evaluation.portfolio.construction import (
 )
 from stable_finance.evaluation.portfolio.risk import apply_screen, estimate_risk
 from stable_finance.evaluation.portfolio.signals import (
-    alpha_from_rule, apply_signal, estimate_beta, estimate_loadings,
+    alpha_from_rule, apply_signal, estimate_beta, estimate_loadings, industry_exposures,
 )
 from stable_finance.evaluation.returns.contract import ForwardReturns
 from stable_finance.evaluation.returns.probes import RidgeProbe
 from stable_finance.evaluation.scoring.ic import grouped_rank_ic
+from stable_finance.evaluation.scoring.exposure import PortfolioExposure, portfolio_exposure
 from stable_finance.evaluation.scoring.pnl import positions_from_fills
 from stable_finance.evaluation.scoring.sharpe import sharpe_ratio
 from stable_finance.evaluation.scoring.tc import transfer_coefficient
@@ -88,7 +89,8 @@ __all__ = ["LEVELS", "BacktestReport", "run_backtest", "sweep_configs"]
 #: remaining axes -- which act only on an existing book -- are evaluated on top.
 _BOOK_AXES = ("universe", "selection", "weighting", "risk_model", "cost_model",
               "efq", "gross_exposure", "shrinkage", "max_iter", "equity", "impact",
-              "alpha", "alpha_ic", "neutralize", "mv_solver", *FEE_SETTINGS)
+              "alpha", "alpha_ic", "neutralize", "mv_solver",
+              "factor_exposure", "factor_limit", *FEE_SETTINGS)
 
 
 #: The book axes only the cost-aware allocator reads. A path-independent rule
@@ -207,6 +209,9 @@ class BacktestReport:
     #: configuration charges fees; it is part of ``mean_cost_bps``, not on top
     #: of it. None otherwise, and then absent from :meth:`as_dict`.
     mean_fee_bps: float | None = None
+    #: Diagnostics of actual positions reconstructed from fills. Present
+    #: when factor_exposure is configured; bounds apply to targets, not fills.
+    exposure: PortfolioExposure | None = None
 
     def as_dict(self) -> dict:
         """A flat, JSON-serializable row: config axes beside the scores.
@@ -216,8 +221,12 @@ class BacktestReport:
         ``mean_fee_bps`` for a configuration that charges no fees.
         """
         row = {k: v for k, v in asdict(self).items()
-               if k not in ("config", "series")
+               if k not in ("config", "series", "exposure")
                and not (k == "mean_fee_bps" and v is None)}
+        if self.exposure is not None:
+            row["mean_concentration"] = float(self.exposure.concentration.mean())
+            row["max_abs_factor_exposure"] = float(
+                np.max(np.abs(self.exposure.factor_exposure), initial=0.0))
         config = {k: v for k, v in asdict(self.config).items()
                   if not (k in OPTIONAL_SETTINGS and v is None)}
         return {**config, **row}
@@ -350,6 +359,42 @@ def _loadings(context, history, realized) -> NDArray[np.float64]:
     return context["loadings"]
 
 
+def _exposures(context, config, history, realized) -> None:
+    """Cache the library's factor estimates for constraints and held-book scoring.
+
+    Like the risk models, estimates use history when supplied. Pass a prior
+    period to keep them out of sample. Industry membership is read at each
+    decision, so a reclassification is not carried back to earlier targets.
+    """
+    kind = config.factor_exposure
+    if kind is None:
+        return
+    cache = context.setdefault("factors", {})
+    if kind in cache:
+        return
+    parts, names = [], []
+    shape = (context["n_decisions"], context["n_assets"])
+    if kind in ("beta", "beta_industry"):
+        parts.append(np.broadcast_to(_beta(context, history, realized), shape)[:, :, None])
+        names.append("beta")
+    if kind in ("industry", "beta_industry"):
+        codes = context["market"].get("industry")
+        industries = np.unique(codes[np.isfinite(codes)])
+        if len(industries):
+            parts.append(industry_exposures(codes))
+            names.extend(f"industry_{code:g}" for code in industries)
+        else:
+            parts.append(np.full((*shape, 1), np.nan))
+            names.append("industry_unknown")
+    if kind == "pca3":
+        loadings = _loadings(context, history, realized).copy()
+        panel = _history_panel(context, history, realized)
+        loadings[np.isfinite(panel.values[:, :, 0]).sum(axis=0) < 2] = np.nan
+        parts.append(np.broadcast_to(loadings, (*shape, loadings.shape[1])))
+        names.extend(f"pc_{i + 1}" for i in range(loadings.shape[1]))
+    cache[kind] = (np.concatenate(parts, axis=2), tuple(names))
+
+
 def _signal(context: dict, config: BacktestConfig, sigma, screened) -> NDArray[np.float64]:
     """The forecast the book is built from, after the configured transforms.
 
@@ -441,7 +486,12 @@ def _book(context: dict, config: BacktestConfig, sigma: NDArray[np.float64]
     risk_aversion = causal_risk_aversion(masked, sigma, config.gross_exposure)
     # The portfolio stage says what to hold; the trades stage how far to move
     # there, given what trading costs.
-    target = mean_variance_target(forecast, sigma[None], risk_aversion=risk_aversion)
+    limits = {}
+    if config.factor_limit is not None:
+        limits = dict(factor_loadings=context["factors"][config.factor_exposure][0],
+                      factor_lower=-config.factor_limit, factor_upper=config.factor_limit)
+    target = mean_variance_target(forecast, sigma[None], risk_aversion=risk_aversion,
+                                  **limits)
     cost = _cost(config, spread, mu.shape, context=context, target=target.values[:, :, 0])
     return rebalance(
         target, sigma[None], risk_aversion=risk_aversion,
@@ -804,6 +854,9 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
             fee=None if fee_series is None else fee_series.copy(),
         ) if with_series else None,
         mean_fee_bps=None if fee_series is None else float(np.nanmean(fee_series) * 1e4),
+        exposure=(portfolio_exposure(values, context["factors"][config.factor_exposure][0],
+                                     factor_names=context["factors"][config.factor_exposure][1])
+                  if config.factor_exposure is not None else None),
     )
 
 
@@ -826,6 +879,9 @@ def _check_axes(config: BacktestConfig, market: MarketData, source) -> None:
     if isinstance(source, ForwardReturns):
         check_config(config, market)
     else:
+        if config.factor_limit is not None:
+            raise ValueError("factor_limit builds a target from forecasts; for weights or "
+                             "orders use factor_exposure alone to report held exposures")
         check_config(config.replace(universe="all", alpha=None, alpha_ic=None,
                                     neutralize=None), market)
 
@@ -909,6 +965,7 @@ def run_backtest(
         raise ValueError("holding='drift' is supported for the mid and cross cost models")
     _check_axes(config, market, source)
     context = _prepare(source, realized, market, days, horizon_index)
+    _exposures(context, config, history, realized)
     if efq is not None:
         context["efq"] = np.broadcast_to(_efq_array(efq), (context["n_decisions"], context["n_assets"]))
     if isinstance(source, ForwardReturns):
@@ -998,7 +1055,7 @@ def sweep_configs(
             try:
                 reports.append(run_backtest(source, realized, market=market, days=days,
                                             config=config, horizon_index=horizon_index,
-                                            with_series=with_series))
+                                            with_series=with_series, history=history))
             except Exception:
                 if on_error == "raise":
                     raise
@@ -1027,6 +1084,7 @@ def sweep_configs(
                 _beta(context, history, realized)
             if config.neutralize == "pca3":
                 _loadings(context, history, realized)
+            _exposures(context, config, history, realized)
             # A held book that drops part of its forecast is a different book.
             book_key = (*_book_key(config), ("drops_forecast", _drops_forecast(context, config)))
             if book_key in book_cache:

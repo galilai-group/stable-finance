@@ -160,6 +160,7 @@ from stable_finance.evaluation.scoring import (
     PBOResult,
     SharpeDifference,
     TransferCoefficient,
+    PortfolioExposure,
     breakeven_efq,
     cross_spread_sharpe,
     deflated_sharpe,
@@ -180,6 +181,7 @@ from stable_finance.evaluation.scoring import (
     sharpe_difference,
     sharpe_ratio,
     sharpe_vs_execution_quality,
+    portfolio_exposure,
     transfer_coefficient,
 )
 from stable_finance.evaluation.trades import (
@@ -259,6 +261,7 @@ __all__ = [
     "SharpeDifference",
     "StreamingRidge",
     "TransferCoefficient",
+    "PortfolioExposure",
     "UNIVERSE_REQUIRES",
     "UNIVERSE_SCREENS",
     "WEIGHTING_REQUIRES",
@@ -337,6 +340,7 @@ __all__ = [
     "sharpe_difference",
     "sharpe_ratio",
     "sharpe_vs_execution_quality",
+    "portfolio_exposure",
     "simulate_fills",
     "sweep_configs",
     "tail_selection",
