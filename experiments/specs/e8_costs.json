@@ -1,0 +1,75 @@
+{
+  "name": "e8_costs",
+  "description": "Cost realism at the 15-minute horizon on the v2 cache: returns VWAP-to-VWAP versus midquote-to-midquote (bid-ask bounce), execution latency 1, 5 and 30 seconds, and 2020 fees (Reg NMS take fee 0.003 USD/share and the SEC Section 31 rate 22.10e-6 on sales) on top of the spread at EFQ 0.7 and 1.0, for the IC-0.03 oracle and the real 15-minute reversal signal. Needs the v2 cache for Jul and Aug 2020 and results/signals/reversal_15m.npz. About 12 tasks of 8 configurations: roughly 10 minutes.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [
+    900
+  ],
+  "cache": "v2",
+  "returns": [
+    "vwap",
+    "mid"
+  ],
+  "latency": [
+    1,
+    5,
+    30
+  ],
+  "forecasts": [
+    {
+      "kind": "oracle",
+      "ic": [
+        0.03
+      ],
+      "noise": [
+        "random"
+      ],
+      "seed": 0
+    },
+    {
+      "kind": "file",
+      "paths": [
+        "experiments/results/signals/reversal_15m.npz"
+      ]
+    }
+  ],
+  "configs": {
+    "base": {
+      "cost_model": "cross",
+      "risk_model": "shrunk_sample",
+      "universe": "all",
+      "annualization": "decisions",
+      "selection": "all",
+      "rebalance": "horizon"
+    },
+    "grid": {
+      "weighting": [
+        "signal",
+        "rank"
+      ],
+      "efq": [
+        0.7,
+        1.0
+      ],
+      "fee_per_share": [
+        null,
+        0.003
+      ],
+      "sec_fee_rate": [
+        null,
+        2.21e-05
+      ]
+    },
+    "exclude": [
+      {
+        "fee_per_share": null,
+        "sec_fee_rate": 2.21e-05
+      },
+      {
+        "fee_per_share": 0.003,
+        "sec_fee_rate": null
+      }
+    ]
+  }
+}

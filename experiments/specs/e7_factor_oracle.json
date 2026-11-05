@@ -1,0 +1,52 @@
+{
+  "name": "e7_factor_oracle",
+  "description": "Do neutralization and a factor risk model help when forecast errors are factor bets? Factor-structured oracles (factor_forecast, three principal-component factors) at IC 0.03 with 0, 30% and 60% of error variance from the factors, two seeds; beta neutralization on or off, shrunk-sample or factor risk model, signal and HRP books held for the horizon. With iid errors (share 0) these transforms can only remove signal. About 6 tasks of 16 configurations: roughly 10 minutes.",
+  "eval_month": "2020-08",
+  "history_month": "2020-07",
+  "horizons": [
+    900
+  ],
+  "forecasts": {
+    "kind": "factor",
+    "ic": [
+      0.03
+    ],
+    "n_factors": 3,
+    "factor_share": [
+      0.0,
+      0.3,
+      0.6
+    ],
+    "seed": [
+      0,
+      1
+    ]
+  },
+  "configs": {
+    "base": {
+      "cost_model": "cross",
+      "universe": "all",
+      "annualization": "decisions",
+      "selection": "all",
+      "rebalance": "horizon"
+    },
+    "grid": {
+      "weighting": [
+        "signal",
+        "hrp"
+      ],
+      "neutralize": [
+        null,
+        "beta"
+      ],
+      "risk_model": [
+        "shrunk_sample",
+        "factor"
+      ],
+      "efq": [
+        0.0,
+        0.7
+      ]
+    }
+  }
+}
