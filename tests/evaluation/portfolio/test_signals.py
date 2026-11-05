@@ -16,6 +16,7 @@ from stable_finance.evaluation.portfolio.signals import (
     alpha_from_rule,
     apply_signal,
     estimate_beta,
+    estimate_loadings,
     industry_exposures,
     neutralize,
     refine_alpha,
@@ -189,6 +190,25 @@ def test_neutralize_broadcasts_static_exposures_over_decisions():
     static = np.random.default_rng(4).normal(size=(values.shape[1], 1))
     tiled = np.broadcast_to(static, (*values.shape, 1))
     np.testing.assert_allclose(neutralize(values, static), neutralize(values, tiled))
+
+
+def test_pca3_residual_is_orthogonal_to_the_history_principal_components():
+    rng = np.random.default_rng(5)
+    common = rng.normal(size=(120, 3)) @ rng.normal(size=(3, 12))
+    history = ForwardReturns((common + 0.3 * rng.normal(size=(120, 12)))[:, :, None],
+                             np.arange(120), np.array([f"A{i}" for i in range(12)]),
+                             np.array([300]))
+    loadings = estimate_loadings(history)
+    assert loadings.shape == (1, 12, 3)
+    values = forecast(n_assets=12)
+    residual = apply_signal("pca3", values, eligible=np.ones(values.shape, dtype=bool),
+                            loadings=loadings[0])
+    for decision in range(values.shape[0]):
+        assert residual[decision].sum() == pytest.approx(0.0, abs=1e-12)
+        np.testing.assert_allclose(residual[decision] @ loadings[0], 0.0, atol=1e-10)
+    assert "pca3" in NEUTRALIZATIONS and SIGNAL_REQUIRES["pca3"] == ()
+    with pytest.raises(ValueError, match="loadings"):
+        apply_signal("pca3", values, eligible=np.ones(values.shape, dtype=bool))
 
 
 def test_industry_neutralization_demeans_within_each_industry():

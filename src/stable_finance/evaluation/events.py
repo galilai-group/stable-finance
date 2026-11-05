@@ -34,8 +34,10 @@ exit price when there is one). Under drift holding these compound to
 
 THE COST. The configured cost model at each fill (``cross``: EFQ times the
 half-spread at the arrival touch, measured against the decision's mid; a
-per-trade ``efq`` overrides the config's). An entry that cannot fill is
-retried at the next decision the name quotes.
+per-trade ``efq`` overrides the config's), plus the configuration's fees on
+each fill (``fee_bps``, ``fee_per_share`` at the decision's mid,
+``sec_fee_rate`` on the sale). An entry that cannot fill is retried at the
+next decision the name quotes.
 """
 
 from __future__ import annotations
@@ -53,7 +55,7 @@ from stable_finance.dataset.anchors import TO_CLOSE
 from stable_finance.dataset.market import MarketData
 from stable_finance.evaluation.backtest import BacktestReport, run_backtest
 from stable_finance.evaluation.config import DEFAULT_BACKTEST, BacktestConfig
-from stable_finance.evaluation.execution import _efq_array, fill_path
+from stable_finance.evaluation.execution import _efq_array, fee_cost, fill_path
 from stable_finance.evaluation.inputs import epoch_seconds
 from stable_finance.evaluation.portfolio.contract import PortfolioWeights
 from stable_finance.evaluation.returns.contract import ForwardReturns
@@ -265,6 +267,10 @@ def event_backtest(trades: Trades, tape: Mapping, *, config: BacktestConfig = DE
     q, price, mid = fills.quantity[:, :, 0], fills.price[:, :, 0], fills.mid_price[:, :, 0]
     with np.errstate(invalid="ignore", divide="ignore"):
         slip = np.where(q != 0, (price - mid) / mid, 0.0)
+    # Each fill's fees, as the report charged them, so a trade's ledger cost
+    # sums with the others' to the report's.
+    fee = (fee_cost(q, market.get("mid") if config.fee_per_share is not None else None,
+                    **config.fees) if config.fees else None)
     pnl = np.where(np.isfinite(realized.values[:, :, 0]), held * realized.values[:, :, 0], 0.0)
     n = len(trades)
     out = {k: np.full(n, np.nan) for k in ("entry_price", "exit_price", "gross", "cost")}
@@ -278,5 +284,7 @@ def event_backtest(trades: Trades, tape: Mapping, *, config: BacktestConfig = DE
             t_out[i], out["exit_price"][i] = weights.decisions[traded[-1]], price[traded[-1], s]
         out["gross"][i] = pnl[js, s].sum()
         out["cost"][i] = (q[js, s] * slip[js, s]).sum()
+        if fee is not None:
+            out["cost"][i] += fee[js, s].sum()
     return EventResult(report, EventLedger(slot, t_in, t_out, out["entry_price"], out["exit_price"],
                                            out["gross"], out["cost"]))

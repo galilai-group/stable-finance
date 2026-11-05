@@ -10,11 +10,19 @@ from numpy.typing import ArrayLike
 from stable_finance.evaluation._grid import _rankdata, require_aligned
 from stable_finance.dataset.market import requires
 from stable_finance.evaluation.returns.contract import ForwardReturns
+from stable_finance.evaluation.scoring.stats import _bartlett_long_run_variance
 
 
 @dataclass(frozen=True)
 class InformationCoefficient:
-    """Mean cross-sectional rank IC and its decision-level standard error."""
+    """Mean cross-sectional rank IC and its decision-level standard error.
+
+    The standard error treats the decisions' ICs as independent unless it was
+    asked to allow for their overlap (``lags`` in :func:`grouped_rank_ic`):
+    forward returns longer than the decision spacing share their later
+    stretches, so neighbouring ICs are correlated and the iid figure is too
+    small.
+    """
 
     mean: float
     standard_error: float
@@ -29,14 +37,42 @@ def _pearson_correlation(left: np.ndarray, right: np.ndarray) -> float:
     return float(np.dot(left, right) / denominator) if denominator > 0 else np.nan
 
 
+def _newey_west_standard_error(values: np.ndarray, rows: np.ndarray, n_rows: int,
+                               lags: int) -> float:
+    """Standard error of the mean of a series observed at ``rows`` of ``n_rows``.
+
+    Newey--West (Bartlett kernel) with lags counted in rows, so two values
+    are ``l`` apart when their rows are, whatever was skipped between them:
+    the series is demeaned and zero-filled where it was not observed, which
+    drops exactly the pairs with a missing side. Scaled by ``1 / (n - 1)``,
+    so ``lags=0`` is the iid ``std(ddof=1) / sqrt(n)``.
+    """
+    n = len(values)
+    if n < 2:
+        return np.nan
+    series = np.zeros(n_rows)
+    series[rows] = values - values.mean()
+    long_run = _bartlett_long_run_variance(series, lags) * n_rows / (n - 1)
+    return float(np.sqrt(max(long_run, 0.0) / n))
+
+
 def grouped_rank_ic(predicted: ArrayLike, realized: ArrayLike, *,
-                    min_assets: int = 20) -> InformationCoefficient:
+                    min_assets: int = 20, lags: int | None = None) -> InformationCoefficient:
     """Average Spearman correlation across decision-time cross-sections.
 
     Args:
         predicted: ``(n_decisions, n_assets)`` scores or forward returns.
         realized: Array of identical shape containing realized returns.
         min_assets: Minimum finite pairs needed to score a decision.
+        lags: Newey--West lags for the standard error, in decisions. None
+            (default) treats the decisions' ICs as independent. A forward
+            return spanning ``k`` decisions overlaps the next ``k - 1``
+            decisions' returns, so their ICs are correlated out to lag
+            ``k - 1`` and ``lags`` should be at least that (the Bartlett
+            weights shrink the longer lags, so a little more is safer).
+            Lags count rows of the panel: a decision too sparse to score
+            leaves a gap rather than closing up. ``lags=0`` is the iid
+            figure. The mean is the same either way.
     """
     predicted = np.asarray(predicted, dtype=np.float64)
     realized = np.asarray(realized, dtype=np.float64)
@@ -44,9 +80,12 @@ def grouped_rank_ic(predicted: ArrayLike, realized: ArrayLike, *,
         raise ValueError("predicted and realized must be equally shaped 2-D arrays")
     if min_assets < 2:
         raise ValueError("min_assets must be at least 2")
+    if lags is not None and (isinstance(lags, bool) or int(lags) != lags or lags < 0):
+        raise ValueError("lags must be a non-negative integer, or None")
 
     values: list[float] = []
-    for prediction, outcome in zip(predicted, realized, strict=True):
+    rows: list[int] = []
+    for row, (prediction, outcome) in enumerate(zip(predicted, realized, strict=True)):
         valid = np.isfinite(prediction) & np.isfinite(outcome)
         if valid.sum() < min_assets:
             continue
@@ -55,13 +94,18 @@ def grouped_rank_ic(predicted: ArrayLike, realized: ArrayLike, *,
         )
         if np.isfinite(value):
             values.append(value)
+            rows.append(row)
 
     if not values:
         return InformationCoefficient(np.nan, np.nan, 0)
     array = np.asarray(values)
-    standard_error = (
-        float(array.std(ddof=1) / np.sqrt(len(array))) if len(array) > 1 else np.nan
-    )
+    if lags is not None:
+        standard_error = _newey_west_standard_error(array, np.asarray(rows),
+                                                    len(predicted), int(lags))
+    else:
+        standard_error = (
+            float(array.std(ddof=1) / np.sqrt(len(array))) if len(array) > 1 else np.nan
+        )
     return InformationCoefficient(float(array.mean()), standard_error, len(array))
 
 

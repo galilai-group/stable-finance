@@ -23,8 +23,9 @@ it:
            calibrated on $1.7 trillion of live institutional trades: cost in
            basis points is ``a + b x + c sqrt(x)`` in the order's size ``x``
            as a percent of the name's average daily dollar volume, and the
-           order is worked over a schedule of decisions (one trading day in
-           the paper) at the midpoint as it evolves. This is passive
+           order is worked over a schedule of decisions (two trading days by
+           default, about the paper's own trade horizon) at the midpoint as
+           it evolves. This is passive
            execution: the paper's orders rest as limit orders and pay no
            spread, only impact, so an order here is already the resting
            trade and carries no limit of its own. Needs ``adv`` and
@@ -60,8 +61,18 @@ percent, and figures should display it that way.
 ``efq`` may be a scalar or an array that broadcasts to ``(decision, asset)``,
 so a per-name or per-decision measure of execution quality plugs in without a
 new model. Costs are one-way, per unit of weight traded: a round trip pays
-twice. Market impact beyond the visible book, and commissions, are outside
-every model here.
+twice. Market impact beyond the visible book is outside every model here.
+
+FEES ARE NOT A MODEL BUT A SURCHARGE on every model except ``mid``: a
+commission in basis points of the notional (``fee_bps``), a charge per share
+(``fee_per_share``, such as an exchange's access fee), and a charge on the
+notional SOLD (``sec_fee_rate``, the SEC's Section 31 fee). They are kept
+apart from the fill price, because a limit is a statement about the price an
+order executes at, not about the commission it then pays, and folding a fee
+into the price would turn it into a fill the limit refuses.
+:func:`fee_per_unit` is what the allocator is charged for them and
+:func:`fee_cost` is what a set of trades pays; ``mid`` stays the frictionless
+benchmark and charges neither.
 """
 
 from __future__ import annotations
@@ -93,6 +104,8 @@ __all__ = [
     "EFQ_DIRECT_ACCESS",
     "EFQ_INFORMED_RANGE",
     "EFQ_LIT_EXCHANGE",
+    "FEE_REQUIRES",
+    "FEE_SETTINGS",
     "Fills",
     "Orders",
     "IMPACT_COEFFICIENTS",
@@ -100,6 +113,8 @@ __all__ = [
     "ImpactStockCoefficients",
     "effective_half_spread",
     "execute",
+    "fee_cost",
+    "fee_per_unit",
     "impact_cost",
     "impact_stock_cost",
     "execution_requires",
@@ -212,6 +227,24 @@ IMPACT_STOCK_COEFFICIENTS = ImpactStockCoefficients(
 #: frictionless fill is recorded in units of the return's own price (1.0).
 _REFERENCE_PRICES = ("mid", "close", "vwap")
 
+#: The fees a backtest configuration may charge on top of its cost model, in
+#: the order they are documented: basis points of the notional traded on
+#: either side, dollars per share traded, and a fraction of the notional SOLD.
+FEE_SETTINGS = ("fee_bps", "fee_per_share", "sec_fee_rate")
+
+#: What each fee needs of the market. A per-share fee is a number of dollars
+#: per share, and a weight is a fraction of equity, so turning one into the
+#: other needs the share price: the midpoint, quoted or derived from the bid
+#: and ask. It must be the price a share actually trades at -- a price
+#: normalised to 1, the stand-in a frictionless fill uses, would bill a $20
+#: stock as if it cost a dollar -- so neither the close nor the VWAP is
+#: substituted silently. The other two are charged on notional and need
+#: nothing.
+FEE_REQUIRES: dict[str, tuple[str, ...]] = {
+    "fee_bps": (),
+    "fee_per_share": ("mid",),
+    "sec_fee_rate": (),
+}
 
 def _efq_array(efq: ArrayLike, name: str = "efq") -> NDArray[np.float64]:
     """An EFQ as a float array, refused unless finite and non-negative."""
@@ -219,6 +252,30 @@ def _efq_array(efq: ArrayLike, name: str = "efq") -> NDArray[np.float64]:
     if not np.isfinite(array).all() or (array < 0).any():
         raise ValueError(f"{name} must be finite and non-negative")
     return array
+
+
+def _fee_setting(name: str, value) -> float | None:
+    """One fee setting as a float, or None; refused unless finite and non-negative.
+
+    A boolean is refused rather than read as 0 or 1, and the value is stored
+    as a float so that ``fee_bps=1`` and ``fee_bps=1.0`` name one
+    configuration with one label. A negative fee -- a maker rebate -- is
+    refused too: whether an order earns one depends on which of its slices
+    rested and were hit, which no model here tracks, and a rebate charged to
+    every trade would pay a crossing order for taking liquidity.
+    """
+    if value is None:
+        return None
+    if (isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value) or value < 0):
+        raise ValueError(f"{name} must be a finite, non-negative number, or None")
+    return float(value)
+
+
+def _fees(fee_bps, fee_per_share, sec_fee_rate) -> tuple[float | None, float | None, float | None]:
+    """The three fee settings, validated."""
+    return (_fee_setting("fee_bps", fee_bps), _fee_setting("fee_per_share", fee_per_share),
+            _fee_setting("sec_fee_rate", sec_fee_rate))
 
 
 @dataclass(frozen=True)
@@ -609,6 +666,13 @@ def impact_cost(size: ArrayLike, *, coefficients: tuple[float, float, float] | N
     and negative (not significant), so far beyond that range the fitted curve
     would turn down. The cost is held at its peak from there on: an order
     past the calibration never gets cheaper for being larger.
+
+    The calibration starts at 0.1% of daily volume, and below it the curve
+    falls toward ``a``: a small order worked passively costs almost nothing,
+    which is what the paper's resting orders paid. That is the model's
+    answer for a small book, not a gap to be patched; a book too small for
+    impact to matter is the regime where only the spread is at stake, and
+    ``cross`` prices that.
     """
     a, b, c = IMPACT_COEFFICIENTS if coefficients is None else coefficients
     x = np.asarray(size, dtype=np.float64)
@@ -658,7 +722,12 @@ def _impact_fills(orders: Orders, market: MarketData, equity, schedule: int,
 
     What is outstanding in a name fills in equal slices over the ``schedule``
     decisions after the latest order, so one order ramps the position
-    linearly. ``schedule=0`` fills at the decision, which is the paper's own
+    linearly. Every new order restarts that clock for the whole outstanding
+    amount, so a book re-ordered at every decision approaches its target
+    geometrically, a fraction ``1 / schedule`` of the gap per decision: with
+    the default two-day schedule and five-minute decisions it holds only a
+    small share of a fast-moving target (``execution_days`` sets the
+    schedule). ``schedule=0`` fills at the decision, which is the paper's own
     accounting (full position at the arrival price, charged the formula).
     Slices past the last decision are never filled, and a decision with no
     mid fills nothing and leaves the rest for the decisions after it.
@@ -842,8 +911,108 @@ def _drift_path(weights: PortfolioWeights, market: MarketData | None, efq, held,
     return Fills(quantity, price, np.where(quantity != 0, buy.mid_price, np.nan), *axes)
 
 
+def fee_per_unit(price: ArrayLike | None = None, *, fee_bps: float | None = None,
+                 fee_per_share: float | None = None,
+                 sec_fee_rate: float | None = None) -> NDArray[np.float64]:
+    """Fees per unit of weight traded, the same for a buy and a sale: the allocator's charge.
+
+    ``fee_bps`` is basis points of the notional, on either side. A weight
+    ``w`` of equity ``E`` at share price ``p`` is ``w E / p`` shares, so
+    ``fee_per_share`` costs ``fee_per_share / p`` per unit of weight, whatever
+    the equity: ``price`` is the share price, which broadcasts to the grid, and
+    a name without a positive price gets an infinite charge -- like an
+    unquoted name in :func:`trading_cost`, it cannot be traded, rather than
+    trading free. Without a per-share fee the charge is one number (an array
+    of ``price``'s shape when one is given).
+
+    ``sec_fee_rate`` is charged on SALES only, but the allocator's trading
+    cost is ``sum_i c_i |w_i - w_prev_i|``, one rate for either side of a
+    trade: the proximal step it is solved with is symmetric soft
+    thresholding. The rate is therefore charged at HALF on every unit traded.
+    That is exact for the thing the allocator is trading off, which is a
+    round trip: every position, long or short, is opened by one side and
+    closed by the other, so it pays one sale per round trip and the half rate
+    on each leg sums to it. Only the timing within the round trip is averaged,
+    and the scoring (:func:`fee_cost`) bills each sale the full rate when it
+    happens.
+
+    With 2020's values on a $20 stock -- the Regulation NMS Rule 610(c) access-fee
+    cap of $0.003 a share, which lit venues charged to take a quote, and the
+    SEC's fiscal-2020 Section 31 rate of $22.10 per million sold. They are
+    facts of a sample, so a caller passes them; the library holds none::
+
+        fee_per_unit(20.0, fee_per_share=0.003, sec_fee_rate=22.10e-6)
+        # 0.003 / 20 + 22.10e-6 / 2 = 1.6105e-4, about 1.6 bp per unit traded
+    """
+    fee_bps, fee_per_share, sec_fee_rate = _fees(fee_bps, fee_per_share, sec_fee_rate)
+    flat = (0.0 if fee_bps is None else fee_bps / 1e4) + (
+        0.0 if sec_fee_rate is None else sec_fee_rate / 2)
+    if fee_per_share is None:
+        return np.asarray(flat) if price is None else np.full(np.shape(price), flat)
+    if price is None:
+        raise ValueError("fee_per_share is dollars per share, so it needs each name's price")
+    price = np.asarray(price, dtype=np.float64)
+    priced = np.isfinite(price) & (price > 0)
+    return np.where(priced, flat + fee_per_share / np.where(priced, price, 1.0), np.inf)
+
+
+def fee_cost(quantity: ArrayLike, price: ArrayLike | None = None, *,
+             fee_bps: float | None = None, fee_per_share: float | None = None,
+             sec_fee_rate: float | None = None) -> NDArray[np.float64]:
+    """The fees a set of signed trades pays, as a fraction of equity, trade by trade.
+
+    ``quantity`` is the weight traded, as :class:`Fills` records it: positive
+    bought, negative sold, zero nothing. Each trade pays
+
+        |q| (fee_bps / 1e4 + fee_per_share / price) + max(-q, 0) sec_fee_rate
+
+    -- a commission and an access fee on either side, and the Section 31 fee
+    on what is sold. ``price`` is the share price the per-share fee is
+    converted at and broadcasts to ``quantity``'s shape; it is needed only
+    with ``fee_per_share``, and a trade where it is not positive is refused,
+    since the fee it paid cannot be known. A zero quantity pays nothing
+    wherever it is.
+
+    For a sample from 2020, the access-fee cap and the fiscal-2020 Section 31
+    rate::
+
+        fees = fee_cost(fills.quantity[:, :, 0], market.get("mid"),
+                        fee_per_share=0.003,       # Reg NMS Rule 610 cap
+                        sec_fee_rate=22.10e-6)     # SEC Section 31, FY2020
+
+    FINRA's trading activity fee (per share sold, capped per trade) and maker
+    rebates for resting orders are not modelled.
+    """
+    fee_bps, fee_per_share, sec_fee_rate = _fees(fee_bps, fee_per_share, sec_fee_rate)
+    q = np.asarray(quantity, dtype=np.float64)
+    if not np.isfinite(q).all():
+        raise ValueError("quantity must be finite; use 0 where nothing traded")
+    size = np.abs(q)
+    out = np.zeros(q.shape)
+    if fee_bps is not None:
+        out = out + size * (fee_bps / 1e4)
+    if fee_per_share is not None:
+        if price is None:
+            raise ValueError("fee_per_share is dollars per share, so it needs each name's price")
+        try:
+            price = np.broadcast_to(np.asarray(price, dtype=np.float64), q.shape)
+        except ValueError:
+            raise ValueError(f"price must broadcast to {q.shape}") from None
+        traded = q != 0
+        priced = np.isfinite(price) & (price > 0)
+        if (traded & ~priced).any():
+            raise ValueError("a trade in a name without a positive price cannot be charged "
+                             "fee_per_share")
+        out = out + np.where(traded, size * fee_per_share / np.where(priced, price, 1.0), 0.0)
+    if sec_fee_rate is not None:
+        out = out + np.maximum(-q, 0.0) * sec_fee_rate
+    return out
+
+
 def trading_cost(
-    name: str, half_spread: ArrayLike, *, multiple: ArrayLike = 1.0
+    name: str, half_spread: ArrayLike, *, multiple: ArrayLike = 1.0,
+    fee_bps: float | None = None, fee_per_share: float | None = None,
+    sec_fee_rate: float | None = None, price: ArrayLike | None = None,
 ) -> NDArray[np.float64]:
     """Cost per unit of weight traded under one named model.
 
@@ -866,9 +1035,20 @@ def trading_cost(
     approximation, and the allocator's objective must stay linear in the
     trade. The book itself prices the fills (:func:`execute`). ``impact`` is
     not a spread model at all and is refused here; see :func:`impact_cost`.
+
+    ``fee_bps``, ``fee_per_share`` and ``sec_fee_rate`` add
+    :func:`fee_per_unit` on top, with ``price`` the share price the per-share
+    fee needs. They are refused with ``mid``, which is the frictionless
+    benchmark; ``cross`` at ``multiple=0`` is a midpoint fill that still pays
+    its fees.
     """
     if name in ("impact", "impact_stock"):
         raise ValueError(f"the {name} model's cost depends on order size; use impact_cost")
+    fees = (fee_bps, fee_per_share, sec_fee_rate)
+    charged = any(fee is not None for fee in fees)
+    if charged and name == "mid":
+        raise ValueError("cost_model='mid' is the frictionless benchmark and charges no fees; "
+                         "charge them on top of 'cross' (multiple=0 for a midpoint fill)")
     multiple = _efq_array(multiple, "multiple")
     if name == "mid":
         spread = np.asarray(half_spread, dtype=np.float64)
@@ -883,7 +1063,11 @@ def trading_cost(
         raise ValueError("half_spread cannot be negative")
     quoted = np.isfinite(spread)
     charge = np.broadcast_to(np.where(quoted, spread, 0.0) * multiple, spread.shape)
-    return np.where(quoted, charge, np.inf)
+    cost = np.where(quoted, charge, np.inf)
+    if not charged:
+        return cost
+    return cost + fee_per_unit(price, fee_bps=fee_bps, fee_per_share=fee_per_share,
+                               sec_fee_rate=sec_fee_rate)
 
 
 def effective_half_spread(

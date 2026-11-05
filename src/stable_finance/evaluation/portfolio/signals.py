@@ -27,7 +27,10 @@ and is merely long the market; one that favours a single industry is an
 industry bet wearing a stock-picking label. Residualising the forecast on
 those exposures, cross-sectionally and before construction, keeps the book
 from expressing a bet the model did not make. The intercept in every
-regression also makes the residual dollar neutral.
+regression also makes the residual dollar neutral. ``pca3`` residualises on
+each name's loadings on the first three principal components of the return
+history -- the statistical factors a forecast's errors may share -- for when
+no named exposure describes them.
 
 Everything here is deterministic numpy and standard library, NaN marks a
 missing value on input and an unusable one on output, and every estimate is
@@ -43,6 +46,7 @@ from numpy.typing import ArrayLike, NDArray
 
 from stable_finance.evaluation._grid import _rankdata
 from stable_finance.evaluation.returns.contract import ForwardReturns
+from stable_finance.evaluation.returns.oracle import factor_loadings
 
 __all__ = [
     "ALPHA_RULES",
@@ -51,6 +55,7 @@ __all__ = [
     "alpha_from_rule",
     "apply_signal",
     "estimate_beta",
+    "estimate_loadings",
     "industry_exposures",
     "neutralize",
     "refine_alpha",
@@ -69,16 +74,21 @@ ALPHA_RULES = ("grinold", "grinold_rank")
 _ALPHA_SCORE_OF = {"grinold": "zscore", "grinold_rank": "gauss_rank"}
 
 #: The neutralizations a backtest configuration may name.
-NEUTRALIZATIONS = ("beta", "industry", "beta_industry")
+NEUTRALIZATIONS = ("beta", "industry", "beta_industry", "pca3")
 
-#: What each neutralization needs of the market. Beta is estimated from the
-#: return history alone, so it needs nothing; the industry options need an
-#: ``industry`` code per name and decision, which is market data.
+#: What each neutralization needs of the market. Beta and the principal
+#: components are estimated from the return history alone, so they need
+#: nothing; the industry options need an ``industry`` code per name and
+#: decision, which is market data.
 SIGNAL_REQUIRES: dict[str, tuple[str, ...]] = {
     "beta": (),
     "industry": ("industry",),
     "beta_industry": ("industry",),
+    "pca3": (),
 }
+
+#: Principal components ``pca3`` residualises on.
+PCA_COMPONENTS = 3
 
 _NORMAL = NormalDist()
 
@@ -239,6 +249,22 @@ def estimate_beta(history: ForwardReturns) -> NDArray[np.float64]:
     return out
 
 
+def estimate_loadings(history: ForwardReturns, n_components: int = PCA_COMPONENTS
+                      ) -> NDArray[np.float64]:
+    """Each name's loadings on the first principal components of a return history.
+
+    The components are those :func:`~stable_finance.factor_forecast` draws
+    its factor errors from (the normal scores of each cross-section, centred
+    by name), taken at every horizon of ``history``, so neutralizing on them
+    removes exactly the structure that oracle puts in its errors. Returns
+    ``(n_horizons, n_assets, n_components)``. A name with no finite history
+    loads zero on every component.
+    """
+    values = np.asarray(history.values, dtype=np.float64)
+    return np.stack([factor_loadings(values[:, :, h], int(n_components))
+                     for h in range(values.shape[2])])
+
+
 def industry_exposures(codes: ArrayLike) -> NDArray[np.float64]:
     """One-hot industry dummies from ``(decision, asset)`` industry codes.
 
@@ -314,6 +340,7 @@ def apply_signal(
     eligible: ArrayLike,
     beta: ArrayLike | None = None,
     industry: ArrayLike | None = None,
+    loadings: ArrayLike | None = None,
 ) -> NDArray[np.float64]:
     """Dispatch to one named neutralization; see :data:`NEUTRALIZATIONS`.
 
@@ -321,7 +348,9 @@ def apply_signal(
     ``(n_assets,)`` (or ``(n_decisions, n_assets)`` for a rolling estimate);
     ``industry`` is the ``(decision, asset)`` industry codes. ``beta_industry``
     regresses on both at once, which is not the same as neutralizing one
-    after the other when beta differs by industry.
+    after the other when beta differs by industry. ``loadings`` is one
+    horizon's :func:`estimate_loadings`, ``(n_assets, k)``, which ``pca3``
+    needs.
     """
     if name not in NEUTRALIZATIONS:
         raise ValueError(f"unknown neutralization {name!r}; choose from {NEUTRALIZATIONS}")
@@ -346,4 +375,12 @@ def apply_signal(
                 f"neutralization={name!r} needs an industry code per name, and "
                 "the market data has none")
         parts.append(industry_exposures(industry))
+    if name == "pca3":
+        if loadings is None:
+            raise ValueError("neutralization='pca3' needs loadings; estimate them with "
+                             "estimate_loadings")
+        k = np.asarray(loadings, dtype=np.float64)
+        if k.ndim != 2 or k.shape[0] != x.shape[1]:
+            raise ValueError(f"loadings must have shape {(x.shape[1], 'k')}, got {k.shape}")
+        parts.append(np.broadcast_to(k, (x.shape[0], *k.shape)))
     return neutralize(x, np.concatenate(parts, axis=2), eligible=eligible)

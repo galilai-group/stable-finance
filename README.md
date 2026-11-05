@@ -149,6 +149,16 @@ decisions are solved in order and each starts from the previous solution. The
 problem is convex and solved by accelerated proximal gradient descent, whose
 proximal step is the trade rule itself.
 
+The solver runs to the step tolerance: accelerated proximal gradient with the
+adaptive restart of O'Donoghue and Candes (2015) in a metric scaled by each
+name's variance, which warns (`ConvergenceWarning`) if it ever reaches its cap
+of at least `RESTART_MAX_ITER` iterations. `solver="fista"` (on `rebalance`,
+`allocate` and `MeanVarianceAllocator`; `mv_solver="fista"` in
+`BacktestConfig`) is plain FISTA stopped at the `max_iter` budget, kept for
+measuring what that budget costs: on a real month it runs out at every
+decision, so its book is where the iterations stopped, not the optimum.
+`return_n_iter=True` returns each decision's iteration count beside the weights.
+
 ```python
 from stable_finance import (
     MeanVarianceAllocator, allocate, estimate_covariance, mean_variance_target, rebalance,
@@ -169,6 +179,22 @@ covariance over finite observations, shrunk toward its diagonal and clipped to
 the positive semidefinite cone. A NaN cost marks an asset that cannot be
 traded at that decision, so it holds its previous weight; a NaN forecast is a
 zero expected return that still pays risk and cost.
+
+`trades.dynamic` holds two rules that trade less than all the way to the
+target, each a function of a target path and the book held:
+`partial_adjustment(target, rate)` moves a fixed fraction of the gap each
+decision, and `no_trade_band(target, band, cost_belief=half_spread)` holds a
+name until its target leaves a band (here a multiple of what the policy
+believes it costs to trade) and then trades to the band's edge (the form of
+Constantinides, 1986). The target can come from
+`portfolio.construction.aim_portfolio(forecast, sigma, risk_aversion=...,
+cost_aversion=...)`, the form of Garleanu and Pedersen's (2013) aim, which
+weights forecasts at several horizons by how slowly they decay. These are
+parametric policies: the rate, the band and the cost aversion are free
+parameters, not the papers' optimal values, and any cost they take is the
+policy's belief, never charged. What a book pays comes from the harness's
+cost models on its fills: the output is `PortfolioWeights`, scored by
+entering `run_backtest` at the weights level.
 
 `trades.rl` holds policies learned for their net-of-cost performance rather
 than written by hand. The first, `ParametricPolicy`, follows Brandt,
@@ -213,7 +239,9 @@ without a positive quote is left unfilled and the realized position lags the
 target. When every order fills, `evaluate_fills` reproduces
 `cross_spread_sharpe` exactly. Depth, partial fills, impact, and commissions
 remain outside the simulator; bring your own `Fills` to evaluate a richer
-execution model.
+execution model. Fees are billed beside the fills, not in their prices:
+`evaluate_fills(fills, realized, fees=fee_cost(fills.quantity, ...))` (see
+[Fees on top of the spread](#fees-on-top-of-the-spread)).
 
 In the originating market-jepa setup, the default for supervised training,
 ridge fitting, and evaluation is the empirical-uniform target within each
@@ -298,6 +326,23 @@ from stable_finance import copula_forecast
 forecast = copula_forecast(realized, [0.03, 0.02, 0.01], half_life=12, days=days, seed=0)
 ```
 
+`factor_forecast` is the copula with three properties of real forecasts
+added, each by a parameter. Its errors are factor bets: they load on the
+principal components of past returns (`n_factors`, `factor_share`), so a
+forecast is wrong about many names at once and neutralization or a risk
+model has something to remove. Its IC drifts: the per-decision target is an
+AR(1) around `ic` (`ic_dispersion`, `ic_persistence`). And its accuracy can
+rise with a name's spread or volatility (`quality="spread"` or `"vol"`). The
+factor errors widen the per-decision IC's spread to about what real signals
+show. With all three off it is `copula_forecast`, draw for draw.
+
+```python
+from stable_finance import factor_forecast
+
+forecast = factor_forecast(realized, 0.03, history=prior, factor_share=0.3, half_life=12,
+                           quality="spread", market=market, days=days, seed=0)
+```
+
 ## The harness is a configuration, not a constant
 
 A Sharpe ratio is not a property of a forecast. It is a property of a forecast
@@ -335,7 +380,7 @@ predictors.
 | `universe` | `all`, `tight_50pct`, `tight_25pct` — a cross-sectional screen on each name's own quoted half-spread |
 | `selection` | `all`, `quintile`, `decile`, `decile_long_only` — how much of the ranking to trade |
 | `weighting` | `mean_variance` (cost-aware, path-dependent), `equal`, `inverse_vol`, `min_var`, `erc`, `rank`, `signal` (proportional to the forecast's distance from the median), `min_var_qp` (the long-only minimum-variance optimum `min_var` approximates), `hrp` (hierarchical risk parity) |
-| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `nonlinear_shrinkage` (Ledoit and Wolf, 2020), `embedding` — the last forecasts correlations from the encoder's own representation |
+| `risk_model` | `diagonal`, `shrunk_sample`, `ledoit_wolf`, `nonlinear_shrinkage` (Ledoit and Wolf, 2020), `embedding` — forecasts correlations from the encoder's own representation — and `factor` (statistical and, when the market has an `industry` column, industry factors plus specific risk; `factor_covariance`) |
 | `cost_model` | `mid`, `cross` — free, or the name's own quoted half-spread times `efq` |
 | `rebalance` | `every_decision`, `daily` — hold the book through the session instead of retrading it; `horizon` is outside the default space (see below) |
 | `annualization` | `decisions`, `daily` — whether every decision is an independent period |
@@ -362,13 +407,14 @@ option.
 of options and pins any field given one value, so a setting outside the
 default space is swept the same way, as in
 `enumerate_configs(neutralize=(None, "beta"), rebalance=("every_decision", "horizon"))`.
-Two such settings are unset by default, so the default space and every label
-in it are unchanged:
+Settings of this kind are unset by default, so the default space and every
+label in it are unchanged:
 
 | Setting | Options |
 |---|---|
 | `alpha` | `"grinold"` or `"grinold_rank"`, with `alpha_ic` — rescale the forecast to `alpha_ic * sigma * z` before construction, `z` the cross-sectional z-score or, for `grinold_rank`, the Gaussian rank score |
 | `neutralize` | `"beta"`, `"industry"`, `"beta_industry"` — residualise the forecast on those exposures before construction |
+| `mv_solver` | `"fista"` — solve the mean-variance rebalance within the `max_iter` budget instead of to convergence, which is the default (a numerical setting; only `weighting="mean_variance"` reads it) |
 
 ### Signal transforms
 
@@ -419,6 +465,48 @@ report = run_backtest(forecast, realized, market=market, days=days,
 The mean-variance allocator sizes its book with one risk aversion per
 decision, from the forecasts up to that decision. A forecast made later never
 resizes a book already held.
+
+### Fees on top of the spread
+
+The spread is not the whole bill. A marketable order also pays the venue's
+access fee per share, and every sale pays the SEC's Section 31 fee; at
+five-minute holding periods the per-share fee is the same order as the
+half-spread of a liquid name. Three optional settings charge them on top of
+any cost model except `mid`, which stays the frictionless benchmark (use
+`cross` at `efq=0` for midpoint fills that still pay fees):
+
+| Setting | Charged |
+|---|---|
+| `fee_bps` | basis points of the notional traded, on either side (a commission) |
+| `fee_per_share` | dollars per share traded, on either side, converted at each name's mid; needs a `mid` (or the bid and ask), and `check_config` refuses it without one |
+| `sec_fee_rate` | a fraction of the notional sold, on sales only |
+
+The values are facts of a sample, so they are passed in, not held by the
+library. For 2020 -- the Regulation NMS Rule 610 access-fee cap and the
+fiscal-2020 Section 31 rate:
+
+```python
+from stable_finance import BacktestConfig
+
+config = BacktestConfig(fee_per_share=0.003,     # $ per share, the access-fee cap
+                        sec_fee_rate=22.10e-6)   # $22.10 per $1M sold
+report = run_backtest(forecast, realized, market=market, config=config)
+report.mean_fee_bps          # the part of mean_cost_bps that is fees
+```
+
+Like `efq`, the fees reach both places a cost does: the cost-aware allocator
+is charged them (`fee_per_unit`), so it trades less when trading costs more,
+and the scoring bills each fill exactly `|dw| (fee_bps / 1e4 + fee_per_share
+/ mid) + max(-dw, 0) sec_fee_rate` (`fee_cost`), beside its slippage rather
+than inside its price, so a limit still refers to the execution price. The
+allocator's cost is one rate for either side of a trade, so it is charged
+half the SEC rate on every unit -- exact per round trip, since every position
+is opened by one side and closed by the other. `PnLSeries.fee` keeps the fees
+apart from the rest of the cost, and the break-even EFQ after fees is
+`breakeven_efq(gross, (cost - fee) / efq, fees=fee)`: fees are paid at every
+execution quality and come off the gross. Unset, as by default, no fee code
+runs: labels, rows and numbers are what they were. FINRA's trading activity
+fee and maker rebates are not modelled.
 
 ### How much of the forecast reached the book
 
@@ -586,7 +674,7 @@ name's average daily dollar volume, with the U.S. estimates `b = -0.53` and
 The position ramps linearly over the next trading day, read from the `days`
 labels, so an intraday signal earns only the part of its return it has
 actually bought; and each slice fills at that decision's own mid plus the
-formula's impact. Orders in the same name within one day are one parent
+formula's impact. Orders in the same name within one schedule (two days by default) are one parent
 order, since concavity would otherwise reward slicing. `execution_days=0`
 fills everything at the decision, which is the paper's own accounting. The
 cost does not depend on how long you take: the paper's patience is in its

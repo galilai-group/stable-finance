@@ -27,7 +27,13 @@ from dataclasses import dataclass, fields, replace
 import numpy as np
 
 from stable_finance.dataset.schema import MissingRolesError
-from stable_finance.evaluation.execution import COST_MODEL_REQUIRES, COST_MODELS
+from stable_finance.evaluation.execution import (
+    COST_MODEL_REQUIRES,
+    COST_MODELS,
+    FEE_REQUIRES,
+    FEE_SETTINGS,
+    _fee_setting,
+)
 from stable_finance.evaluation.portfolio.construction import (
     SELECTION_REQUIRES,
     SELECTION_RULES,
@@ -45,6 +51,7 @@ from stable_finance.evaluation.portfolio.signals import (
     NEUTRALIZATIONS,
     SIGNAL_REQUIRES,
 )
+from stable_finance.evaluation.trades.rebalance import REBALANCE_SOLVERS
 
 __all__ = [
     "ANNUALIZATIONS",
@@ -122,7 +129,7 @@ AXIS_REQUIRES: dict[str, dict[str, tuple[str, ...]]] = {
 #: Settings that are ``None`` unless a model needs them, and that labels and
 #: result rows leave out while unset.
 OPTIONAL_SETTINGS = ("equity", "execution_days", "impact", "alpha", "alpha_ic",
-                     "neutralize")
+                     "neutralize", "mv_solver", *FEE_SETTINGS)
 
 
 @dataclass(frozen=True)
@@ -155,8 +162,9 @@ class BacktestConfig:
     #: is in shares, so the same weights walk a book further at larger size.
     equity: float | None = None
     #: How long ``cost_model='impact'`` works each order, in trading days,
-    #: measured in decisions from the ``days`` labels. ``None`` is the paper's
-    #: one day; ``0`` fills at the decision, the paper's own accounting.
+    #: measured in decisions from the ``days`` labels. ``None`` is two days,
+    #: about the paper's trades (a median horizon of 1.7 days, a mean of 2.7);
+    #: ``0`` fills at the decision, the paper's own accounting.
     execution_days: float | None = None
     #: Coefficients for ``cost_model='impact'`` (three, ``(a, b, c)``) or
     #: ``'impact_stock'`` (eleven, an
@@ -185,6 +193,39 @@ class BacktestConfig:
     #: the risk history), ``"industry"`` (needs an ``industry`` market
     #: quantity) or ``"beta_industry"``. ``None`` leaves it as forecast.
     neutralize: str | None = None
+    #: How the cost-aware allocator's rebalance is solved, a NUMERICAL setting
+    #: like ``max_iter`` and read only by ``weighting='mean_variance'``.
+    #: ``None`` is the library's default,
+    #: :data:`~stable_finance.evaluation.trades.rebalance.DEFAULT_SOLVER`:
+    #: accelerated proximal gradient with adaptive restart, run until the step
+    #: falls below the solver's tolerance under a cap of at least
+    #: :data:`~stable_finance.evaluation.trades.rebalance.RESTART_MAX_ITER`
+    #: iterations -- the converged book, so that a result about the allocator
+    #: is not a result about where its solver was stopped. ``"fista"`` stops
+    #: at the ``max_iter`` budget, for measuring what that budget costs.
+    mv_solver: str | None = None
+    #: FEES, charged per unit of weight traded ON TOP of the cost model, and,
+    #: like ``efq``, to the cost-aware allocator and in the scoring alike, so
+    #: a book is planned against the fees it then pays. All three are refused
+    #: with ``cost_model='mid'``, the frictionless benchmark (``cross`` at
+    #: ``efq=0`` is a midpoint fill that still pays them). ``fee_bps`` is a
+    #: commission in basis points of the notional traded, on either side.
+    fee_bps: float | None = None
+    #: Dollars per share traded, on either side, such as an exchange's take
+    #: fee. It needs each name's share price (a ``mid``, or the bid and ask),
+    #: and :func:`check_config` refuses it on a market without one.
+    fee_per_share: float | None = None
+    #: A fraction of the notional SOLD, the SEC's Section 31 fee. The
+    #: allocator's cost is one rate for either side of a trade, so it is
+    #: charged half of this on every unit, which is exact per round trip (see
+    #: :func:`~stable_finance.evaluation.execution.fee_per_unit`); the scoring
+    #: bills each sale in full. For a sample from 2020::
+    #:
+    #:     BacktestConfig(fee_per_share=0.003,    # Reg NMS Rule 610 access-fee cap
+    #:                    sec_fee_rate=22.10e-6)  # SEC Section 31, fiscal 2020
+    #:
+    #: which is about 1.5 bp per side on a $20 stock, plus 0.22 bp on each sale.
+    sec_fee_rate: float | None = None
 
     def __post_init__(self) -> None:
         for field, allowed in (
@@ -239,6 +280,15 @@ class BacktestConfig:
                              "coefficient to scale the forecast by")
         if self.neutralize is not None and self.neutralize not in NEUTRALIZATIONS:
             raise ValueError(f"neutralize={self.neutralize!r} is not one of {NEUTRALIZATIONS}")
+        if self.mv_solver is not None and self.mv_solver not in REBALANCE_SOLVERS:
+            raise ValueError(f"mv_solver={self.mv_solver!r} is not None or one of "
+                             f"{REBALANCE_SOLVERS}")
+        for name in FEE_SETTINGS:
+            object.__setattr__(self, name, _fee_setting(name, getattr(self, name)))
+        if self.cost_model == "mid" and self.fees:
+            raise ValueError("cost_model='mid' is the frictionless benchmark and charges no fees; "
+                             "charge them on top of 'cross' (efq=0 for midpoint fills that still "
+                             "pay them), 'book' or an impact model")
         if self.rebalance == "horizon" and self.holding == "drift":
             raise ValueError("rebalance='horizon' books each held book's forward return once; "
                              "holding='drift' already carries positions step by step on "
@@ -258,13 +308,26 @@ class BacktestConfig:
         )
 
     @property
+    def fees(self) -> dict[str, float]:
+        """The fee settings this configuration charges, by name; empty when it charges none."""
+        return {name: getattr(self, name) for name in FEE_SETTINGS
+                if getattr(self, name) is not None}
+
+    @property
     def requires(self) -> dict[str, tuple[str, ...]]:
-        """Market quantities this configuration needs, by the axis needing them."""
+        """Market quantities this configuration needs, by the axis needing them.
+
+        A fee that needs the market is listed under its own name, as an axis
+        option is: ``fee_per_share`` needs the share price.
+        """
         out = {}
         for axis, table in AXIS_REQUIRES.items():
             needed = table.get(getattr(self, axis), ())
             if needed:
                 out[axis] = tuple(needed)
+        for name in self.fees:
+            if FEE_REQUIRES[name]:
+                out[name] = tuple(FEE_REQUIRES[name])
         return out
 
     def supported_by(self, market) -> bool:
@@ -289,7 +352,9 @@ DEFAULT_BACKTEST = BacktestConfig()
 #: absent because ``efq`` is now the cost axis.
 #: ``rebalance`` sweeps the two schedules that are modelling choices;
 #: ``horizon`` is the accounting for a horizon longer than the decision
-#: spacing and is asked for by name.
+#: spacing and is asked for by name. ``risk_model`` is every model in
+#: :data:`RISK_MODELS`, the one list of them; :func:`enumerate_configs` keeps
+#: the ones a given market supports.
 CONFIG_SPACE = {
     "universe": UNIVERSE_SCREENS,
     "selection": SELECTION_RULES,
@@ -340,7 +405,10 @@ def check_config(config: BacktestConfig, market) -> None:
              "universe": "universe='all' runs without quotes",
              "neutralize": "neutralize='beta' runs on any market data, estimating beta "
                            "from the risk history; 'industry' needs an industry code "
-                           "for each name"}
+                           "for each name",
+             "fee_per_share": "fee_per_share is dollars per share, so it needs each name's "
+                              "share price (mid, or bid_price and ask_price); fee_bps and "
+                              "sec_fee_rate are charged on notional and need none"}
     for axis, needed in config.requires.items():
         try:
             market.require(*needed, purpose=f"{axis}={getattr(config, axis)!r}")
