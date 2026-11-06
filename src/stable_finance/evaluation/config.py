@@ -205,14 +205,18 @@ class BacktestConfig:
     #: is not a result about where its solver was stopped. ``"fista"`` stops
     #: at the ``max_iter`` budget, for measuring what that budget costs.
     mv_solver: str | None = None
-    #: Report held-book exposures using the library's beta, industry or PCA
-    #: estimates (the same choices as neutralize), independently of risk_model.
-    #: This does not select the fitted loadings inside the factor risk model.
-    #: Set factor_limit as well to bound the frictionless mean-variance target;
-    #: fills may drift away.
+    #: Bound the frictionless mean-variance target's exposure to the library's
+    #: beta, industry or PCA estimates: the same choices as neutralize, from
+    #: the same estimators, independently of risk_model (the loadings fitted
+    #: inside the factor risk model are not among them). A name whose loading
+    #: is unknown -- a beta with fewer than two finite history decisions, an
+    #: unknown industry code -- is left out of the target, where neutralization
+    #: keeps it with its raw forecast. Set together with factor_limit. The held
+    #: book may drift outside the bound; run_backtest(with_exposure=...)
+    #: reports where it ended up.
     factor_exposure: str | None = None
-    #: Symmetric bound on each selected factor, in signed weight units.
-    #: None reports exposures without constraining the target.
+    #: Symmetric bound on each exposure of factor_exposure, in signed weight
+    #: units; zero imposes neutrality.
     factor_limit: float | None = None
     #: FEES, charged per unit of weight traded ON TOP of the cost model, and,
     #: like ``efq``, to the cost-aware allocator and in the scoring alike, so
@@ -290,15 +294,17 @@ class BacktestConfig:
                              "coefficient to scale the forecast by")
         if self.neutralize is not None and self.neutralize not in NEUTRALIZATIONS:
             raise ValueError(f"neutralize={self.neutralize!r} is not one of {NEUTRALIZATIONS}")
-        if self.factor_exposure is not None and self.factor_exposure not in NEUTRALIZATIONS:
-            raise ValueError(f"factor_exposure={self.factor_exposure!r} is not one of "
-                             f"{NEUTRALIZATIONS}")
-        if self.factor_limit is not None:
+        if (self.factor_exposure is None) != (self.factor_limit is None):
+            raise ValueError("factor_exposure and factor_limit are set together; to report "
+                             "held exposures without a bound, pass with_exposure to "
+                             "run_backtest")
+        if self.factor_exposure is not None:
+            if self.factor_exposure not in NEUTRALIZATIONS:
+                raise ValueError(f"factor_exposure={self.factor_exposure!r} is not one of "
+                                 f"{NEUTRALIZATIONS}")
             if (isinstance(self.factor_limit, bool) or not np.isfinite(self.factor_limit)
                     or self.factor_limit < 0):
                 raise ValueError("factor_limit must be finite and non-negative")
-            if self.factor_exposure is None:
-                raise ValueError("factor_limit needs factor_exposure")
             if self.weighting != "mean_variance":
                 raise ValueError("factor_limit constrains the mean_variance target")
         if self.mv_solver is not None and self.mv_solver not in REBALANCE_SOLVERS:
@@ -478,15 +484,20 @@ def enumerate_configs(*, market=None, **overrides) -> tuple[BacktestConfig, ...]
             scalars[name] = value
 
     names = list(axes)
-    out = []
+    out, seen = [], set()
     for combination in itertools.product(*(axes[name] for name in names)):
         options = {**dict(zip(names, combination)), **scalars}
-        if (options.get("factor_limit") is not None
-                and options.get("weighting", "mean_variance") != "mean_variance"):
+        if options.get("factor_limit") is None:
+            # No bound is the plain target whichever estimator is named.
+            options.pop("factor_exposure", None)
+        elif options.get("factor_exposure") is None:
+            raise ValueError("factor_limit needs factor_exposure")
+        elif options.get("weighting", DEFAULT_BACKTEST.weighting) != "mean_variance":
             continue
         config = BacktestConfig(**options)
-        if _is_degenerate(config):
+        if _is_degenerate(config) or config in seen:
             continue
+        seen.add(config)
         if market is not None and not config.supported_by(market):
             continue
         out.append(config)

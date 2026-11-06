@@ -1044,36 +1044,38 @@ def test_a_sweep_keeps_the_two_solvers_books_apart():
     assert swept[1].mean_turnover != pytest.approx(swept[3].mean_turnover)
 
 
-# Factor bounds constrain construction; diagnostics read the filled holdings.
+# Factor bounds constrain construction; with_exposure reads the filled holdings.
 
 def test_factor_settings_are_optional_and_validated():
     plain = run_backtest(**world()).as_dict()
     assert "factor_exposure" not in DEFAULT_BACKTEST.label
     assert "factor_limit" not in plain and "mean_concentration" not in plain
     assert "exposure" not in plain
-    for settings in ({"factor_exposure": "unknown"}, {"factor_limit": 0.1},
+    for settings in ({"factor_exposure": "beta"}, {"factor_limit": 0.1},
+                     {"factor_exposure": "unknown", "factor_limit": 0.1},
                      {"factor_exposure": "beta", "factor_limit": -0.1},
                      {"factor_exposure": "beta", "factor_limit": np.nan},
                      {"factor_exposure": "beta", "factor_limit": 0.1, "weighting": "equal"}):
         with pytest.raises(ValueError, match="factor"):
             BacktestConfig(**settings)
+    with pytest.raises(ValueError, match="with_exposure"):
+        run_backtest(**world(), with_exposure="unknown")
 
 
 @pytest.mark.parametrize("kind", ["beta", "industry", "beta_industry", "pca3"])
-def test_factor_diagnostics_leave_the_book_unchanged(kind):
+def test_reporting_exposure_changes_neither_the_book_nor_the_label(kind):
     setup = world(n_decisions=24)
     market = MarketData({"half_spread": setup.pop("half_spread"),
                          "industry": np.tile([1, 1, 1, 2, 2, 2], (24, 1))},
                         setup["forecast"].decisions, ASSETS)
     plain = run_backtest(**setup, market=market)
-    measured = run_backtest(**setup, market=market,
-                            config=DEFAULT_BACKTEST.replace(factor_exposure=kind))
+    measured = run_backtest(**setup, market=market, with_exposure=kind)
+    assert measured.config == plain.config
     row = measured.as_dict()
-    for name in ("factor_exposure", "mean_concentration", "max_abs_factor_exposure"):
-        row.pop(name)
+    row.pop("mean_concentration"), row.pop("max_abs_factor_exposure")
     assert row == plain.as_dict()
-    assert measured.exposure is not None
     assert measured.exposure.factor_exposure.shape[0] == 24
+    assert np.isfinite(measured.exposure.factor_exposure).all()
 
 
 @pytest.mark.parametrize("kind", ["beta", "industry", "beta_industry", "pca3"])
@@ -1083,31 +1085,47 @@ def test_factor_bounds_run_through_construction_and_the_native_harness(kind):
     market = MarketData({"industry": np.tile([1, 1, 1, 2, 2, 2], (24, 1))},
                         setup["forecast"].decisions, ASSETS)
     config = FRICTIONLESS.replace(factor_exposure=kind, factor_limit=0.0)
-    report = run_backtest(**setup, market=market, config=config)
+    report = run_backtest(**setup, market=market, config=config, with_exposure=kind)
     # At zero cost with complete fills, the held book reaches the bounded target.
     np.testing.assert_allclose(report.exposure.factor_exposure, 0.0, atol=1e-7)
     assert np.isfinite(report.exposure.concentration).all()
     assert report.as_dict()["max_abs_factor_exposure"] < 1e-7
     assert "exposure" not in report.as_dict()
+    # The bound applies whether or not the exposure is reported.
+    silent = run_backtest(**setup, market=market, config=config)
+    assert silent.exposure is None
+    assert silent.mean_turnover == report.mean_turnover
+    free = run_backtest(**setup, market=market, config=FRICTIONLESS, with_exposure=kind)
+    assert np.abs(free.exposure.factor_exposure).max() > 1e-3
 
 
 def test_factor_bounds_are_an_explicit_sweep_axis_without_changing_the_default_grid():
-    market = MarketData.empty(np.arange(24), ASSETS)
+    market = MarketData({"industry": np.tile([1, 1, 1, 2, 2, 2], (24, 1))},
+                        np.arange(24), ASSETS)
     assert all(c.factor_limit is None for c in enumerate_configs(market=market))
-    configs = enumerate_configs(market=market, universe="all", selection="all",
-                                weighting="mean_variance", risk_model="diagonal",
-                                rebalance="every_decision", factor_exposure="beta",
-                                factor_limit=(None, 0.0, 0.1))
-    assert {c.factor_limit for c in configs} == {None, 0.0, 0.1}
+    pinned = dict(market=market, universe="all", selection="all", weighting="mean_variance",
+                  risk_model="diagonal", rebalance="every_decision")
+    configs = enumerate_configs(**pinned, factor_exposure="beta", factor_limit=(None, 0.0, 0.1))
+    # No bound is the plain target whichever estimator is named: one point.
+    assert [(c.factor_exposure, c.factor_limit) for c in configs] == [
+        (None, None), ("beta", 0.0), ("beta", 0.1)]
+    assert [(c.factor_exposure, c.factor_limit) for c in enumerate_configs(
+        **pinned, factor_exposure=("beta", "industry"), factor_limit=(None, 0.1))] == [
+        (None, None), ("beta", 0.1), ("industry", 0.1)]
+    with pytest.raises(ValueError, match="factor_limit needs factor_exposure"):
+        enumerate_configs(**pinned, factor_limit=(None, 0.1))
     setup = world(n_decisions=24)
     setup.pop("half_spread")
-    swept = sweep_configs(setup["forecast"], setup["realized"], configs,
-                          market=market, history=setup["history"], days=setup["days"])
-    alone = [run_backtest(**setup, market=market, config=c) for c in configs]
+    swept = sweep_configs(setup["forecast"], setup["realized"], configs, market=market,
+                          history=setup["history"], days=setup["days"], with_exposure="beta")
+    alone = [run_backtest(**setup, market=market, config=c, with_exposure="beta")
+             for c in configs]
     assert [r.as_dict() for r in swept] == [r.as_dict() for r in alone]
     for together, single in zip(swept, alone):
         np.testing.assert_array_equal(together.exposure.factor_exposure,
                                       single.exposure.factor_exposure)
+    assert (np.abs(swept[1].exposure.factor_exposure).max()
+            < np.abs(swept[0].exposure.factor_exposure).max())
 
 
 def test_held_factor_exposure_uses_partial_fills_and_prior_history():
@@ -1117,35 +1135,37 @@ def test_held_factor_exposure_uses_partial_fills_and_prior_history():
     weights = PortfolioWeights(target, setup["forecast"].decisions, ASSETS, AXIS)
     spread = setup["half_spread"]
     spread[1, 0] = np.nan  # The first name cannot exit at the second decision.
-    config = DEFAULT_BACKTEST.replace(factor_exposure="beta")
     report = run_backtest(weights, setup["realized"], half_spread=spread,
-                          history=setup["history"], config=config)
+                          history=setup["history"], with_exposure="beta")
     beta = bt.estimate_beta(setup["history"])[0]
     held = target[:, :, 0].copy()
     held[1, 0] = 0.5
     np.testing.assert_allclose(report.exposure.factor_exposure[:, 0], held @ beta)
     np.testing.assert_allclose(report.exposure.concentration[:3], [0.5, 1.0, 0.0])
     # A sweep beginning below construction must receive the same prior history.
-    swept, = sweep_configs(weights, setup["realized"], [config], half_spread=spread,
-                            history=setup["history"])
+    swept, = sweep_configs(weights, setup["realized"], [DEFAULT_BACKTEST], half_spread=spread,
+                           history=setup["history"], with_exposure="beta")
     np.testing.assert_array_equal(swept.exposure.factor_exposure,
                                   report.exposure.factor_exposure)
     with pytest.raises(ValueError, match="builds a target from forecasts"):
-        run_backtest(weights, setup["realized"], half_spread=spread,
-                     history=setup["history"], config=config.replace(factor_limit=0.1))
+        run_backtest(weights, setup["realized"], half_spread=spread, history=setup["history"],
+                     config=DEFAULT_BACKTEST.replace(factor_exposure="beta", factor_limit=0.1))
 
 
-def test_industry_factor_diagnostics_require_industry_data():
+def test_industry_factor_exposure_requires_industry_data():
     setup = world(n_decisions=8)
     with pytest.raises(MissingRolesError, match="industry"):
-        run_backtest(**setup, config=DEFAULT_BACKTEST.replace(factor_exposure="industry"))
+        run_backtest(**setup, with_exposure="industry")
+    with pytest.raises(MissingRolesError, match="industry"):
+        run_backtest(**setup, config=DEFAULT_BACKTEST.replace(factor_exposure="industry",
+                                                              factor_limit=0.1))
 
 
 def test_factor_estimates_do_not_read_the_scored_returns_when_history_is_supplied():
     setup = world(n_decisions=24)
     config = FRICTIONLESS.replace(factor_exposure="beta", factor_limit=0.1)
-    a = run_backtest(**setup, config=config)
+    a = run_backtest(**setup, config=config, with_exposure="beta")
     setup["realized"] = panel(setup["realized"].values[:, :, 0] * np.arange(1, 7))
-    b = run_backtest(**setup, config=config)
+    b = run_backtest(**setup, config=config, with_exposure="beta")
     np.testing.assert_array_equal(a.exposure.factor_exposure, b.exposure.factor_exposure)
     np.testing.assert_array_equal(a.exposure.concentration, b.exposure.concentration)

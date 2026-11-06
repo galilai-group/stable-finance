@@ -747,8 +747,8 @@ def _per_decision_risk_aversion(
 
 def _bounded_target(target, sigma, loadings, lower, upper, root):
     """Project one frictionless target into its factor bounds in the risk metric."""
-    from scipy.linalg import qr, solve_triangular
-    from scipy.optimize import LinearConstraint, minimize
+    from scipy.linalg import solve_triangular
+    from scipy.optimize import minimize
 
     bounded = np.isfinite(lower) | np.isfinite(upper)
     loadings, lower, upper = loadings[:, bounded], lower[bounded], upper[bounded]
@@ -773,38 +773,59 @@ def _bounded_target(target, sigma, loadings, lower, upper, root):
         weights[known] = target
         return weights
 
-    # In risk coordinates z = L' (w - target), curvature is the identity.
-    # Solving directly in weights can stop far from the optimum in a weak
-    # risk direction even when the factor constraints are satisfied.
+    # In risk coordinates z = L'(w - target) the curvature is the identity, so
+    # the bounded target is the projection of the origin onto the slab
+    # low <= D z <= high with D = B' L^-T. Solving in weights instead can stop
+    # far from the optimum in a weak risk direction with the bounds satisfied.
     design = solve_triangular(root, matrix.T, lower=True).T
     norm = np.linalg.norm(design, axis=1)
-    design = design / norm[:, None]
+    design /= norm[:, None]
     low, high = (lower - exposure) / norm, (upper - exposure) / norm
     equal = lower == upper
-    constraints = []
-    if equal.any():
-        equations, values = design[equal], low[equal]
-        # Industry columns and caller matrices can be redundant. SLSQP needs
-        # an independent equality system; keep the same feasible set.
-        _, triangular, order = qr(equations.T, mode="economic", pivoting=True)
-        rank = np.linalg.matrix_rank(triangular)
-        independent = order[:rank]
-        feasible = np.linalg.lstsq(equations, values, rcond=None)[0]
-        if not np.allclose(equations @ feasible, values, atol=1e-9, rtol=1e-9):
-            raise ValueError("factor bounds are infeasible")
-        constraints.append(LinearConstraint(equations[independent], values[independent],
-                                            values[independent]))
-    if (~equal).any():
-        constraints.append(LinearConstraint(design[~equal], low[~equal], high[~equal]))
+    if equal.any() and not np.allclose(
+            design[equal] @ np.linalg.lstsq(design[equal], low[equal], rcond=None)[0],
+            low[equal], atol=1e-9, rtol=1e-9):
+        raise ValueError("factor bounds are infeasible")
+    # The dual has a pair of multipliers per FACTOR, not a variable per name:
+    # z = D'(b - a), with a >= 0 pushing an exposure down to its upper bound
+    # and b >= 0 up to its lower one, and minimizes
+    #     (1/2) (b - a)' D D' (b - a) + a' high - b' low.
+    # A one-sided bound fixes the multiplier of its missing side at zero.
+    # Slacks are put in units of the largest, so the tolerances are relative.
+    unit = max(np.abs(low[np.isfinite(low)]).max(initial=0.0),
+               np.abs(high[np.isfinite(high)]).max(initial=0.0))
+    low, high = low / unit, high / unit
+    gram = design @ design.T
+    k = len(low)
+    cost = np.r_[np.where(np.isfinite(high), high, 0.0), -np.where(np.isfinite(low), low, 0.0)]
+    box = ([(0.0, None if np.isfinite(h) else 0.0) for h in high]
+           + [(0.0, None if np.isfinite(l) else 0.0) for l in low])
 
-    solved = minimize(lambda z: (0.5 * z @ z, z), np.zeros_like(target),
-                      jac=True, constraints=constraints,
-                      method="SLSQP", options=dict(ftol=1e-12, maxiter=500))
-    candidate = target + solve_triangular(root.T, solved.x, lower=False)
+    def dual(x):
+        push = gram @ (x[k:] - x[:k])
+        return 0.5 * (x[k:] - x[:k]) @ push + cost @ x, np.r_[-push, push] + cost
+
+    x = minimize(dual, np.zeros(2 * k), jac=True, method="L-BFGS-B", bounds=box,
+                 options=dict(ftol=1e-15, gtol=1e-12, maxiter=10_000)).x
+    a, b = x[:k], x[k:]
+    # The iterate says which bounds bind. The projection onto exactly those
+    # is in closed form, and is the optimum when it is feasible with
+    # multipliers of the right sign (the KKT conditions); then it replaces
+    # the iterate, so a binding bound is met to roundoff, not to a tolerance.
+    active = equal | (a > 1e-9) | (b > 1e-9)
+    at_low = equal | (b >= a)
+    multipliers = np.zeros(k)
+    multipliers[active] = np.linalg.lstsq(gram[np.ix_(active, active)],
+                                          np.where(at_low, low, high)[active], rcond=None)[0]
+    push = gram @ multipliers
+    if (np.all(push >= low - 1e-10) and np.all(push <= high + 1e-10)
+            and np.all(multipliers[active & ~equal & at_low] >= -1e-10)
+            and np.all(multipliers[active & ~equal & ~at_low] <= 1e-10)):
+        a, b = np.maximum(-multipliers, 0.0), np.maximum(multipliers, 0.0)
+    candidate = target + solve_triangular(root.T, design.T @ (b - a) * unit, lower=False)
     exposure = matrix @ candidate
-    if (not solved.success or np.any(exposure < lower - 1e-8)
-            or np.any(exposure > upper + 1e-8)):
-        raise ValueError(f"factor bounds could not be satisfied: {solved.message}")
+    if np.any(exposure < lower - 1e-8) or np.any(exposure > upper + 1e-8):
+        raise ValueError("factor bounds could not be satisfied")
     weights[known] = candidate
     return weights
 

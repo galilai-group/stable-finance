@@ -673,6 +673,37 @@ def test_time_varying_loadings_and_each_horizon_are_constrained_independently():
                                        atol=2e-6, rtol=1e-6)
 
 
+def test_several_binding_bounds_match_a_reference_solver():
+    from scipy.optimize import LinearConstraint, minimize
+
+    rng = np.random.default_rng(7)
+    n = 8
+    common = rng.normal(size=(n, 2))
+    sigma = common @ common.T * 0.3 + np.diag(rng.uniform(0.5, 2.0, n))
+    mu = rng.normal(size=(3, n, 1))
+    loadings = rng.normal(size=(n, 4))
+    loadings[:, 1] = rng.integers(0, 2, n)
+    lower, upper = np.array([-0.2, 0.1, -np.inf, 0.0]), np.array([0.2, 0.1, 0.3, 0.0])
+    forecast = ForwardReturns(mu, [0, 1, 2], [f"A{i}" for i in range(n)], [300])
+    target = mean_variance_target(forecast, sigma[None], factor_loadings=loadings,
+                                  factor_lower=lower, factor_upper=upper)
+    for decision in range(3):
+        unbounded = np.linalg.solve(sigma, mu[decision, :, 0])
+        assert np.sum((unbounded @ loadings < lower) | (unbounded @ loadings > upper)) >= 2
+        reference = minimize(
+            lambda w: 0.5 * w @ sigma @ w - mu[decision, :, 0] @ w, np.zeros(n),
+            jac=lambda w: sigma @ w - mu[decision, :, 0], method="SLSQP",
+            constraints=[LinearConstraint(loadings.T[[1, 3]], lower[[1, 3]], upper[[1, 3]]),
+                         LinearConstraint(loadings.T[[0, 2]], lower[[0, 2]], upper[[0, 2]])],
+            options=dict(ftol=1e-15, maxiter=1000))
+        assert reference.success
+        np.testing.assert_allclose(target.values[decision, :, 0], reference.x, atol=1e-6)
+    exposure = np.einsum("dnh,nf->dhf", target.values, loadings)[:, 0, :]
+    assert np.all(exposure >= lower - 1e-9) and np.all(exposure <= upper + 1e-9)
+    np.testing.assert_allclose(exposure[:, 1], 0.1, atol=1e-9)
+    np.testing.assert_allclose(exposure[:, 3], 0.0, atol=1e-9)
+
+
 def test_unknown_loadings_remove_the_name_before_refitting_the_target():
     forecast, sigma = mv_panel()
     loadings = np.array([[1.], [np.nan], [-1.]])

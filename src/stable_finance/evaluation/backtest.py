@@ -71,7 +71,8 @@ from stable_finance.evaluation.portfolio.construction import (
 )
 from stable_finance.evaluation.portfolio.risk import apply_screen, estimate_risk
 from stable_finance.evaluation.portfolio.signals import (
-    alpha_from_rule, apply_signal, estimate_beta, estimate_loadings, industry_exposures,
+    NEUTRALIZATIONS, SIGNAL_REQUIRES, alpha_from_rule, apply_signal, estimate_beta,
+    estimate_loadings, industry_exposures,
 )
 from stable_finance.evaluation.returns.contract import ForwardReturns
 from stable_finance.evaluation.returns.probes import RidgeProbe
@@ -209,8 +210,10 @@ class BacktestReport:
     #: configuration charges fees; it is part of ``mean_cost_bps``, not on top
     #: of it. None otherwise, and then absent from :meth:`as_dict`.
     mean_fee_bps: float | None = None
-    #: Diagnostics of actual positions reconstructed from fills. Present
-    #: when factor_exposure is configured; bounds apply to targets, not fills.
+    #: Factor exposure and concentration of the positions actually held,
+    #: reconstructed from fills, on the estimator ``with_exposure`` named to
+    #: :func:`run_backtest`; None otherwise, and then absent from
+    #: :meth:`as_dict`. A configured bound applies to targets, not fills.
     exposure: PortfolioExposure | None = None
 
     def as_dict(self) -> dict:
@@ -218,15 +221,21 @@ class BacktestReport:
 
         ``equity`` is left out when unset, as in the config's label, so rows
         written before it existed keep the same columns; so is
-        ``mean_fee_bps`` for a configuration that charges no fees.
+        ``mean_fee_bps`` for a configuration that charges no fees. With
+        ``exposure``, ``mean_concentration`` and ``max_abs_factor_exposure``
+        summarize it over the decisions (and factors) where it is known.
         """
         row = {k: v for k, v in asdict(self).items()
                if k not in ("config", "series", "exposure")
                and not (k == "mean_fee_bps" and v is None)}
         if self.exposure is not None:
-            row["mean_concentration"] = float(self.exposure.concentration.mean())
+            concentration = self.exposure.concentration
+            exposure = np.abs(self.exposure.factor_exposure)
+            row["mean_concentration"] = float(
+                concentration[np.isfinite(concentration)].mean()
+                if np.isfinite(concentration).any() else np.nan)
             row["max_abs_factor_exposure"] = float(
-                np.max(np.abs(self.exposure.factor_exposure), initial=0.0))
+                exposure[np.isfinite(exposure)].max() if np.isfinite(exposure).any() else np.nan)
         config = {k: v for k, v in asdict(self.config).items()
                   if not (k in OPTIONAL_SETTINGS and v is None)}
         return {**config, **row}
@@ -359,14 +368,14 @@ def _loadings(context, history, realized) -> NDArray[np.float64]:
     return context["loadings"]
 
 
-def _exposures(context, config, history, realized) -> None:
-    """Cache the library's factor estimates for constraints and held-book scoring.
+def _exposures(context, kind, history, realized) -> None:
+    """Cache the library's factor estimates for bounds and held-book scoring.
 
-    Like the risk models, estimates use history when supplied. Pass a prior
-    period to keep them out of sample. Industry membership is read at each
-    decision, so a reclassification is not carried back to earlier targets.
+    ``kind`` is one of :data:`NEUTRALIZATIONS`, or None for nothing. Like the
+    risk models, estimates use history when supplied. Pass a prior period to
+    keep them out of sample. Industry membership is read at each decision, so
+    a reclassification is not carried back to earlier targets.
     """
-    kind = config.factor_exposure
     if kind is None:
         return
     cache = context.setdefault("factors", {})
@@ -770,6 +779,7 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
     periods the same way, or None when the configuration charges none.
     """
     mu, spread, day = context["mu"], context["spread"], context["day"]
+    kind = context.get("with_exposure")
     net = gross - costs
     turnover = turnover_per_asset.sum(axis=1)
     if config.rebalance == "horizon":
@@ -854,9 +864,8 @@ def _report(context: dict, config: BacktestConfig, gross, costs, turnover_per_as
             fee=None if fee_series is None else fee_series.copy(),
         ) if with_series else None,
         mean_fee_bps=None if fee_series is None else float(np.nanmean(fee_series) * 1e4),
-        exposure=(portfolio_exposure(values, context["factors"][config.factor_exposure][0],
-                                     factor_names=context["factors"][config.factor_exposure][1])
-                  if config.factor_exposure is not None else None),
+        exposure=None if kind is None else portfolio_exposure(
+            values, context["factors"][kind][0], factor_names=context["factors"][kind][1]),
     )
 
 
@@ -874,6 +883,15 @@ def _forecast(source, train, probe) -> ForwardReturns:
     return (probe or RidgeProbe()).fit(train_embeddings, train_returns).predict(source)
 
 
+def _check_exposure(kind: str | None, market: MarketData) -> None:
+    """Refuse a ``with_exposure`` the market cannot support, before anything runs."""
+    if kind is None:
+        return
+    if kind not in NEUTRALIZATIONS:
+        raise ValueError(f"with_exposure={kind!r} is not None or one of {NEUTRALIZATIONS}")
+    market.require(*SIGNAL_REQUIRES[kind], purpose=f"with_exposure={kind!r}")
+
+
 def _check_axes(config: BacktestConfig, market: MarketData, source) -> None:
     """Check the axes a level uses; below the forecast only trading remains."""
     if isinstance(source, ForwardReturns):
@@ -881,7 +899,7 @@ def _check_axes(config: BacktestConfig, market: MarketData, source) -> None:
     else:
         if config.factor_limit is not None:
             raise ValueError("factor_limit builds a target from forecasts; for weights or "
-                             "orders use factor_exposure alone to report held exposures")
+                             "orders pass with_exposure to report held exposures")
         check_config(config.replace(universe="all", alpha=None, alpha_ic=None,
                                     neutralize=None), market)
 
@@ -902,6 +920,7 @@ def run_backtest(
     probe: RidgeProbe | None = None,
     efq: ArrayLike | None = None,
     unfilled: str = "retry",
+    with_exposure: str | None = None,
 ) -> BacktestReport:
     """Score one input, at any level, under one harness configuration.
 
@@ -950,6 +969,19 @@ def run_backtest(
     between decisions (see :data:`~stable_finance.evaluation.config.HOLDING_RULES`);
     ``realized`` must then hold each name's return from each decision to the
     next. It is supported for the ``mid`` and ``cross`` cost models.
+
+    ``with_exposure`` names one of the library's factor estimators
+    (:data:`~stable_finance.evaluation.portfolio.signals.NEUTRALIZATIONS`)
+    and adds the held book's exposure to it, and its concentration, to the
+    report as :attr:`BacktestReport.exposure`. Like ``with_series`` it is a
+    reporting choice, not a configuration: it changes no label and no book,
+    and reads any input level, including weights or orders supplied by a
+    caller. Beta and the principal components are estimated from
+    ``history``, so pass a prior period to keep them out of sample; the
+    industry options need an ``industry`` code on the market.
+    ``config.factor_limit`` bounds the mean-variance target's exposure to
+    ``config.factor_exposure``; where the held book ended up after costs,
+    partial fills and drift is what this reports.
     """
     source = forecast
     if isinstance(source, Embeddings):
@@ -964,8 +996,11 @@ def run_backtest(
     if config.holding == "drift" and config.cost_model not in ("mid", "cross"):
         raise ValueError("holding='drift' is supported for the mid and cross cost models")
     _check_axes(config, market, source)
+    _check_exposure(with_exposure, market)
     context = _prepare(source, realized, market, days, horizon_index)
-    _exposures(context, config, history, realized)
+    _exposures(context, config.factor_exposure, history, realized)
+    _exposures(context, with_exposure, history, realized)
+    context["with_exposure"] = with_exposure
     if efq is not None:
         context["efq"] = np.broadcast_to(_efq_array(efq), (context["n_decisions"], context["n_assets"]))
     if isinstance(source, ForwardReturns):
@@ -1014,6 +1049,7 @@ def sweep_configs(
     with_series: bool = False,
     train: tuple[Embeddings, ForwardReturns] | None = None,
     probe: RidgeProbe | None = None,
+    with_exposure: str | None = None,
 ) -> tuple[BacktestReport, ...]:
     """Score one input under many configurations, sharing the work.
 
@@ -1034,7 +1070,8 @@ def sweep_configs(
     Every configuration is checked against ``market`` before any is run, so a
     sweep refuses up front rather than failing partway; with ``on_error='skip'``
     the unsupported ones are dropped instead. ``enumerate_configs(market=...)``
-    builds a space that needs no dropping.
+    builds a space that needs no dropping. ``with_exposure`` is
+    :func:`run_backtest`'s, reported on every configuration.
     """
     if on_error not in ("raise", "skip"):
         raise ValueError("on_error must be 'raise' or 'skip'")
@@ -1049,18 +1086,22 @@ def sweep_configs(
             _check_axes(config, market, source)
     else:
         configs = tuple(c for c in configs if c.supported_by(market))
+    _check_exposure(with_exposure, market)
     if not isinstance(source, ForwardReturns):
         reports = []
         for config in configs:
             try:
                 reports.append(run_backtest(source, realized, market=market, days=days,
                                             config=config, horizon_index=horizon_index,
-                                            with_series=with_series, history=history))
+                                            with_series=with_series, history=history,
+                                            with_exposure=with_exposure))
             except Exception:
                 if on_error == "raise":
                     raise
         return tuple(reports)
     context = _prepare(source, realized, market, days, horizon_index)
+    _exposures(context, with_exposure, history, realized)
+    context["with_exposure"] = with_exposure
     # The risk cache is tiny (one matrix per risk model) and kept whole. The
     # book cache is NOT: a book is a full weight panel, and the space holds
     # over a thousand distinct ones, which would be gigabytes held for nothing.
@@ -1084,7 +1125,7 @@ def sweep_configs(
                 _beta(context, history, realized)
             if config.neutralize == "pca3":
                 _loadings(context, history, realized)
-            _exposures(context, config, history, realized)
+            _exposures(context, config.factor_exposure, history, realized)
             # A held book that drops part of its forecast is a different book.
             book_key = (*_book_key(config), ("drops_forecast", _drops_forecast(context, config)))
             if book_key in book_cache:

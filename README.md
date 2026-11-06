@@ -188,33 +188,39 @@ zero target weight. The target is not rescaled after solving.
 Equal lower and upper bounds fix exposure at that value; setting both to
 zero imposes factor neutrality.
 
-The same option is available through the harness using its own estimators:
+The same bound is available through the harness, using its own estimators:
 
 ```python
 config = BacktestConfig(factor_exposure="beta", factor_limit=0.10)
 report = run_backtest(forecast, realized, history=train_returns,
-                      half_spread=half_spread, config=config)
-report.exposure.factor_exposure   # actual held exposure at each decision
+                      half_spread=half_spread, config=config, with_exposure="beta")
+report.exposure.factor_exposure   # held exposure at each decision
 report.exposure.concentration     # gross-normalized Herfindahl concentration
 ```
 
-`factor_exposure` selects `beta`, `industry`, `beta_industry` or `pca3`;
-`factor_limit` bounds each selected exposure symmetrically. Omit the limit
-for diagnostics alone, including on weights or orders supplied by a caller.
-Beta and PCA use the supplied risk history; industry uses current market
-codes. Beta is relative to the equal-weighted return panel, not an index.
-The supported sources use `estimate_beta`, `industry_exposures` and
-`estimate_loadings` from the signal module, independently of `risk_model`.
-In particular, `pca3` uses that module's PCA estimates; fitted loadings inside
-`risk_model="factor"` are not exposed by this option. Caller-supplied loading
-matrices can be passed directly to `mean_variance_target(factor_loadings=...)`.
-Unknown exposure of a held name is reported as NaN. Neutralizing a signal
-removes its factor component, and a factor risk model prices factor risk;
-these bounds instead restrict the resulting target weights. Trading costs,
-partial fills and drift can leave actual holdings outside the target bounds.
+`factor_exposure` selects `beta`, `industry`, `beta_industry` or `pca3` and
+`factor_limit` bounds each selected exposure symmetrically; the two are set
+together. Where the held book then ends up, after trading costs, partial
+fills and drift, is a reporting choice rather than a configuration, like
+`with_series`: `with_exposure` names the estimator to report on, changes no
+label and no book, reads any input level including weights or orders
+supplied by a caller, and adds `mean_concentration` and
+`max_abs_factor_exposure` to the result row. Beta and PCA use the supplied
+risk history; industry uses current market codes. Beta is relative to the
+equal-weighted return panel, not an index. The estimators are
+`estimate_beta`, `industry_exposures` and `estimate_loadings` from the signal
+module, independently of `risk_model`; the loadings fitted inside
+`risk_model="factor"` are not among them. Caller-supplied loading matrices
+go directly to `mean_variance_target(factor_loadings=...)`. A name whose
+loading is unknown (a beta with fewer than two finite history decisions, an
+unknown industry code) is left out of the bounded target, where `neutralize`
+would keep it with its raw forecast, and its held exposure is reported as
+NaN. Neutralizing a signal removes its factor component and a factor risk
+model prices factor risk; these bounds restrict the target weights instead.
 `enumerate_configs(factor_exposure="beta", factor_limit=(None, 0.0, 0.10),
 weighting="mean_variance")` compares those choices without changing the
-default grid. The existing trades and execution stages are unchanged.
+default grid; the unbounded point is the plain mean-variance target whichever
+estimator is named. The trades and execution stages are unchanged.
 
 `trades.dynamic` holds two rules that trade less than all the way to the
 target, each a function of a target path and the book held:
