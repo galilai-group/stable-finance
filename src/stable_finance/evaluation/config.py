@@ -123,13 +123,14 @@ AXIS_REQUIRES: dict[str, dict[str, tuple[str, ...]]] = {
     "risk_model": RISK_MODEL_REQUIRES,
     "cost_model": COST_MODEL_REQUIRES,
     "neutralize": SIGNAL_REQUIRES,
+    "factor_exposure": SIGNAL_REQUIRES,
 }
 
 
 #: Settings that are ``None`` unless a model needs them, and that labels and
 #: result rows leave out while unset.
 OPTIONAL_SETTINGS = ("equity", "execution_days", "impact", "alpha", "alpha_ic",
-                     "neutralize", "mv_solver", *FEE_SETTINGS)
+                     "neutralize", "mv_solver", "factor_exposure", "factor_limit", *FEE_SETTINGS)
 
 
 @dataclass(frozen=True)
@@ -204,6 +205,19 @@ class BacktestConfig:
     #: is not a result about where its solver was stopped. ``"fista"`` stops
     #: at the ``max_iter`` budget, for measuring what that budget costs.
     mv_solver: str | None = None
+    #: Bound the frictionless mean-variance target's exposure to the library's
+    #: beta, industry or PCA estimates: the same choices as neutralize, from
+    #: the same estimators, independently of risk_model (the loadings fitted
+    #: inside the factor risk model are not among them). A name whose loading
+    #: is unknown -- a beta with fewer than two finite history decisions, an
+    #: unknown industry code -- is left out of the target, where neutralization
+    #: keeps it with its raw forecast. Set together with factor_limit. The held
+    #: book may drift outside the bound; run_backtest(with_exposure=...)
+    #: reports where it ended up.
+    factor_exposure: str | None = None
+    #: Symmetric bound on each exposure of factor_exposure, in signed weight
+    #: units; zero imposes neutrality.
+    factor_limit: float | None = None
     #: FEES, charged per unit of weight traded ON TOP of the cost model, and,
     #: like ``efq``, to the cost-aware allocator and in the scoring alike, so
     #: a book is planned against the fees it then pays. All three are refused
@@ -280,6 +294,19 @@ class BacktestConfig:
                              "coefficient to scale the forecast by")
         if self.neutralize is not None and self.neutralize not in NEUTRALIZATIONS:
             raise ValueError(f"neutralize={self.neutralize!r} is not one of {NEUTRALIZATIONS}")
+        if (self.factor_exposure is None) != (self.factor_limit is None):
+            raise ValueError("factor_exposure and factor_limit are set together; to report "
+                             "held exposures without a bound, pass with_exposure to "
+                             "run_backtest")
+        if self.factor_exposure is not None:
+            if self.factor_exposure not in NEUTRALIZATIONS:
+                raise ValueError(f"factor_exposure={self.factor_exposure!r} is not one of "
+                                 f"{NEUTRALIZATIONS}")
+            if (isinstance(self.factor_limit, bool) or not np.isfinite(self.factor_limit)
+                    or self.factor_limit < 0):
+                raise ValueError("factor_limit must be finite and non-negative")
+            if self.weighting != "mean_variance":
+                raise ValueError("factor_limit constrains the mean_variance target")
         if self.mv_solver is not None and self.mv_solver not in REBALANCE_SOLVERS:
             raise ValueError(f"mv_solver={self.mv_solver!r} is not None or one of "
                              f"{REBALANCE_SOLVERS}")
@@ -406,6 +433,8 @@ def check_config(config: BacktestConfig, market) -> None:
              "neutralize": "neutralize='beta' runs on any market data, estimating beta "
                            "from the risk history; 'industry' needs an industry code "
                            "for each name",
+             "factor_exposure": "factor_exposure='beta' or 'pca3' estimates loadings "
+                                "from the risk history; 'industry' needs industry codes",
              "fee_per_share": "fee_per_share is dollars per share, so it needs each name's "
                               "share price (mid, or bid_price and ask_price); fee_bps and "
                               "sec_fee_rate are charged on notional and need none"}
@@ -455,11 +484,20 @@ def enumerate_configs(*, market=None, **overrides) -> tuple[BacktestConfig, ...]
             scalars[name] = value
 
     names = list(axes)
-    out = []
+    out, seen = [], set()
     for combination in itertools.product(*(axes[name] for name in names)):
-        config = BacktestConfig(**dict(zip(names, combination)), **scalars)
-        if _is_degenerate(config):
+        options = {**dict(zip(names, combination)), **scalars}
+        if options.get("factor_limit") is None:
+            # No bound is the plain target whichever estimator is named.
+            options.pop("factor_exposure", None)
+        elif options.get("factor_exposure") is None:
+            raise ValueError("factor_limit needs factor_exposure")
+        elif options.get("weighting", DEFAULT_BACKTEST.weighting) != "mean_variance":
             continue
+        config = BacktestConfig(**options)
+        if _is_degenerate(config) or config in seen:
+            continue
+        seen.add(config)
         if market is not None and not config.supported_by(market):
             continue
         out.append(config)

@@ -1,5 +1,6 @@
 """Stage 5, how good each stage's output is: the IC of a forecast, the P&L and Sharpe of a portfolio, how much of the forecast reached the weights (the transfer coefficient), execution-quality curves, and the statistics that keep a sweep of many configurations honest."""
 
+from stable_finance.evaluation.scoring.exposure import PortfolioExposure, portfolio_exposure
 from stable_finance.evaluation.scoring.ic import (
     InformationCoefficient,
     evaluate_forward_returns,
@@ -43,6 +44,7 @@ __all__ = [
     "ExecutionQualityCurve",
     "InformationCoefficient",
     "PBOResult",
+    "PortfolioExposure",
     "SharpeDifference",
     "TransferCoefficient",
     "breakeven_efq",
@@ -60,6 +62,7 @@ __all__ = [
     "paired_difference",
     "pbo",
     "pooled_estimates",
+    "portfolio_exposure",
     "positions_from_fills",
     "probabilistic_sharpe",
     "sharpe_difference",

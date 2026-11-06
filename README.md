@@ -142,8 +142,8 @@ the cost-aware mean-variance problem, because
 mu'w - (risk_aversion / 2) w'Sigma w = -(risk_aversion / 2) (w - w*)'Sigma (w - w*) + const
 ```
 
-so `rebalance(mean_variance_target(...))` gives the weights `allocate` gets in
-one solve. The cost term is what makes the held portfolio depend on the one
+so for an unconstrained target, `rebalance(mean_variance_target(...))` gives
+the weights `allocate` gets in one solve. The cost term is what makes the held portfolio depend on the one
 already held: small forecast changes do not justify paying the spread, so
 decisions are solved in order and each starts from the previous solution. The
 problem is convex and solved by accelerated proximal gradient descent, whose
@@ -179,6 +179,48 @@ covariance over finite observations, shrunk toward its diagonal and clipped to
 the positive semidefinite cone. A NaN cost marks an asset that cannot be
 traded at that decision, so it holds its previous weight; a NaN forecast is a
 zero expected return that still pays risk and cost.
+
+`mean_variance_target` also accepts `factor_loadings`, `factor_lower` and
+`factor_upper` to bound `loadings.T @ weights` in the frictionless target.
+Loadings may be fixed `(asset, factor)` or observed at each decision
+`(decision, asset, factor)`. Names with unknown constrained loadings receive
+zero target weight. The target is not rescaled after solving.
+Equal lower and upper bounds fix exposure at that value; setting both to
+zero imposes factor neutrality.
+
+The same bound is available through the harness, using its own estimators:
+
+```python
+config = BacktestConfig(factor_exposure="beta", factor_limit=0.10)
+report = run_backtest(forecast, realized, history=train_returns,
+                      half_spread=half_spread, config=config, with_exposure="beta")
+report.exposure.factor_exposure   # held exposure at each decision
+report.exposure.concentration     # gross-normalized Herfindahl concentration
+```
+
+`factor_exposure` selects `beta`, `industry`, `beta_industry` or `pca3` and
+`factor_limit` bounds each selected exposure symmetrically; the two are set
+together. Where the held book then ends up, after trading costs, partial
+fills and drift, is a reporting choice rather than a configuration, like
+`with_series`: `with_exposure` names the estimator to report on, changes no
+label and no book, reads any input level including weights or orders
+supplied by a caller, and adds `mean_concentration` and
+`max_abs_factor_exposure` to the result row. Beta and PCA use the supplied
+risk history; industry uses current market codes. Beta is relative to the
+equal-weighted return panel, not an index. The estimators are
+`estimate_beta`, `industry_exposures` and `estimate_loadings` from the signal
+module, independently of `risk_model`; the loadings fitted inside
+`risk_model="factor"` are not among them. Caller-supplied loading matrices
+go directly to `mean_variance_target(factor_loadings=...)`. A name whose
+loading is unknown (a beta with fewer than two finite history decisions, an
+unknown industry code) is left out of the bounded target, where `neutralize`
+would keep it with its raw forecast, and its held exposure is reported as
+NaN. Neutralizing a signal removes its factor component and a factor risk
+model prices factor risk; these bounds restrict the target weights instead.
+`enumerate_configs(factor_exposure="beta", factor_limit=(None, 0.0, 0.10),
+weighting="mean_variance")` compares those choices without changing the
+default grid; the unbounded point is the plain mean-variance target whichever
+estimator is named. The trades and execution stages are unchanged.
 
 `trades.dynamic` holds two rules that trade less than all the way to the
 target, each a function of a target path and the book held:

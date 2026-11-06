@@ -745,11 +745,99 @@ def _per_decision_risk_aversion(
     return array
 
 
+def _bounded_target(target, sigma, loadings, lower, upper, root):
+    """Project one frictionless target into its factor bounds in the risk metric."""
+    from scipy.linalg import solve_triangular
+    from scipy.optimize import minimize
+
+    bounded = np.isfinite(lower) | np.isfinite(upper)
+    loadings, lower, upper = loadings[:, bounded], lower[bounded], upper[bounded]
+    known = np.isfinite(loadings).all(axis=1)
+    weights = np.zeros_like(target)
+    matrix = loadings[known].T
+    if not known.all():
+        # Unknown exposure is not zero exposure: leave those names out of the
+        # target, and refit the remaining names rather than clipping a hedge.
+        target = np.linalg.solve(sigma[np.ix_(known, known)], (sigma @ target)[known])
+        sigma = sigma[np.ix_(known, known)]
+        if known.any():
+            root = np.linalg.cholesky(sigma / np.max(np.diag(sigma)))
+    scale = np.max(np.abs(matrix), axis=1, initial=0.0)
+    empty = scale == 0
+    if np.any(empty & ((lower > 0) | (upper < 0))):
+        raise ValueError("factor bounds are infeasible")
+    matrix = matrix[~empty] / scale[~empty, None]
+    lower, upper = lower[~empty] / scale[~empty], upper[~empty] / scale[~empty]
+    exposure = matrix @ target
+    if np.all(exposure >= lower) and np.all(exposure <= upper):
+        weights[known] = target
+        return weights
+
+    # In risk coordinates z = L'(w - target) the curvature is the identity, so
+    # the bounded target is the projection of the origin onto the slab
+    # low <= D z <= high with D = B' L^-T. Solving in weights instead can stop
+    # far from the optimum in a weak risk direction with the bounds satisfied.
+    design = solve_triangular(root, matrix.T, lower=True).T
+    norm = np.linalg.norm(design, axis=1)
+    design /= norm[:, None]
+    low, high = (lower - exposure) / norm, (upper - exposure) / norm
+    equal = lower == upper
+    if equal.any() and not np.allclose(
+            design[equal] @ np.linalg.lstsq(design[equal], low[equal], rcond=None)[0],
+            low[equal], atol=1e-9, rtol=1e-9):
+        raise ValueError("factor bounds are infeasible")
+    # The dual has a pair of multipliers per FACTOR, not a variable per name:
+    # z = D'(b - a), with a >= 0 pushing an exposure down to its upper bound
+    # and b >= 0 up to its lower one, and minimizes
+    #     (1/2) (b - a)' D D' (b - a) + a' high - b' low.
+    # A one-sided bound fixes the multiplier of its missing side at zero.
+    # Slacks are put in units of the largest, so the tolerances are relative.
+    unit = max(np.abs(low[np.isfinite(low)]).max(initial=0.0),
+               np.abs(high[np.isfinite(high)]).max(initial=0.0))
+    low, high = low / unit, high / unit
+    gram = design @ design.T
+    k = len(low)
+    cost = np.r_[np.where(np.isfinite(high), high, 0.0), -np.where(np.isfinite(low), low, 0.0)]
+    box = ([(0.0, None if np.isfinite(h) else 0.0) for h in high]
+           + [(0.0, None if np.isfinite(l) else 0.0) for l in low])
+
+    def dual(x):
+        push = gram @ (x[k:] - x[:k])
+        return 0.5 * (x[k:] - x[:k]) @ push + cost @ x, np.r_[-push, push] + cost
+
+    x = minimize(dual, np.zeros(2 * k), jac=True, method="L-BFGS-B", bounds=box,
+                 options=dict(ftol=1e-15, gtol=1e-12, maxiter=10_000)).x
+    a, b = x[:k], x[k:]
+    # The iterate says which bounds bind. The projection onto exactly those
+    # is in closed form, and is the optimum when it is feasible with
+    # multipliers of the right sign (the KKT conditions); then it replaces
+    # the iterate, so a binding bound is met to roundoff, not to a tolerance.
+    active = equal | (a > 1e-9) | (b > 1e-9)
+    at_low = equal | (b >= a)
+    multipliers = np.zeros(k)
+    multipliers[active] = np.linalg.lstsq(gram[np.ix_(active, active)],
+                                          np.where(at_low, low, high)[active], rcond=None)[0]
+    push = gram @ multipliers
+    if (np.all(push >= low - 1e-10) and np.all(push <= high + 1e-10)
+            and np.all(multipliers[active & ~equal & at_low] >= -1e-10)
+            and np.all(multipliers[active & ~equal & ~at_low] <= 1e-10)):
+        a, b = np.maximum(-multipliers, 0.0), np.maximum(multipliers, 0.0)
+    candidate = target + solve_triangular(root.T, design.T @ (b - a) * unit, lower=False)
+    exposure = matrix @ candidate
+    if np.any(exposure < lower - 1e-8) or np.any(exposure > upper + 1e-8):
+        raise ValueError("factor bounds could not be satisfied")
+    weights[known] = candidate
+    return weights
+
+
 def mean_variance_target(
     forecast: ForwardReturns,
     covariance: ArrayLike,
     *,
     risk_aversion: float | ArrayLike = 1.0,
+    factor_loadings: ArrayLike | None = None,
+    factor_lower: ArrayLike | None = None,
+    factor_upper: ArrayLike | None = None,
 ) -> PortfolioWeights:
     """The frictionless mean-variance holding, ``Sigma^-1 mu_t / lambda_t``.
 
@@ -762,6 +850,17 @@ def mean_variance_target(
     return. How far to actually move toward this target, given costs, is the
     trades stage's decision
     (:func:`~stable_finance.evaluation.trades.rebalance.rebalance`).
+
+    Optional ``factor_loadings`` have shape ``(asset, factor)`` or
+    ``(decision, asset, factor)`` and bound the target's factor exposures by
+    ``factor_lower <= loadings.T @ weights <= factor_upper``. Bounds are
+    scalars or one value per factor. Equal bounds fix exposure at that value;
+    equal zero bounds impose factor neutrality.
+    This solves the constrained mean-variance problem with positive definite
+    covariance and does not rescale the weights afterwards. Names with unknown
+    loadings receive zero weight.
+    These are TARGET bounds: trading costs and execution may leave the held
+    book outside them, which is measured separately in the backtest report.
     """
     mu = np.nan_to_num(np.asarray(forecast.values, dtype=np.float64), nan=0.0)
     aversion = _per_decision_risk_aversion(risk_aversion, mu.shape[0])
@@ -774,6 +873,31 @@ def mean_variance_target(
     for horizon in range(mu.shape[2]):
         target[:, :, horizon] = (
             np.linalg.solve(sigma[horizon], mu[:, :, horizon].T).T / aversion[:, None])
+    if factor_loadings is not None:
+        loadings = np.asarray(factor_loadings, dtype=np.float64)
+        if loadings.ndim not in (2, 3) or loadings.shape[-2] != mu.shape[1]:
+            raise ValueError("factor_loadings must have shape (asset, factor) or "
+                             "(decision, asset, factor)")
+        loadings = np.broadcast_to(loadings, (mu.shape[0], mu.shape[1], loadings.shape[-1]))
+        if factor_lower is None or factor_upper is None:
+            raise ValueError("factor_loadings needs factor_lower and factor_upper")
+        lower = np.broadcast_to(np.asarray(factor_lower, dtype=np.float64), (loadings.shape[-1],))
+        upper = np.broadcast_to(np.asarray(factor_upper, dtype=np.float64), (loadings.shape[-1],))
+        if np.any(np.isnan(lower) | np.isnan(upper) | (lower > upper)
+                  | np.isposinf(lower) | np.isneginf(upper)):
+            raise ValueError("factor bounds must be ordered and not NaN")
+        scale = np.max(np.diagonal(sigma, axis1=1, axis2=2), axis=1)
+        try:
+            roots = np.linalg.cholesky(sigma / scale[:, None, None])
+        except np.linalg.LinAlgError:
+            raise ValueError("factor bounds need positive definite covariance")
+        for horizon in range(mu.shape[2]):
+            for decision in range(mu.shape[0]):
+                target[decision, :, horizon] = _bounded_target(
+                    target[decision, :, horizon], sigma[horizon], loadings[decision],
+                    lower, upper, roots[horizon])
+    elif factor_lower is not None or factor_upper is not None:
+        raise ValueError("factor bounds need factor_loadings")
     return PortfolioWeights(target, forecast.decisions, forecast.assets, forecast.horizons)
 
 
